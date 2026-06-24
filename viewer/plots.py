@@ -59,6 +59,59 @@ def add_profile_line(plot, mzs, intensities):
     plot.plot(mzs[order], intensities[order], pen=pg.mkPen(width=1))
 
 
+def plot_bars(plot, labels, values, title="", y_label="value", color="#4c72b0"):
+    clear_plot(plot)
+    plot.setTitle(title)
+    plot.setLabel("left", y_label)
+
+    values = np.asarray(values, dtype=np.float64)
+
+    if values.size == 0:
+        plot.getAxis("bottom").setTicks([[]])
+        return
+
+    x = np.arange(values.size, dtype=np.float64)
+    bars = pg.BarGraphItem(x=x, height=values, width=0.6, brush=color, pen=pg.mkPen("#22222288"))
+    plot.addItem(bars)
+
+    ticks = [(i, str(label)) for i, label in enumerate(labels)]
+    plot.getAxis("bottom").setTicks([ticks])
+    plot.setLabel("bottom", "")
+
+
+def plot_grouped_bars(plot, group_labels, series, title="", y_label="value"):
+    """series: list of (name, values, color) aligned to group_labels."""
+    clear_plot(plot)
+    plot.setTitle(title)
+    plot.setLabel("left", y_label)
+    plot.addLegend()
+
+    n_series = len(series)
+
+    if n_series == 0 or len(group_labels) == 0:
+        plot.getAxis("bottom").setTicks([[]])
+        return
+
+    group_width = 0.8
+    bar_width = group_width / n_series
+    base = np.arange(len(group_labels), dtype=np.float64)
+
+    for series_i, (name, values, color) in enumerate(series):
+        values = np.asarray(values, dtype=np.float64)
+        offset = -group_width / 2 + bar_width * (series_i + 0.5)
+        bars = pg.BarGraphItem(
+            x=base + offset,
+            height=values,
+            width=bar_width * 0.9,
+            brush=color,
+            name=name,
+        )
+        plot.addItem(bars)
+
+    ticks = [(i, str(label)) for i, label in enumerate(group_labels)]
+    plot.getAxis("bottom").setTicks([ticks])
+
+
 def plot_traces(plot, rts, traces, targets, title=""):
     clear_plot(plot)
     plot.setTitle(title)

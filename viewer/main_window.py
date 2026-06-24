@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -24,10 +25,12 @@ try:
     from .mzml_store import MzmlStore, scan_arrays
     from .plots import add_profile_line, plot_points, plot_spectrum, plot_traces
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float, safe_int, ViewerSession
+    from .views import OverviewView, PeptidesView, ProteinsView
 except ImportError:
     from mzml_store import MzmlStore, scan_arrays
     from plots import add_profile_line, plot_points, plot_spectrum, plot_traces
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float, safe_int, ViewerSession
+    from views import OverviewView, PeptidesView, ProteinsView
 
 
 PSM_COLUMNS = [
@@ -119,6 +122,15 @@ class MainWindow(QMainWindow):
         self.load_files()
 
     def build_layout(self):
+        tabs = QTabWidget()
+        tabs.addTab(OverviewView(self.session), "Overview")
+        tabs.addTab(self.build_spectra_tab(), "Spectra")
+        tabs.addTab(PeptidesView(self.session), "Peptides")
+        tabs.addTab(ProteinsView(self.session), "Proteins")
+        tabs.setCurrentIndex(1)
+        self.setCentralWidget(tabs)
+
+    def build_spectra_tab(self):
         top_bar = QWidget()
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(4, 4, 4, 4)
@@ -159,7 +171,7 @@ class MainWindow(QMainWindow):
         main.setStretchFactor(0, 2)
         main.setStretchFactor(1, 5)
 
-        self.setCentralWidget(main)
+        return main
 
     def load_files(self):
         self.file_combo.blockSignals(True)

@@ -159,9 +159,85 @@ class ViewerSession:
         self.file_by_name = {row.get("filename", ""): row for row in self.file_rows}
 
         self._psm_cache = {}
+        self._file_table_cache = {}
+        self._global_peptides = None
+        self._global_proteins = None
+        self._quant_cache = None
 
     def files(self):
         return self.file_rows
+
+    def summary(self):
+        return self.manifest
+
+    def global_peptides(self):
+        if self._global_peptides is None:
+            self._global_peptides = read_tsv(self.reorganized / "peptides.tsv")
+
+        return self._global_peptides
+
+    def global_proteins(self):
+        if self._global_proteins is None:
+            self._global_proteins = read_tsv(self.reorganized / "proteins.tsv")
+
+        return self._global_proteins
+
+    def _file_table(self, filename, name):
+        key = (filename, name)
+
+        if key in self._file_table_cache:
+            return self._file_table_cache[key]
+
+        file_row = self.file_by_name.get(filename, {})
+        run_dir = file_row.get("run_dir") or safe_dir_name(filename)
+        rows = read_tsv(self.by_file_dir / run_dir / name)
+
+        self._file_table_cache[key] = rows
+        return rows
+
+    def file_peptides(self, filename):
+        return self._file_table(filename, "peptides.tsv")
+
+    def file_proteins(self, filename):
+        return self._file_table(filename, "proteins.tsv")
+
+    def file_quant(self, filename):
+        return self._file_table(filename, "peptide_quant.tsv")
+
+    def all_quant_rows(self):
+        if self._quant_cache is not None:
+            return self._quant_cache
+
+        rows = []
+
+        for file_row in self.file_rows:
+            filename = file_row.get("filename", "")
+
+            for row in self.file_quant(filename):
+                merged = dict(row)
+                merged["filename"] = filename
+                rows.append(merged)
+
+        self._quant_cache = rows
+        return rows
+
+    def quant_for_peptide(self, peptide_plain):
+        """Quantities for a peptide across every file, keyed by filename.
+
+        Returns {filename: total_quantity} summed over charge states, using the
+        modification-stripped sequence so charge/mod variants collapse together.
+        """
+        totals = {}
+
+        for row in self.all_quant_rows():
+            if row.get("peptide_plain", "") != peptide_plain:
+                continue
+
+            quantity = safe_float(row.get("quantity"), 0.0) or 0.0
+            filename = row.get("filename", "")
+            totals[filename] = totals.get(filename, 0.0) + quantity
+
+        return totals
 
     def load_psms(self, filename):
         if filename in self._psm_cache:
