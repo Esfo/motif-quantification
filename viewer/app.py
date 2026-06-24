@@ -65,8 +65,20 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Let Ctrl+C in the terminal actually quit: restore the default SIGINT
+    # behavior and wake the Qt loop periodically so Python can run the handler.
+    import signal
+
+    from PySide6.QtCore import QTimer
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     app = QApplication(sys.argv)
     app.setApplicationName("Motif Quantification Viewer")
+
+    heartbeat = QTimer()
+    heartbeat.start(200)
+    heartbeat.timeout.connect(lambda: None)
 
     window = MainWindow(
         reorganized=args.reorganized,

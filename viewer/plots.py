@@ -59,7 +59,27 @@ def add_profile_line(plot, mzs, intensities):
     plot.plot(mzs[order], intensities[order], pen=pg.mkPen(width=1))
 
 
-def plot_bars(plot, labels, values, title="", y_label="value", color="#4c72b0"):
+import re
+
+
+def short_file_label(filename):
+    """Compact, legible x-axis label for a run, e.g. 'G01' or 'N16'.
+
+    Falls back to the bare filename when the fraction/replicate pattern is
+    absent. Used to keep per-file bar charts from turning into an unreadable
+    wall of long filenames.
+    """
+    name = str(filename)
+    frac = "G" if "_GuHCl_" in name else ("N" if "_NaCl_" in name else "")
+    match = re.search(r"_(\d+)(?:_|\.centroid|\.)", name)
+
+    if frac and match:
+        return f"{frac}{match.group(1)}"
+
+    return name[:10]
+
+
+def plot_bars(plot, labels, values, title="", y_label="value", color="#4c72b0", brushes=None):
     clear_plot(plot)
     plot.setTitle(title)
     plot.setLabel("left", y_label)
@@ -71,7 +91,12 @@ def plot_bars(plot, labels, values, title="", y_label="value", color="#4c72b0"):
         return
 
     x = np.arange(values.size, dtype=np.float64)
-    bars = pg.BarGraphItem(x=x, height=values, width=0.6, brush=color, pen=pg.mkPen("#22222288"))
+
+    if brushes is not None:
+        bars = pg.BarGraphItem(x=x, height=values, width=0.7, brushes=brushes)
+    else:
+        bars = pg.BarGraphItem(x=x, height=values, width=0.7, brush=color)
+
     plot.addItem(bars)
 
     ticks = [(i, str(label)) for i, label in enumerate(labels)]

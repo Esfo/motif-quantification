@@ -29,12 +29,14 @@ try:
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float, safe_int, ViewerSession
     from .views import OverviewView, PeptidesView, ProteinsView
     from .region_view import RegionView
+    from .theming import palette, style_plot
 except ImportError:
     from mzml_store import MzmlStore, scan_arrays
     from plots import add_profile_line, plot_points, plot_spectrum, plot_traces
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float, safe_int, ViewerSession
     from views import OverviewView, PeptidesView, ProteinsView
     from region_view import RegionView
+    from theming import palette, style_plot
 
 
 PSM_COLUMNS = [
@@ -93,6 +95,7 @@ class MainWindow(QMainWindow):
         self.profile_stores = {}
 
         self._opening = False
+        self.theme = "dark"
 
         self.build_menu()
 
@@ -134,6 +137,28 @@ class MainWindow(QMainWindow):
         quit_action = file_menu.addAction("&Quit")
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
+
+        view_menu = self.menuBar().addMenu("&View")
+        self.theme_action = view_menu.addAction("Switch to &light mode")
+        self.theme_action.setShortcut("Ctrl+T")
+        self.theme_action.triggered.connect(self.toggle_theme)
+
+    def toggle_theme(self):
+        self.apply_theme("light" if self.theme == "dark" else "dark")
+
+    def apply_theme(self, theme):
+        self.theme = theme
+        pal = palette(theme)
+
+        for widget in self.findChildren(pg.PlotWidget):
+            style_plot(widget, pal)
+
+        if getattr(self, "region_view", None) is not None:
+            self.region_view.apply_theme(theme)
+
+        self.theme_action.setText(
+            "Switch to &light mode" if theme == "dark" else "Switch to &dark mode"
+        )
 
     def choose_reorganized(self):
         if self._opening:
@@ -222,6 +247,7 @@ class MainWindow(QMainWindow):
         self.distribution_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.distribution_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.distribution_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.distribution_table.cellDoubleClicked.connect(self.on_distribution_activated)
 
         self.detail_text = QPlainTextEdit()
         self.detail_text.setReadOnly(True)
@@ -232,9 +258,11 @@ class MainWindow(QMainWindow):
 
     def build_layout(self):
         self.region_view = RegionView()
+        self.overview_view = OverviewView(self.session)
+        self.overview_view.file_activated.connect(self.show_file_in_spectra)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(OverviewView(self.session), "Overview")
+        self.tabs.addTab(self.overview_view, "Overview")
         self.tabs.addTab(self.build_spectra_tab(), "Spectra")
         self.tabs.addTab(self.region_view, "3D Profile")
         self.tabs.addTab(PeptidesView(self.session), "Peptides")
@@ -243,9 +271,60 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.setCentralWidget(self.tabs)
 
+        self.region_view.apply_theme(self.theme)
+        self.apply_theme(self.theme)
+
     def on_tab_changed(self, index):
         if self.tabs.widget(index) is self.region_view:
             self.region_view.render_if_pending()
+
+    def show_file_in_spectra(self, filename):
+        index = self.file_combo.findData(filename)
+
+        if index >= 0:
+            self.file_combo.setCurrentIndex(index)
+            self.tabs.setCurrentIndex(1)
+
+    def on_distribution_activated(self, row_i, _col):
+        item = self.distribution_table.item(row_i, 0)
+
+        if item is None:
+            return
+
+        row = item.data(Qt.UserRole)
+
+        if not isinstance(row, dict):
+            return
+
+        mono_mz = safe_float(row.get("mono_mz"))
+        charge = safe_int(row.get("charge")) or 1
+        n_members = safe_int(row.get("n_members")) or 4
+        rt_start = safe_float(row.get("rt_start"))
+        rt_end = safe_float(row.get("rt_end"))
+        rt_apex = safe_float(row.get("rt_apex"))
+
+        if mono_mz is None:
+            return
+
+        mz_min = mono_mz - 0.6
+        mz_max = mono_mz + (n_members + 1) / charge + 0.6
+
+        if rt_start is None or rt_end is None:
+            center = rt_apex if rt_apex is not None else 0.0
+            rt_start = center - self.xics_rt_window
+            rt_end = center + self.xics_rt_window
+
+        self.region_view.set_target(
+            centroid_store=self.get_centroid_store(),
+            profile_store=self.get_profile_store(),
+            mz_min=mz_min,
+            mz_max=mz_max,
+            rt_start=max(0.0, rt_start),
+            rt_end=rt_end,
+            label=f"distribution {row.get('distribution_id', '')} z={charge}",
+        )
+        self.tabs.setCurrentIndex(2)
+        self.region_view.render_if_pending()
 
     def build_spectra_tab(self):
         top_bar = QWidget()

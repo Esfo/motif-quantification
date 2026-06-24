@@ -6,7 +6,7 @@ the LFQ quantities Sage produced. Nothing here computes spectra, ions, or
 isotope distributions; it only surfaces values already on disk.
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -23,10 +23,10 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 try:
-    from .plots import plot_bars
+    from .plots import plot_bars, short_file_label
     from .session import safe_float
 except ImportError:
-    from plots import plot_bars
+    from plots import plot_bars, short_file_label
     from session import safe_float
 
 
@@ -95,6 +95,8 @@ def filter_rows(rows, text, fields):
 class OverviewView(QWidget):
     """Per-file run summary from files.tsv, with a bar chart of counts."""
 
+    file_activated = Signal(str)
+
     COLUMNS = [
         ("filename", "file"),
         ("fraction", "fraction"),
@@ -115,6 +117,7 @@ class OverviewView(QWidget):
 
         self.table = QTableWidget()
         configure_table(self.table)
+        self.table.cellDoubleClicked.connect(self.on_row_activated)
 
         self.plot = pg.PlotWidget()
 
@@ -168,7 +171,7 @@ class OverviewView(QWidget):
         colors = []
 
         for row in rows:
-            labels.append(row.get("filename", ""))
+            labels.append(short_file_label(row.get("filename", "")))
             peptide_counts.append(safe_float(row.get("n_peptides"), 0.0) or 0.0)
             colors.append(FRACTION_COLORS.get(row.get("fraction", ""), "#4c72b0"))
 
@@ -179,17 +182,26 @@ class OverviewView(QWidget):
 
         if labels:
             x = list(range(len(labels)))
-            bars = pg.BarGraphItem(
-                x=x,
-                height=peptide_counts,
-                width=0.6,
-                brushes=colors,
-                pen=pg.mkPen("#22222288"),
-            )
+            bars = pg.BarGraphItem(x=x, height=peptide_counts, width=0.7, brushes=colors)
             self.plot.addItem(bars)
             self.plot.getAxis("bottom").setTicks(
                 [[(i, label) for i, label in enumerate(labels)]]
             )
+
+    def on_row_activated(self, row_i, _col):
+        item = self.table.item(row_i, 0)
+
+        if item is None:
+            return
+
+        original = item.data(Qt.UserRole)
+        rows = self.session.files()
+
+        if original is not None and 0 <= original < len(rows):
+            filename = rows[original].get("filename", "")
+
+            if filename:
+                self.file_activated.emit(filename)
 
 
 class PeptidesView(QWidget):
@@ -294,7 +306,7 @@ class PeptidesView(QWidget):
         values = []
 
         for filename in file_order:
-            labels.append(filename)
+            labels.append(short_file_label(filename))
             values.append(totals.get(filename, 0.0))
 
         if any(values):
