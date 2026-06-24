@@ -1208,7 +1208,7 @@ def submit_centroid(centroid_executor, prepared, args):
         centroid_path.parent.mkdir(parents=True, exist_ok=True)
         centroid_path.touch()
 
-    print(f"centroid-start {prepared.centroid}", file=sys.stderr, flush=True)
+    print(f"centroiding {prepared.centroid}", file=sys.stderr, flush=True)
 
     return centroid_executor.submit(
         process_prepared,
@@ -1300,7 +1300,7 @@ def run_pipeline(args, output_dir):
 
                     results.append(result)
                     notes_blocks.append(result["notes"])
-                    print(f"centroid  {result['centroid']}", flush=True)
+                    print(f"centroided {result['centroid']}", flush=True)
 
     except KeyboardInterrupt:
         hard_interrupt_exit(prepare_executor, centroid_executor)
