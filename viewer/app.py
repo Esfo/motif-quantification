@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+from pathlib import Path
+
+from PySide6.QtWidgets import QApplication
+
+try:
+    from .main_window import MainWindow
+except ImportError:
+    from main_window import MainWindow
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Open the motif-quantification MS evidence viewer."
+    )
+
+    parser.add_argument(
+        "--reorganized",
+        required=True,
+        type=Path,
+        help="searches/reorganized directory produced by reorganize-results.py",
+    )
+
+    parser.add_argument(
+        "--distribution-db",
+        type=Path,
+        default=None,
+        help="optional distributions SQLite database",
+    )
+
+    parser.add_argument(
+        "--centroid-dir",
+        type=Path,
+        default=None,
+        help="optional directory containing centroid mzML files; defaults to manifest mzml_dir",
+    )
+
+    parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        default=None,
+        help="optional directory containing matching profile mzML files",
+    )
+
+    parser.add_argument(
+        "--xics-ppm",
+        type=float,
+        default=10.0,
+        help="ppm tolerance for MS1 isotope XIC extraction",
+    )
+
+    parser.add_argument(
+        "--xics-rt-window",
+        type=float,
+        default=0.8,
+        help="RT window in minutes on each side of the selected ID",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Motif Quantification Viewer")
+
+    window = MainWindow(
+        reorganized=args.reorganized,
+        distribution_db=args.distribution_db,
+        centroid_dir=args.centroid_dir,
+        profile_dir=args.profile_dir,
+        xics_ppm=args.xics_ppm,
+        xics_rt_window=args.xics_rt_window,
+    )
+
+    window.resize(1600, 950)
+    window.show()
+
+    raise SystemExit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

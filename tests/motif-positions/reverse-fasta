@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+
+import argparse
+from pathlib import Path
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Reverse every protein sequence in a FASTA file."
+    )
+    p.add_argument("fasta", type=Path)
+    p.add_argument("out_fasta", type=Path)
+    p.add_argument("--line-width", type=int, default=60)
+    return p.parse_args()
+
+
+def write_wrapped(out, seq: str, width: int):
+    if width <= 0:
+        out.write(seq + "\n")
+        return
+
+    for i in range(0, len(seq), width):
+        out.write(seq[i : i + width] + "\n")
+
+
+def main():
+    args = parse_args()
+
+    header = None
+    seq_parts: list[str] = []
+
+    with args.fasta.open() as f, args.out_fasta.open("w") as out:
+        for line in f:
+            line = line.rstrip("\n")
+
+            if line.startswith(">"):
+                if header is not None:
+                    out.write(header + "\n")
+                    seq = "".join(seq_parts).replace(" ", "").replace("\t", "")
+                    write_wrapped(out, seq[::-1], args.line_width)
+
+                header = line
+                seq_parts = []
+            else:
+                seq_parts.append(line.strip())
+
+        if header is not None:
+            out.write(header + "\n")
+            seq = "".join(seq_parts).replace(" ", "").replace("\t", "")
+            write_wrapped(out, seq[::-1], args.line_width)
+
+
+if __name__ == "__main__":
+    main()

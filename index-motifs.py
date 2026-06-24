@@ -1,83 +1,80 @@
 #!/usr/bin/env python3
 
 """
-Build a skeleton motif atlas.
+Build a raw motif index from a FASTA proteome.
 
-Output:
-  proteins.tsv
-  motifs.tsv
-  postings.bin
-  build_info.tsv
+A motif pattern is a compressed description of related protein windows.
 
-Specificity logic:
-  internal_budget = round((k - 2) * specificity)
+A letter means that position is fixed.
+A dot means that position is open.
 
-  At each next internal fixed position:
-    step = next_internal_fixed / internal_budget
-    child_min = max(min_proteins, ceil(parent_support * specificity * step))
+So:
 
-So --specificity controls both:
-  1. how many internal positions a skeleton may fix
-  2. how much parent support a new child skeleton needs
+    A.....G
 
+means:
 
-Build a skeleton motif atlas from a FASTA proteome.
+    any 7-amino-acid window that starts with A and ends with G
 
-A skeleton motif is a partially fixed peptide pattern:
+The Rust code starts with broad endpoint patterns. Then it asks whether one
+internal position should be filled to create more specific child patterns:
 
-    A...G
-    A.P.G
-    A.P.LG
+    A.....G
+        A.P...G
+        A.K...G
+        A...L.G
 
-The endpoints are fixed first. Internal positions are filled only when doing so
-creates a pattern that is supported by enough proteins.
+The main control is:
 
-The main tuning flag is:
+    --specificity
 
-    --specificity 0.35
+Specificity means exactly two things in this version.
 
-Specificity controls how detailed motifs are allowed to become.
+First: length-scaled depth.
 
-It dynamically controls two linked things:
+Instead of a hard-coded max_fixed value, the maximum number of internal fixed
+positions is derived from motif length:
 
-1. How many internal positions may be fixed
+    internal_positions = k - 2
+    internal_budget = round(internal_positions * specificity)
 
-   For a motif length k:
+Endpoints do not count because they define the starting parent pattern.
 
-       internal_positions = k - 2
-       internal_budget = round(internal_positions * specificity)
+Second: parent-level split coverage.
 
-   Endpoints do not count toward this budget.
+A parent should not split just because one tiny child exists. The children from
+one proposed split position must collectively explain enough of the parent:
 
-   Example with --specificity 0.35:
+    split_coverage =
+        unique proteins covered by all children from that split
+        /
+        parent proteins
 
-       k=6   -> 4 internal slots  -> about 1 slot may be fixed
-       k=12  -> 10 internal slots -> about 4 slots may be fixed
-       k=25  -> 23 internal slots -> about 8 slots may be fixed
+The required split coverage is derived from specificity:
 
-2. How much evidence is needed to create a more-specific child motif
+    required_split_coverage = 1 - specificity
 
-   As a skeleton becomes more specific, the support required for another child
-   also increases.
+So at specificity 0.35, children must cover at least 65% of the parent protein
+set for the split to happen.
 
-       progress = next_internal_fixed_position / internal_budget
-       required_fraction = specificity * progress
-       child_min = max(min_proteins, ceil(parent_support * required_fraction))
+Lower specificity keeps motifs broader.
+Higher specificity allows deeper and smaller substructure.
 
-   This prevents broad parent motifs from spawning many tiny children while also
-   preventing already-specific motifs from fragmenting endlessly.
+The splitter avoids an artificial left-side bias. If several split positions
+are equally good, it does not simply pick the earliest internal position. It
+scores split positions by protein coverage and child structure first, then uses
+centrality as a final tie-break.
 
-In plain terms:
+This script writes only the raw atlas:
 
-    --specificity controls the allowed detail level of the atlas.
+    motifs.tsv
+    postings.bin
+    proteins.tsv
+    build_info.tsv
 
-Lower values produce broader, more general skeletons.
-Higher values allow more detailed skeletons, but require stronger support as
-the motif becomes more specific.
-
-The default, --specificity 0.35, means the atlas may fix roughly 35% of the
-internal positions, with child-support requirements tightening as that budget
-is used.
+No family hierarchy.
+No cleaned motif table.
+No cross-length merge.
 """
 
 from __future__ import annotations
@@ -90,7 +87,7 @@ from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build skeleton motif index.")
+    p = argparse.ArgumentParser(description="Build a raw skeleton motif index.")
 
     p.add_argument("fasta", type=Path)
     p.add_argument("outdir", type=Path)
@@ -107,6 +104,12 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--threads", type=int)
     p.add_argument("--chunk-size", type=int, default=64)
+    p.add_argument(
+        "--branch-min-hits",
+        type=int,
+        default=8192,
+        help="Performance-only threshold for parallelizing recursive branches. Does not change output.",
+    )
     p.add_argument("--overwrite", action="store_true")
 
     return p.parse_args()
@@ -145,6 +148,8 @@ def main() -> int:
         args.exclude_aa,
         "--chunk-size",
         str(args.chunk_size),
+        "--branch-min-hits",
+        str(args.branch_min_hits),
     ]
 
     if args.include_trembl:

@@ -8,3 +8,87 @@ motif-indexing/target/
 *.tsv
 *.tsv.gz
 *.zst
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Large mass-spec raw/intermediate data
+*.mzML
+*.mzML.gz
+*.mzml
+*.mzml.gz
+*.raw
+*.RAW
+*.wiff
+*.wiff2
+*.d/
+*.tdf
+*.tdf_bin
+*.baf
+
+# SQLite/generated indexes
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+
+# Distribution/deconvolution outputs
+distributions/*.pickle
+distributions/*.pkl
+distributions/*.json
+distributions/*.tsv
+distributions/*.csv
+distributions/*.sqlite
+distributions/*.sqlite3
+
+# Search/Sage/Percolator generated outputs
+searches/
+**/sage.pin
+**/results.sage.tsv
+**/results.json
+**/lfq.tsv
+**/matched_fragments.sage.tsv
+**/sage.tsv
+**/percolator.target.psms.txt
+**/percolator.decoy.psms.txt
+**/percolator.target.peptides.txt
+**/percolator.decoy.peptides.txt
+**/reorganized/
+
+# Viewer runtime/generated files
+viewer/*.log
+viewer/*.json
+viewer/*.sqlite
+viewer/*.sqlite3
+viewer/session_state.*
+viewer/cache/
+viewer/.cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

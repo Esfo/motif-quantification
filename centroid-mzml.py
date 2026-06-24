@@ -24,6 +24,7 @@ from psims.mzml.writer import MzMLWriter
 
 
 DEFAULT_DOCKER_IMAGE = "proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses:latest"
+SCRIPT_VERSION = "1.9.0"
 
 VENDOR_SUFFIXES = (
     ".raw",
@@ -38,7 +39,6 @@ VENDOR_SUFFIXES = (
 
 ACTIVE_LOCK = threading.RLock()
 ACTIVE_PROCS = set()
-ACTIVE_CONTAINERS = set()
 
 
 @dataclass(frozen=True)
@@ -114,9 +114,22 @@ def looks_complete_mzml(path):
     return b"</indexedmzml>" in tail or b"</mzml>" in tail
 
 
-def safe_docker_name(source):
-    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", strip_ms_suffix(source))[:64]
-    return f"centroidmzml-{stem}-{uuid.uuid4().hex[:12]}"
+def relative_to_or_none(path, root):
+    try:
+        return Path(path).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        return None
+
+
+def choose_docker_mount_root(source, output_dir):
+    source = Path(source).resolve()
+    output_dir = Path(output_dir).resolve()
+    cwd = Path.cwd().resolve()
+
+    if relative_to_or_none(source, cwd) is not None and relative_to_or_none(output_dir, cwd) is not None:
+        return cwd
+
+    return Path(os.path.commonpath([str(source.parent), str(output_dir)])).resolve()
 
 
 def subprocess_preexec():
@@ -140,18 +153,6 @@ def register_proc(proc):
 def unregister_proc(proc):
     with ACTIVE_LOCK:
         ACTIVE_PROCS.discard(proc)
-
-
-def register_container(name):
-    if name:
-        with ACTIVE_LOCK:
-            ACTIVE_CONTAINERS.add(name)
-
-
-def unregister_container(name):
-    if name:
-        with ACTIVE_LOCK:
-            ACTIVE_CONTAINERS.discard(name)
 
 
 def kill_process_group(proc, timeout=1):
@@ -186,34 +187,13 @@ def kill_process_group(proc, timeout=1):
         pass
 
 
-def docker_rm_force(name):
-    if not name:
-        return
-
-    subprocess.run(
-        ["docker", "rm", "-f", name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-
-
 def kill_active_children():
     with ACTIVE_LOCK:
         procs = list(ACTIVE_PROCS)
-        containers = list(ACTIVE_CONTAINERS)
 
     for proc in procs:
         try:
             kill_process_group(proc)
-        except Exception:
-            pass
-
-    for container in containers:
-        try:
-            docker_rm_force(container)
         except Exception:
             pass
 
@@ -244,9 +224,7 @@ def hard_interrupt_exit(prepare_executor=None, centroid_executor=None):
     os._exit(130)
 
 
-def run_checked_subprocess(cmd, failure_message, docker_container=None):
-    register_container(docker_container)
-
+def run_checked_subprocess(cmd, failure_message):
     proc = subprocess.Popen(
         cmd,
         text=True,
@@ -260,94 +238,63 @@ def run_checked_subprocess(cmd, failure_message, docker_container=None):
         stdout, stderr = proc.communicate()
     except BaseException:
         kill_process_group(proc)
-        if docker_container:
-            docker_rm_force(docker_container)
         raise
     finally:
         unregister_proc(proc)
-        unregister_container(docker_container)
 
     if proc.returncode != 0:
         sys.stderr.write(stdout or "")
         sys.stderr.write(stderr or "")
-        if docker_container:
-            docker_rm_force(docker_container)
         fail(failure_message)
 
     return stdout, stderr
 
 
-def run_host_msconvert(source, output_dir, outfile, args):
+def run_host_msconvert(source, output_dir, args):
+    source = Path(source)
+    output_dir = Path(output_dir)
+
     cmd = [
         args.msconvert,
         str(source),
         "--mzML",
         "--64",
         "--zlib",
-        "--outdir",
-        str(output_dir),
-        "--outfile",
-        outfile,
+        f"--outdir={str(output_dir)}",
     ]
 
     run_checked_subprocess(cmd, f"msconvert failed for {source}")
 
 
-def run_docker_msconvert(source, output_dir, outfile, args):
+def run_docker_msconvert(source, output_dir, args):
     source = Path(source).resolve()
     output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    input_parent = source.parent
-    input_name = source.name
-    container_name = safe_docker_name(source)
-
-    uid = os.getuid()
-    gid = os.getgid()
-
-    msconvert_cmd = [
-        *shlex.split(args.docker_msconvert),
-        f"/input/{input_name}",
-        "--mzML",
-        "--64",
-        "--zlib",
-        "--outdir",
-        "/output",
-        "--outfile",
-        outfile,
-    ]
-
-    msconvert_shell = " ".join(shlex.quote(x) for x in msconvert_cmd)
-    output_shell = f"/output/{shlex.quote(outfile)}"
-    shell_cmd = (
-        f"trap 'chown {uid}:{gid} {output_shell} 2>/dev/null || true' EXIT; "
-        f"{msconvert_shell}"
-    )
+    mount_root = choose_docker_mount_root(source, output_dir)
+    source_rel = source.relative_to(mount_root).as_posix()
+    output_rel = output_dir.relative_to(mount_root).as_posix()
 
     cmd = [
         "docker",
         "run",
         "--rm",
-        "--name",
-        container_name,
-        "--cpus",
-        "1",
         "-e",
         "WINEDEBUG=-all",
         "-v",
-        f"{input_parent}:/input:ro",
-        "-v",
-        f"{output_dir}:/output",
+        f"{mount_root}:/data",
+        "-w",
+        "/data",
         args.docker_image,
-        "bash",
-        "-lc",
-        shell_cmd,
+        *shlex.split(args.docker_msconvert),
+        "--mzML",
+        "--64",
+        "--zlib",
+        f"--outdir={output_rel}",
+        source_rel,
     ]
 
-    run_checked_subprocess(
-        cmd,
-        f"Docker msconvert failed for {source}",
-        docker_container=container_name,
-    )
+    run_checked_subprocess(cmd, f"Docker msconvert failed for {source}")
 
 
 def run_msconvert(source, output_dir, args):
@@ -364,9 +311,9 @@ def run_msconvert(source, output_dir, args):
         out_mzml.unlink()
 
     if args.converter == "docker":
-        run_docker_msconvert(source, output_dir, out_mzml.name, args)
+        run_docker_msconvert(source, output_dir, args)
     elif args.converter == "host":
-        run_host_msconvert(source, output_dir, out_mzml.name, args)
+        run_host_msconvert(source, output_dir, args)
     else:
         fail(f"unknown converter: {args.converter}")
 
@@ -417,11 +364,7 @@ def derive_parallelism(args):
         die("--jobs must be at least 1")
 
     input_count = len(args.inputs)
-
     args.worker_slots = max(1, min(args.jobs, input_count))
-    args.converter_workers = args.worker_slots
-    args.centroid_workers = args.worker_slots
-
     return args
 
 
@@ -429,7 +372,7 @@ def print_parallelism(args):
     vendor_count = sum(1 for path in args.inputs if is_vendor(path))
 
     if vendor_count and args.converter == "docker":
-        conversion = f"up to {args.worker_slots} Docker converter(s), 1 CPU each"
+        conversion = f"up to {args.worker_slots} Docker converter(s), uncapped ProteoWizard/Wine"
     elif vendor_count:
         conversion = f"up to {args.worker_slots} host converter(s)"
     else:
@@ -437,10 +380,9 @@ def print_parallelism(args):
 
     print(
         f"parallelism: -j {args.jobs}; "
-        f"{args.worker_slots} total active job slot(s); "
+        f"{args.worker_slots} concurrent file job(s); "
         f"conversion: {conversion}; "
-        f"centroiding: up to {args.worker_slots} worker(s); "
-        f"active conversion + centroid jobs <= {args.worker_slots}",
+        f"centroiding: up to {args.worker_slots} worker(s)",
         file=sys.stderr,
         flush=True,
     )
@@ -818,6 +760,7 @@ def write_mzml_header(writer, has_profile=False):
         [
             {
                 "id": "centroidmzml",
+                "version": SCRIPT_VERSION,
                 "params": ["custom unreleased software tool"],
             }
         ]
@@ -1091,7 +1034,7 @@ def parse_args():
     default_jobs = max(1, min(4, os.cpu_count() or 1))
 
     parser = argparse.ArgumentParser(
-        prog="centroidmzml",
+        prog="centroid-mzml",
         description="Convert vendor/profile MS data to profile mzML and custom-centroided mzML.",
     )
 
@@ -1109,7 +1052,7 @@ def parse_args():
         "--jobs",
         type=int,
         default=default_jobs,
-        help=f"total active jobs; default: {default_jobs}",
+        help=f"concurrent file jobs; default: {default_jobs}",
     )
 
     parser.add_argument(
@@ -1162,6 +1105,12 @@ def parse_args():
         "--overwrite",
         action="store_true",
         help="overwrite existing .mzML and .centroid.mzML outputs",
+    )
+
+    parser.add_argument(
+        "--tracebacks",
+        action="store_true",
+        help="print full Python tracebacks for per-file failures",
     )
 
     return parser.parse_args()
@@ -1221,6 +1170,13 @@ def submit_centroid(centroid_executor, prepared, args):
     )
 
 
+def print_failure(label, item, exc, args):
+    print(f"failed {label} {item}: {exc}", file=sys.stderr, flush=True)
+
+    if args.tracebacks:
+        print(traceback.format_exc(), file=sys.stderr)
+
+
 def run_pipeline(args, output_dir):
     validate_inputs(args.inputs)
 
@@ -1266,10 +1222,8 @@ def run_pipeline(args, output_dir):
                     try:
                         prepared = future.result()
                     except Exception as exc:
-                        tb = traceback.format_exc()
-                        failures.append((source, exc, tb))
-                        print(f"failed preparing {source}: {exc}", file=sys.stderr)
-                        print(tb, file=sys.stderr)
+                        failures.append((source, exc))
+                        print_failure("preparing", source, exc, args)
                         continue
 
                     print(f"profile   {prepared.profile}", flush=True)
@@ -1277,10 +1231,8 @@ def run_pipeline(args, output_dir):
                     try:
                         centroid_future = submit_centroid(centroid_executor, prepared, args)
                     except Exception as exc:
-                        tb = traceback.format_exc()
-                        failures.append((prepared.source, exc, tb))
-                        print(f"failed submitting centroid job for {prepared.source}: {exc}", file=sys.stderr)
-                        print(tb, file=sys.stderr)
+                        failures.append((prepared.source, exc))
+                        print_failure("submitting centroid job for", prepared.source, exc, args)
                         continue
 
                     centroid_futures[centroid_future] = prepared
@@ -1292,10 +1244,8 @@ def run_pipeline(args, output_dir):
                     try:
                         result = future.result()
                     except Exception as exc:
-                        tb = traceback.format_exc()
-                        failures.append((prepared.source, exc, tb))
-                        print(f"failed centroiding {prepared.source}: {exc}", file=sys.stderr)
-                        print(tb, file=sys.stderr)
+                        failures.append((prepared.source, exc))
+                        print_failure("centroiding", prepared.source, exc, args)
                         continue
 
                     results.append(result)
@@ -1318,7 +1268,10 @@ def run_pipeline(args, output_dir):
         print(
             f"finished with {len(failures)} failed file(s) and {len(results)} successful centroid file(s)",
             file=sys.stderr,
+            flush=True,
         )
+        for item, exc in failures:
+            print(f"  failed: {item}: {exc}", file=sys.stderr, flush=True)
         raise SystemExit(1)
 
     return sorted(results, key=lambda x: x["source"])

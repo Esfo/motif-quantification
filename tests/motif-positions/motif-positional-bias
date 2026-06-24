@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+
+"""
+Test whether fixed internal motif positions are left-loaded, right-loaded, or
+center-loaded.
+
+This script ignores motif endpoints and only studies internal fixed positions.
+
+It compares observed fixed-position counts against a null model that preserves:
+
+    1. motif length k
+    2. number of fixed internal positions in that motif
+
+For each motif, the null expectation randomly places the same number of fixed
+internal residues across the same internal slots. This means the output is not
+confounded by longer motifs having more positions or deeper motifs having more
+fixed residues.
+
+Main printed value:
+
+    mirror_imbalance = (left_fixed - right_fixed) / (left_fixed + right_fixed)
+
+Interpretation:
+
+    near 0:
+        no strong left/right positional asymmetry
+
+    positive:
+        fixed internal residues are left-loaded
+
+    negative:
+        fixed internal residues are right-loaded
+
+Run this on both the original proteome index and the reversed-proteome index.
+
+Expected diagnostic:
+
+    original positive, reversed negative:
+        likely biological N-to-C directionality
+
+    original positive, reversed also positive:
+        likely algorithmic left-position bias
+
+    both near zero:
+        no strong left/right bias
+
+Use --weighted to weight each motif by protein_count. If weighted bias is much
+stronger than unweighted bias, the bias is concentrated in higher-support motifs,
+not just rare low-support leaves.
+
+The TSV output contains bin-level observed-versus-expected counts. Positive z
+means that relative internal position is enriched compared with the null model.
+"""
+
+import argparse
+import math
+from collections import defaultdict
+from pathlib import Path
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("motifs_tsv", type=Path)
+    p.add_argument("out_tsv", type=Path)
+    p.add_argument("--bins", type=int, default=20)
+    p.add_argument("--weighted", action="store_true")
+    return p.parse_args()
+
+
+def motif_positions(motif: str):
+    return [i for i, c in enumerate(motif) if c != "."]
+
+
+def main():
+    args = parse_args()
+
+    obs = [0.0 for _ in range(args.bins)]
+    exp = [0.0 for _ in range(args.bins)]
+    var = [0.0 for _ in range(args.bins)]
+
+    left = 0.0
+    right = 0.0
+    center = 0.0
+    total_fixed_internal = 0.0
+    motif_count = 0
+
+    by_k = defaultdict(int)
+    by_fixed_internal = defaultdict(int)
+
+    with args.motifs_tsv.open() as f:
+        header = next(f).rstrip("\n").split("\t")
+        motif_idx = header.index("motif_text")
+        protein_idx = header.index("protein_count")
+
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            motif = parts[motif_idx]
+            protein_count = int(parts[protein_idx])
+            weight = float(protein_count if args.weighted else 1.0)
+
+            k = len(motif)
+            if k <= 2:
+                continue
+
+            internal_slots = k - 2
+            fixed = motif_positions(motif)
+            internal_fixed = [p for p in fixed if 0 < p < k - 1]
+            m = len(internal_fixed)
+
+            if m == 0:
+                continue
+
+            motif_count += 1
+            by_k[k] += 1
+            by_fixed_internal[m] += 1
+            total_fixed_internal += weight * m
+
+            midpoint = (k - 1) / 2
+
+            for p in internal_fixed:
+                rel = (p - 1) / internal_slots
+                b = min(args.bins - 1, int(rel * args.bins))
+                obs[b] += weight
+
+                if p < midpoint:
+                    left += weight
+                elif p > midpoint:
+                    right += weight
+                else:
+                    center += weight
+
+            p_fixed = m / internal_slots
+
+            for p in range(1, k - 1):
+                rel = (p - 1) / internal_slots
+                b = min(args.bins - 1, int(rel * args.bins))
+                exp[b] += weight * p_fixed
+                var[b] += (weight ** 2) * p_fixed * (1.0 - p_fixed)
+
+    with args.out_tsv.open("w") as out:
+        out.write(
+            "bin\tleft_edge\tright_edge\tobserved\texpected\tobs_minus_exp\tz\n"
+        )
+
+        for b in range(args.bins):
+            z = 0.0
+            if var[b] > 0:
+                z = (obs[b] - exp[b]) / math.sqrt(var[b])
+
+            out.write(
+                f"{b}\t"
+                f"{b / args.bins:.4f}\t"
+                f"{(b + 1) / args.bins:.4f}\t"
+                f"{obs[b]:.3f}\t"
+                f"{exp[b]:.3f}\t"
+                f"{obs[b] - exp[b]:.3f}\t"
+                f"{z:.3f}\n"
+            )
+
+    denom = left + right
+    mirror_imbalance = 0.0 if denom == 0 else (left - right) / denom
+
+    print(f"motifs_used\t{motif_count}")
+    print(f"total_fixed_internal\t{total_fixed_internal:.3f}")
+    print(f"left_fixed\t{left:.3f}")
+    print(f"right_fixed\t{right:.3f}")
+    print(f"center_fixed\t{center:.3f}")
+    print(f"mirror_imbalance\t{mirror_imbalance:.6f}")
+    print(f"wrote\t{args.out_tsv}")
+
+
+if __name__ == "__main__":
+    main()
