@@ -1,0 +1,10 @@
+motif-indexing/target/
+
+# Motif index outputs
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.parquet
+*.tsv
+*.tsv.gz
+*.zst

@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+
+import argparse
+import gzip
+import sys
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import numpy as np
+from pyteomics import mzml
+
+
+def strip_ms_suffix(path):
+    name = Path(path).name
+    lowered = name.lower()
+
+    for suffix in (
+        ".centroid.mzml",
+        ".mzml.gz",
+        ".mzml",
+        ".raw",
+        ".wiff.scan",
+        ".wiff2",
+        ".wiff",
+        ".d",
+        ".lcd",
+        ".baf",
+        ".tdf_bin",
+        ".tdf",
+    ):
+        if lowered.endswith(suffix):
+            return name[: -len(suffix)]
+
+    return Path(name).stem
+
+
+def parse_levels(value):
+    levels = set()
+
+    for part in value.split(","):
+        part = part.strip()
+
+        if not part:
+            continue
+
+        if "-" in part:
+            left, right = part.split("-", 1)
+            levels.update(range(int(left), int(right) + 1))
+        else:
+            levels.add(int(part))
+
+    if not levels:
+        raise SystemExit("empty --levels")
+
+    return levels
+
+
+def open_text(path):
+    path = Path(path)
+
+    if str(path).lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+
+    return open(path, "rt", encoding="utf-8", errors="replace")
+
+
+def local_name(tag):
+    if "}" in tag:
+        return tag.rsplit("}", 1)[1]
+    return tag
+
+
+def collect_mzml_header(path):
+    found = Counter()
+    spectrum_list_count = None
+    spectrum_list_default_dp = None
+    run_default_instrument = None
+    data_processing_ids = set()
+    software_ids = set()
+    instrument_ids = set()
+    cv_terms_seen = Counter()
+
+    with open_text(path) as handle:
+        for event, elem in ET.iterparse(handle, events=("start",)):
+            tag = local_name(elem.tag)
+
+            if tag in {
+                "cvList",
+                "fileDescription",
+                "fileContent",
+                "softwareList",
+                "instrumentConfigurationList",
+                "dataProcessingList",
+                "run",
+                "spectrumList",
+            }:
+                found[tag] += 1
+
+            if tag == "cvParam":
+                accession = elem.attrib.get("accession")
+                name = elem.attrib.get("name")
+
+                if accession:
+                    cv_terms_seen[accession] += 1
+                if name:
+                    cv_terms_seen[name] += 1
+
+            if tag == "software":
+                software_id = elem.attrib.get("id")
+                if software_id:
+                    software_ids.add(software_id)
+
+            if tag == "instrumentConfiguration":
+                instrument_id = elem.attrib.get("id")
+                if instrument_id:
+                    instrument_ids.add(instrument_id)
+
+            if tag == "dataProcessing":
+                dp_id = elem.attrib.get("id")
+                if dp_id:
+                    data_processing_ids.add(dp_id)
+
+            if tag == "run":
+                run_default_instrument = elem.attrib.get("defaultInstrumentConfigurationRef")
+
+            if tag == "spectrumList":
+                count = elem.attrib.get("count")
+                spectrum_list_default_dp = elem.attrib.get("defaultDataProcessingRef")
+
+                if count is not None:
+                    try:
+                        spectrum_list_count = int(count)
+                    except ValueError:
+                        spectrum_list_count = None
+
+                break
+
+    return {
+        "found": found,
+        "spectrum_list_count": spectrum_list_count,
+        "spectrum_list_default_dp": spectrum_list_default_dp,
+        "run_default_instrument": run_default_instrument,
+        "data_processing_ids": data_processing_ids,
+        "software_ids": software_ids,
+        "instrument_ids": instrument_ids,
+        "cv_terms_seen": cv_terms_seen,
+    }
+
+
+def scan_ms_level(scan):
+    return int(scan.get("ms level", 0) or 0)
+
+
+def scan_id(scan):
+    return scan.get("id") or f"index={scan.get('index', 0)}"
+
+
+def is_centroid_scan(scan):
+    return "centroid spectrum" in scan
+
+
+def is_profile_scan(scan):
+    return "profile spectrum" in scan
+
+
+def scan_rt(scan):
+    try:
+        return float(np.real(scan["scanList"]["scan"][0]["scan start time"]))
+    except Exception:
+        return None
+
+
+def precursor_mz(scan):
+    try:
+        precursor = scan["precursorList"]["precursor"][0]
+        selected = precursor["selectedIonList"]["selectedIon"][0]
+        return float(selected["selected ion m/z"])
+    except Exception:
+        return None
+
+
+def read_scan_summary(path):
+    summaries = []
+    errors = []
+
+    try:
+        with mzml.MzML(str(path), dtype=np.float64) as reader:
+            for index, scan in enumerate(reader):
+                sid = scan_id(scan)
+                level = scan_ms_level(scan)
+
+                try:
+                    mz_array = np.asarray(scan["m/z array"], dtype=np.float64)
+                    intensity_array = np.asarray(scan["intensity array"], dtype=np.float64)
+                except Exception as exc:
+                    errors.append(f"{sid}: missing or unreadable m/z or intensity array: {exc}")
+                    continue
+
+                if mz_array.shape != intensity_array.shape:
+                    errors.append(
+                        f"{sid}: m/z and intensity arrays differ in length "
+                        f"({mz_array.size} vs {intensity_array.size})"
+                    )
+
+                if not np.isfinite(mz_array).all():
+                    errors.append(f"{sid}: m/z array contains non-finite values")
+
+                if not np.isfinite(intensity_array).all():
+                    errors.append(f"{sid}: intensity array contains non-finite values")
+
+                if mz_array.size and np.any(mz_array < 0):
+                    errors.append(f"{sid}: m/z array contains negative values")
+
+                if intensity_array.size and np.any(intensity_array < 0):
+                    errors.append(f"{sid}: intensity array contains negative values")
+
+                if mz_array.size > 1 and np.any(np.diff(mz_array) < 0):
+                    errors.append(f"{sid}: m/z array is not sorted ascending")
+
+                summaries.append(
+                    {
+                        "index": index,
+                        "id": sid,
+                        "level": level,
+                        "centroid": is_centroid_scan(scan),
+                        "profile": is_profile_scan(scan),
+                        "mz_count": int(mz_array.size),
+                        "tic": float(intensity_array.sum()),
+                        "rt": scan_rt(scan),
+                        "precursor_mz": precursor_mz(scan),
+                    }
+                )
+
+    except Exception as exc:
+        errors.append(f"file could not be read by pyteomics: {exc}")
+
+    return summaries, errors
+
+
+def validate_header(path):
+    errors = []
+    warnings = []
+    header = collect_mzml_header(path)
+
+    required_sections = [
+        "cvList",
+        "fileDescription",
+        "softwareList",
+        "instrumentConfigurationList",
+        "dataProcessingList",
+        "run",
+        "spectrumList",
+    ]
+
+    for section in required_sections:
+        if header["found"][section] < 1:
+            errors.append(f"missing mzML section: {section}")
+
+    if header["spectrum_list_count"] is None:
+        errors.append("spectrumList has no integer count")
+
+    default_dp = header["spectrum_list_default_dp"]
+
+    if not default_dp:
+        errors.append("spectrumList has no defaultDataProcessingRef")
+    elif default_dp not in header["data_processing_ids"]:
+        errors.append(
+            f"spectrumList defaultDataProcessingRef={default_dp!r} "
+            "does not match any dataProcessing id"
+        )
+
+    default_ic = header["run_default_instrument"]
+
+    if not default_ic:
+        warnings.append("run has no defaultInstrumentConfigurationRef")
+    elif default_ic not in header["instrument_ids"]:
+        errors.append(
+            f"run defaultInstrumentConfigurationRef={default_ic!r} "
+            "does not match any instrumentConfiguration id"
+        )
+
+    if not header["software_ids"]:
+        errors.append("softwareList exists but no software id was found")
+
+    if not header["data_processing_ids"]:
+        errors.append("dataProcessingList exists but no dataProcessing id was found")
+
+    return header, errors, warnings
+
+
+def validate_centroid_file(path, centroid_levels):
+    path = Path(path)
+    errors = []
+    warnings = []
+
+    if not path.exists():
+        return None, [f"missing file: {path}"], warnings
+
+    if path.stat().st_size == 0:
+        return None, [f"empty file: {path}"], warnings
+
+    if path.name.endswith(".tmp"):
+        return None, [f"temporary file was passed as input: {path}"], warnings
+
+    header, header_errors, header_warnings = validate_header(path)
+    errors.extend(header_errors)
+    warnings.extend(header_warnings)
+
+    scans, scan_errors = read_scan_summary(path)
+    errors.extend(scan_errors)
+
+    if header["spectrum_list_count"] is not None and header["spectrum_list_count"] != len(scans):
+        errors.append(
+            f"spectrumList count says {header['spectrum_list_count']}, "
+            f"but pyteomics read {len(scans)} spectra"
+        )
+
+    if not scans:
+        errors.append("no spectra read")
+
+    duplicate_ids = [
+        sid for sid, count in Counter(scan["id"] for scan in scans).items()
+        if count > 1
+    ]
+
+    if duplicate_ids:
+        errors.append(f"duplicate spectrum ids: {duplicate_ids[:10]}")
+
+    by_level = Counter(scan["level"] for scan in scans)
+
+    for level in sorted(centroid_levels):
+        if by_level[level] == 0:
+            warnings.append(f"no MS{level} scans found")
+
+    for scan in scans:
+        sid = scan["id"]
+        level = scan["level"]
+
+        if level in centroid_levels:
+            if not scan["centroid"]:
+                errors.append(f"{sid}: MS{level} scan is not marked centroid spectrum")
+            if scan["profile"]:
+                errors.append(f"{sid}: MS{level} scan is still marked profile spectrum")
+            if scan["mz_count"] == 0:
+                warnings.append(f"{sid}: MS{level} centroided scan has zero peaks")
+
+        if level >= 2 and scan["precursor_mz"] is None:
+            warnings.append(f"{sid}: MS{level} scan has no selected precursor m/z")
+
+    return {
+        "path": path,
+        "scan_count": len(scans),
+        "by_level": by_level,
+        "centroid_by_level": Counter(scan["level"] for scan in scans if scan["centroid"]),
+        "profile_by_level": Counter(scan["level"] for scan in scans if scan["profile"]),
+    }, errors, warnings
+
+
+def matching_profile_file(centroid_path, profile_dir):
+    centroid_path = Path(centroid_path)
+    profile_dir = Path(profile_dir)
+
+    stem = strip_ms_suffix(centroid_path)
+    candidates = [
+        profile_dir / f"{stem}.mzML",
+        profile_dir / f"{stem}.mzml",
+        centroid_path.with_name(f"{stem}.mzML"),
+        centroid_path.with_name(f"{stem}.mzml"),
+    ]
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.resolve() != centroid_path.resolve():
+            return candidate
+
+    return None
+
+
+def compare_profile_and_centroid(profile_path, centroid_path):
+    errors = []
+    warnings = []
+
+    profile_scans, profile_errors = read_scan_summary(profile_path)
+    centroid_scans, centroid_errors = read_scan_summary(centroid_path)
+
+    if profile_errors:
+        errors.extend(f"profile {profile_path}: {x}" for x in profile_errors)
+
+    if centroid_errors:
+        errors.extend(f"centroid {centroid_path}: {x}" for x in centroid_errors)
+
+    if len(profile_scans) != len(centroid_scans):
+        errors.append(
+            f"profile/centroid spectrum count mismatch: "
+            f"{profile_path} has {len(profile_scans)}, {centroid_path} has {len(centroid_scans)}"
+        )
+
+    n = min(len(profile_scans), len(centroid_scans))
+
+    for i in range(n):
+        p = profile_scans[i]
+        c = centroid_scans[i]
+
+        if p["id"] != c["id"]:
+            errors.append(
+                f"spectrum id mismatch at index {i}: profile={p['id']!r}, centroid={c['id']!r}"
+            )
+
+        if p["level"] != c["level"]:
+            errors.append(
+                f"MS level mismatch for {p['id']!r}: profile=MS{p['level']}, centroid=MS{c['level']}"
+            )
+
+        if p["rt"] is not None and c["rt"] is not None:
+            if abs(p["rt"] - c["rt"]) > 1e-8:
+                warnings.append(
+                    f"RT changed for {p['id']!r}: profile={p['rt']}, centroid={c['rt']}"
+                )
+
+        if p["precursor_mz"] is not None and c["precursor_mz"] is not None:
+            if abs(p["precursor_mz"] - c["precursor_mz"]) > 1e-8:
+                warnings.append(
+                    f"precursor m/z changed for {p['id']!r}: "
+                    f"profile={p['precursor_mz']}, centroid={c['precursor_mz']}"
+                )
+
+    return errors, warnings
+
+
+def expand_inputs(inputs):
+    files = []
+
+    for item in inputs:
+        path = Path(item)
+
+        if path.is_dir():
+            files.extend(sorted(path.glob("*.centroid.mzML")))
+            files.extend(sorted(path.glob("*.centroid.mzml")))
+        else:
+            files.append(path)
+
+    seen = set()
+    out = []
+
+    for path in files:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="validate-centroid-mzml",
+        description="Validate custom centroided mzML files before search.",
+    )
+
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="centroid mzML files or directories containing *.centroid.mzML",
+    )
+
+    parser.add_argument(
+        "--levels",
+        default="1,2",
+        type=parse_levels,
+        help="MS levels expected to be centroided; default: 1,2",
+    )
+
+    parser.add_argument(
+        "--profile-dir",
+        default=None,
+        help="optional directory containing matching profile mzML files for pairwise comparison",
+    )
+
+    parser.add_argument(
+        "--no-profile-compare",
+        action="store_true",
+        help="disable profile-vs-centroid consistency checks",
+    )
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="only print failures and final summary",
+    )
+
+    args = parser.parse_args()
+
+    files = expand_inputs(args.inputs)
+
+    if not files:
+        print("no centroid mzML files found", file=sys.stderr)
+        return 2
+
+    total_errors = 0
+    total_warnings = 0
+    passed = 0
+
+    for path in files:
+        summary, errors, warnings = validate_centroid_file(path, args.levels)
+
+        if not args.no_profile_compare:
+            profile_dir = args.profile_dir if args.profile_dir else path.parent
+            profile_path = matching_profile_file(path, profile_dir)
+
+            if profile_path is not None:
+                pair_errors, pair_warnings = compare_profile_and_centroid(profile_path, path)
+                errors.extend(pair_errors)
+                warnings.extend(pair_warnings)
+            else:
+                warnings.append("no matching profile mzML found for pairwise comparison")
+
+        total_errors += len(errors)
+        total_warnings += len(warnings)
+
+        if errors:
+            print(f"FAIL {path}")
+            for error in errors[:50]:
+                print(f"  ERROR: {error}")
+            if len(errors) > 50:
+                print(f"  ERROR: ... {len(errors) - 50} more")
+        else:
+            passed += 1
+            if not args.quiet:
+                by_level = summary["by_level"] if summary else {}
+                centroid_by_level = summary["centroid_by_level"] if summary else {}
+                profile_by_level = summary["profile_by_level"] if summary else {}
+
+                levels = " ".join(
+                    f"MS{level}={by_level[level]}"
+                    for level in sorted(by_level)
+                )
+
+                centroid_levels = " ".join(
+                    f"MS{level}={centroid_by_level[level]}"
+                    for level in sorted(centroid_by_level)
+                )
+
+                profile_levels = " ".join(
+                    f"MS{level}={profile_by_level[level]}"
+                    for level in sorted(profile_by_level)
+                )
+
+                print(f"PASS {path}")
+                print(f"  spectra: {summary['scan_count']}")
+                print(f"  levels: {levels or 'none'}")
+                print(f"  centroid-marked: {centroid_levels or 'none'}")
+                print(f"  profile-marked: {profile_levels or 'none'}")
+
+        if warnings and not args.quiet:
+            for warning in warnings[:20]:
+                print(f"  WARNING: {warning}")
+            if len(warnings) > 20:
+                print(f"  WARNING: ... {len(warnings) - 20} more")
+
+    print(
+        f"summary: files={len(files)} passed={passed} "
+        f"errors={total_errors} warnings={total_warnings}"
+    )
+
+    return 1 if total_errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
