@@ -234,6 +234,79 @@ class MzmlStore:
             "traces": [np.asarray(trace, dtype=np.float64) for trace in traces],
         }
 
+    def extract_region(
+        self,
+        mz_min,
+        mz_max,
+        rt_start,
+        rt_end,
+        mz_bins=600,
+        mode="profile",
+    ):
+        """Rasterize MS1 data in an RT x m/z window onto a regular grid.
+
+        Returns rts (one per MS1 scan in range), a shared mz grid, and a
+        Z matrix of shape (n_scans, mz_bins). Profile data is linearly
+        interpolated onto the grid (it is continuous); centroid data is
+        rasterized by assigning each peak to its nearest bin and keeping the
+        max (interpolation would blur or zero out sparse spikes).
+
+        Nothing here models or fits anything; it only bins measured points.
+        """
+        mz_min = float(mz_min)
+        mz_max = float(mz_max)
+        mz_bins = max(2, int(mz_bins))
+
+        mz_grid = np.linspace(mz_min, mz_max, mz_bins)
+        edges = np.linspace(mz_min, mz_max, mz_bins + 1)
+
+        rts = []
+        rows = []
+
+        with mzml.MzML(str(self.path), dtype=np.float64) as reader:
+            for scan in reader:
+                if scan_ms_level(scan) != 1:
+                    continue
+
+                rt = scan_rt(scan)
+
+                if rt is None or rt < rt_start or rt > rt_end:
+                    continue
+
+                mza, inten = scan_arrays(scan)
+
+                if mza.size:
+                    keep = (mza >= mz_min) & (mza <= mz_max)
+                    mza = mza[keep]
+                    inten = inten[keep]
+
+                row = np.zeros(mz_bins, dtype=np.float64)
+
+                if mza.size:
+                    order = np.argsort(mza)
+                    mza = mza[order]
+                    inten = inten[order]
+
+                    if mode == "profile":
+                        row = np.interp(mz_grid, mza, inten, left=0.0, right=0.0)
+                    else:
+                        idx = np.clip(np.searchsorted(edges, mza, side="right") - 1, 0, mz_bins - 1)
+                        np.maximum.at(row, idx, inten)
+
+                rts.append(rt)
+                rows.append(row)
+
+        if rows:
+            z = np.vstack(rows)
+        else:
+            z = np.zeros((0, mz_bins), dtype=np.float64)
+
+        return {
+            "rts": np.asarray(rts, dtype=np.float64),
+            "mz_grid": mz_grid,
+            "z": z,
+        }
+
     def scan_window_by_number(self, number, mz_min, mz_max):
         scan = self.get_scan_by_number(number)
 

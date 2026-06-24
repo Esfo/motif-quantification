@@ -26,11 +26,13 @@ try:
     from .plots import add_profile_line, plot_points, plot_spectrum, plot_traces
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float, safe_int, ViewerSession
     from .views import OverviewView, PeptidesView, ProteinsView
+    from .region_view import RegionView
 except ImportError:
     from mzml_store import MzmlStore, scan_arrays
     from plots import add_profile_line, plot_points, plot_spectrum, plot_traces
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float, safe_int, ViewerSession
     from views import OverviewView, PeptidesView, ProteinsView
+    from region_view import RegionView
 
 
 PSM_COLUMNS = [
@@ -122,13 +124,21 @@ class MainWindow(QMainWindow):
         self.load_files()
 
     def build_layout(self):
-        tabs = QTabWidget()
-        tabs.addTab(OverviewView(self.session), "Overview")
-        tabs.addTab(self.build_spectra_tab(), "Spectra")
-        tabs.addTab(PeptidesView(self.session), "Peptides")
-        tabs.addTab(ProteinsView(self.session), "Proteins")
-        tabs.setCurrentIndex(1)
-        self.setCentralWidget(tabs)
+        self.region_view = RegionView()
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(OverviewView(self.session), "Overview")
+        self.tabs.addTab(self.build_spectra_tab(), "Spectra")
+        self.tabs.addTab(self.region_view, "3D Profile")
+        self.tabs.addTab(PeptidesView(self.session), "Peptides")
+        self.tabs.addTab(ProteinsView(self.session), "Proteins")
+        self.tabs.setCurrentIndex(1)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.setCentralWidget(self.tabs)
+
+    def on_tab_changed(self, index):
+        if self.tabs.widget(index) is self.region_view:
+            self.region_view.render_if_pending()
 
     def build_spectra_tab(self):
         top_bar = QWidget()
@@ -468,6 +478,35 @@ class MainWindow(QMainWindow):
         detail_lines.append(f"distribution candidates: {len(candidates)}")
 
         self.detail_text.setPlainText("\n".join(detail_lines))
+
+        self.arm_region_view(row, targets, neutral_mass, charge, rt, centroid_store)
+
+    def arm_region_view(self, row, targets, neutral_mass, charge, rt, centroid_store):
+        if rt is None:
+            return
+
+        if targets:
+            mz_min = min(targets) - 0.75
+            mz_max = max(targets) + 0.75
+        elif neutral_mass is not None and charge:
+            mono = neutral_mass / charge
+            mz_min = mono - 1.0
+            mz_max = mono + 4.0
+        else:
+            return
+
+        rt_start = max(0.0, rt - self.xics_rt_window)
+        rt_end = rt + self.xics_rt_window
+
+        self.region_view.set_target(
+            centroid_store=centroid_store,
+            profile_store=self.get_profile_store(),
+            mz_min=mz_min,
+            mz_max=mz_max,
+            rt_start=rt_start,
+            rt_end=rt_end,
+            label=f"scan {row.get('scan', '')} {row.get('peptide', '')} z={charge}",
+        )
 
     def populate_distribution_table(self, rows):
         self.distribution_table.setRowCount(len(rows))
