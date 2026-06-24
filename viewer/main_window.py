@@ -92,9 +92,11 @@ class MainWindow(QMainWindow):
         self.centroid_stores = {}
         self.profile_stores = {}
 
+        self._opening = False
+
         self.build_menu()
 
-        # Double-clicking anywhere while no folder is loaded opens the picker.
+        # Double-clicking the empty viewer opens the picker.
         QApplication.instance().installEventFilter(self)
 
         # Always show the full (empty) GUI; load data if a folder was given.
@@ -104,6 +106,12 @@ class MainWindow(QMainWindow):
         if (
             event.type() == QEvent.MouseButtonDblClick
             and (self.session is None or self.session.is_empty)
+            and not self._opening
+            # Ignore clicks inside the file dialog (a separate top-level window)
+            # or any other modal popup; only react to clicks on this window.
+            and QApplication.activeModalWidget() is None
+            and isinstance(obj, QWidget)
+            and self.isAncestorOf(obj)
         ):
             self.choose_reorganized()
             return True
@@ -128,10 +136,22 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
 
     def choose_reorganized(self):
-        start = str(self.session.reorganized) if self.session is not None else ""
-        path = QFileDialog.getExistingDirectory(
-            self, "Open reorganized search folder", start
-        )
+        if self._opening:
+            return
+
+        self._opening = True
+
+        try:
+            start = ""
+
+            if self.session is not None and self.session.reorganized is not None:
+                start = str(self.session.reorganized)
+
+            path = QFileDialog.getExistingDirectory(
+                self, "Open reorganized search folder", start
+            )
+        finally:
+            self._opening = False
 
         if path:
             self.open_reorganized(path)
