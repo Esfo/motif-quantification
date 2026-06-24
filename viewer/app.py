@@ -19,9 +19,9 @@ def parse_args():
 
     parser.add_argument(
         "--reorganized",
-        required=True,
         type=Path,
-        help="searches/reorganized directory produced by reorganize-results.py",
+        default=None,
+        help="optional searches/reorganized directory; if omitted, open it from File ▸ Open in the app",
     )
 
     parser.add_argument(

@@ -88,6 +88,19 @@ class MzmlStore:
         self.by_id = {}
         self.ms1 = []
 
+        self._data_reader = None
+
+    def data_reader(self):
+        """Persistent indexed reader for random-access scan reads.
+
+        Reused across calls so the (potentially multi-GB) file is indexed once
+        rather than reopened per scan.
+        """
+        if self._data_reader is None:
+            self._data_reader = mzml.MzML(str(self.path), dtype=np.float64, use_index=True)
+
+        return self._data_reader
+
     def load_metadata(self):
         if self.loaded:
             return
@@ -97,7 +110,10 @@ class MzmlStore:
 
         summaries = []
 
-        with mzml.MzML(str(self.path), dtype=np.float64) as reader:
+        # decode_binary=False skips base64/zlib decoding of the m/z and
+        # intensity arrays: metadata only needs id, ms level, and RT, so we
+        # avoid decoding gigabytes of peak data just to enumerate scans.
+        with mzml.MzML(str(self.path), use_index=True, decode_binary=False) as reader:
             for scan in reader:
                 sid = scan_id(scan)
                 number = scan_number_from_id(sid)
@@ -136,19 +152,21 @@ class MzmlStore:
 
     def get_scan_by_id(self, spectrum_id):
         spectrum_id = str(spectrum_id)
+        reader = self.data_reader()
 
-        with mzml.MzML(str(self.path), dtype=np.float64) as reader:
-            if hasattr(reader, "get_by_id"):
-                try:
-                    return reader.get_by_id(spectrum_id)
-                except Exception:
-                    pass
+        try:
+            return reader.get_by_id(spectrum_id)
+        except Exception:
+            return None
 
-            for scan in reader:
-                if scan_id(scan) == spectrum_id:
-                    return scan
+    def ms1_in_rt(self, rt_start, rt_end):
+        self.load_metadata()
 
-        return None
+        return [
+            summary
+            for summary in self.ms1
+            if summary.rt is not None and rt_start <= summary.rt <= rt_end
+        ]
 
     def nearest_ms1_by_rt(self, rt):
         self.load_metadata()
@@ -195,38 +213,36 @@ class MzmlStore:
         rts = []
         traces = [[] for _ in targets]
 
-        with mzml.MzML(str(self.path), dtype=np.float64) as reader:
-            for scan in reader:
-                if scan_ms_level(scan) != 1:
-                    continue
+        reader = self.data_reader()
 
-                rt = scan_rt(scan)
+        for summary in self.ms1_in_rt(rt_start, rt_end):
+            scan = reader.get_by_id(summary.spectrum_id)
 
-                if rt is None or rt < rt_start or rt > rt_end:
-                    continue
+            if scan is None:
+                continue
 
-                mza, inten = scan_arrays(scan)
+            mza, inten = scan_arrays(scan)
 
-                if mza.size == 0:
-                    continue
+            if mza.size == 0:
+                continue
 
-                order = np.argsort(mza)
-                mza = mza[order]
-                inten = inten[order]
+            order = np.argsort(mza)
+            mza = mza[order]
+            inten = inten[order]
 
-                rts.append(rt)
+            rts.append(summary.rt)
 
-                for target_i, target in enumerate(targets):
-                    tolerance = max(abs_tol, target * ppm / 1_000_000.0)
-                    left = np.searchsorted(mza, target - tolerance, side="left")
-                    right = np.searchsorted(mza, target + tolerance, side="right")
+            for target_i, target in enumerate(targets):
+                tolerance = max(abs_tol, target * ppm / 1_000_000.0)
+                left = np.searchsorted(mza, target - tolerance, side="left")
+                right = np.searchsorted(mza, target + tolerance, side="right")
 
-                    if right > left:
-                        value = float(np.sum(inten[left:right]))
-                    else:
-                        value = 0.0
+                if right > left:
+                    value = float(np.sum(inten[left:right]))
+                else:
+                    value = 0.0
 
-                    traces[target_i].append(value)
+                traces[target_i].append(value)
 
         return {
             "rts": np.asarray(rts, dtype=np.float64),
@@ -263,38 +279,36 @@ class MzmlStore:
         rts = []
         rows = []
 
-        with mzml.MzML(str(self.path), dtype=np.float64) as reader:
-            for scan in reader:
-                if scan_ms_level(scan) != 1:
-                    continue
+        reader = self.data_reader()
 
-                rt = scan_rt(scan)
+        for summary in self.ms1_in_rt(rt_start, rt_end):
+            scan = reader.get_by_id(summary.spectrum_id)
 
-                if rt is None or rt < rt_start or rt > rt_end:
-                    continue
+            if scan is None:
+                continue
 
-                mza, inten = scan_arrays(scan)
+            mza, inten = scan_arrays(scan)
 
-                if mza.size:
-                    keep = (mza >= mz_min) & (mza <= mz_max)
-                    mza = mza[keep]
-                    inten = inten[keep]
+            if mza.size:
+                keep = (mza >= mz_min) & (mza <= mz_max)
+                mza = mza[keep]
+                inten = inten[keep]
 
-                row = np.zeros(mz_bins, dtype=np.float64)
+            row = np.zeros(mz_bins, dtype=np.float64)
 
-                if mza.size:
-                    order = np.argsort(mza)
-                    mza = mza[order]
-                    inten = inten[order]
+            if mza.size:
+                order = np.argsort(mza)
+                mza = mza[order]
+                inten = inten[order]
 
-                    if mode == "profile":
-                        row = np.interp(mz_grid, mza, inten, left=0.0, right=0.0)
-                    else:
-                        idx = np.clip(np.searchsorted(edges, mza, side="right") - 1, 0, mz_bins - 1)
-                        np.maximum.at(row, idx, inten)
+                if mode == "profile":
+                    row = np.interp(mz_grid, mza, inten, left=0.0, right=0.0)
+                else:
+                    idx = np.clip(np.searchsorted(edges, mza, side="right") - 1, 0, mz_bins - 1)
+                    np.maximum.at(row, idx, inten)
 
-                rts.append(rt)
-                rows.append(row)
+            rts.append(summary.rt)
+            rows.append(row)
 
         if rows:
             z = np.vstack(rows)

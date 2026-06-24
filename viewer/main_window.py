@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -67,7 +68,7 @@ DISTRIBUTION_COLUMNS = [
 class MainWindow(QMainWindow):
     def __init__(
         self,
-        reorganized,
+        reorganized=None,
         distribution_db=None,
         centroid_dir=None,
         profile_dir=None,
@@ -78,21 +79,96 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Motif Quantification Viewer")
 
-        self.session = ViewerSession(
-            reorganized=reorganized,
-            distribution_db=distribution_db,
-            centroid_dir=centroid_dir,
-            profile_dir=profile_dir,
-        )
-
+        self.distribution_db = distribution_db
+        self.centroid_dir = centroid_dir
+        self.profile_dir = profile_dir
         self.xics_ppm = float(xics_ppm)
         self.xics_rt_window = float(xics_rt_window)
+
+        self.session = None
+        self.current_filename = None
+        self.current_psms = []
+        self.centroid_stores = {}
+        self.profile_stores = {}
+
+        self.placeholder = QLabel(
+            "No search folder open.\n\nUse File ▸ Open reorganized folder…  (Ctrl+O)\n"
+            "and pick a 'reorganized' directory produced by reorganize-results.py."
+        )
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.setCentralWidget(self.placeholder)
+
+        self.build_menu()
+
+        if reorganized is not None:
+            self.open_reorganized(reorganized)
+
+    def build_menu(self):
+        file_menu = self.menuBar().addMenu("&File")
+
+        open_action = file_menu.addAction("&Open reorganized folder…")
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self.choose_reorganized)
+
+        self.reload_action = file_menu.addAction("&Reload")
+        self.reload_action.setShortcut("Ctrl+R")
+        self.reload_action.triggered.connect(self.reload_current)
+        self.reload_action.setEnabled(False)
+
+        file_menu.addSeparator()
+        quit_action = file_menu.addAction("&Quit")
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.triggered.connect(self.close)
+
+    def choose_reorganized(self):
+        start = str(self.session.reorganized) if self.session is not None else ""
+        path = QFileDialog.getExistingDirectory(
+            self, "Open reorganized search folder", start
+        )
+
+        if path:
+            self.open_reorganized(path)
+
+    def reload_current(self):
+        if self.session is not None:
+            self.open_reorganized(self.session.reorganized)
+
+    def open_reorganized(self, reorganized):
+        reorganized = Path(reorganized)
+
+        if not (reorganized / "files.tsv").exists():
+            QMessageBox.warning(
+                self,
+                "Not a reorganized folder",
+                f"{reorganized}\n\nNo files.tsv found here. Pick the 'reorganized' "
+                "directory that reorganize-results.py wrote.",
+            )
+            return
+
+        try:
+            self.session = ViewerSession(
+                reorganized=reorganized,
+                distribution_db=self.distribution_db,
+                centroid_dir=self.centroid_dir,
+                profile_dir=self.profile_dir,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to open folder", str(exc))
+            return
 
         self.current_filename = None
         self.current_psms = []
         self.centroid_stores = {}
         self.profile_stores = {}
 
+        self.create_spectra_widgets()
+        self.build_layout()
+        self.load_files()
+
+        self.reload_action.setEnabled(True)
+        self.setWindowTitle(f"Motif Quantification Viewer — {reorganized}")
+
+    def create_spectra_widgets(self):
         self.file_combo = QComboBox()
         self.profile_checkbox = QCheckBox("profile overlay")
         self.profile_checkbox.setChecked(False)
@@ -119,9 +195,6 @@ class MainWindow(QMainWindow):
         self.ms2_plot = pg.PlotWidget()
         self.ms1_trace_plot = pg.PlotWidget()
         self.ms1_scan_plot = pg.PlotWidget()
-
-        self.build_layout()
-        self.load_files()
 
     def build_layout(self):
         self.region_view = RegionView()
