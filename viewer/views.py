@@ -135,6 +135,12 @@ class OverviewView(QWidget):
         rows = self.session.files()
         fill_table(self.table, self.COLUMNS, rows)
 
+        if not rows:
+            self.summary_label.setText(
+                "No folder open. Double-click anywhere or use File ▸ Open reorganized folder… (Ctrl+O)."
+            )
+            return
+
         summary = self.session.summary() or {}
         counts = summary.get("rows", {})
 

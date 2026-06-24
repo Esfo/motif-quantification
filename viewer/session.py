@@ -2,11 +2,29 @@ import csv
 import json
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 
 PROTON = 1.007276554940804
 C13_DELTA = 1.00335483507
+
+
+# Reorganized proteins.tsv packs every peptide of a protein into one field,
+# which can blow past csv's default 128 KB field cap. Raise it as high as the
+# platform allows.
+def _raise_csv_limit():
+    limit = sys.maxsize
+
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit = int(limit // 10)
+
+
+_raise_csv_limit()
 
 
 def read_tsv(path):
@@ -135,8 +153,10 @@ class ViewerSession:
         centroid_dir=None,
         profile_dir=None,
     ):
-        self.reorganized = Path(reorganized).resolve()
-        self.manifest = read_json(self.reorganized / "manifest.json")
+        self.reorganized = Path(reorganized).resolve() if reorganized else None
+        self.is_empty = self.reorganized is None
+
+        self.manifest = read_json(self.reorganized / "manifest.json") if self.reorganized else {}
 
         manifest_mzml_dir = self.manifest.get("mzml_dir")
         manifest_by_file_dir = self.manifest.get("by_file_dir")
@@ -146,16 +166,17 @@ class ViewerSession:
         if self.mzml_dir is None and manifest_mzml_dir:
             self.mzml_dir = Path(manifest_mzml_dir).resolve()
 
-        self.by_file_dir = (
-            Path(manifest_by_file_dir).resolve()
-            if manifest_by_file_dir
-            else self.reorganized / "by_file"
-        )
+        if manifest_by_file_dir:
+            self.by_file_dir = Path(manifest_by_file_dir).resolve()
+        elif self.reorganized:
+            self.by_file_dir = self.reorganized / "by_file"
+        else:
+            self.by_file_dir = None
 
         self.profile_dir = Path(profile_dir).resolve() if profile_dir else None
         self.distribution_db = Path(distribution_db).resolve() if distribution_db else None
 
-        self.file_rows = read_tsv(self.reorganized / "files.tsv")
+        self.file_rows = read_tsv(self.reorganized / "files.tsv") if self.reorganized else []
         self.file_by_name = {row.get("filename", ""): row for row in self.file_rows}
 
         self._psm_cache = {}
@@ -172,17 +193,24 @@ class ViewerSession:
 
     def global_peptides(self):
         if self._global_peptides is None:
-            self._global_peptides = read_tsv(self.reorganized / "peptides.tsv")
+            self._global_peptides = (
+                read_tsv(self.reorganized / "peptides.tsv") if self.reorganized else []
+            )
 
         return self._global_peptides
 
     def global_proteins(self):
         if self._global_proteins is None:
-            self._global_proteins = read_tsv(self.reorganized / "proteins.tsv")
+            self._global_proteins = (
+                read_tsv(self.reorganized / "proteins.tsv") if self.reorganized else []
+            )
 
         return self._global_proteins
 
     def _file_table(self, filename, name):
+        if self.by_file_dir is None:
+            return []
+
         key = (filename, name)
 
         if key in self._file_table_cache:
@@ -240,6 +268,9 @@ class ViewerSession:
         return totals
 
     def load_psms(self, filename):
+        if self.by_file_dir is None:
+            return []
+
         if filename in self._psm_cache:
             return self._psm_cache[filename]
 

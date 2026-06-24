@@ -1,9 +1,10 @@
 from pathlib import Path
 import traceback
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -91,17 +92,23 @@ class MainWindow(QMainWindow):
         self.centroid_stores = {}
         self.profile_stores = {}
 
-        self.placeholder = QLabel(
-            "No search folder open.\n\nUse File ▸ Open reorganized folder…  (Ctrl+O)\n"
-            "and pick a 'reorganized' directory produced by reorganize-results.py."
-        )
-        self.placeholder.setAlignment(Qt.AlignCenter)
-        self.setCentralWidget(self.placeholder)
-
         self.build_menu()
 
-        if reorganized is not None:
-            self.open_reorganized(reorganized)
+        # Double-clicking anywhere while no folder is loaded opens the picker.
+        QApplication.instance().installEventFilter(self)
+
+        # Always show the full (empty) GUI; load data if a folder was given.
+        self.load_session(reorganized)
+
+    def eventFilter(self, obj, event):
+        if (
+            event.type() == QEvent.MouseButtonDblClick
+            and (self.session is None or self.session.is_empty)
+        ):
+            self.choose_reorganized()
+            return True
+
+        return super().eventFilter(obj, event)
 
     def build_menu(self):
         file_menu = self.menuBar().addMenu("&File")
@@ -145,6 +152,9 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self.load_session(reorganized)
+
+    def load_session(self, reorganized):
         try:
             self.session = ViewerSession(
                 reorganized=reorganized,
@@ -165,8 +175,12 @@ class MainWindow(QMainWindow):
         self.build_layout()
         self.load_files()
 
-        self.reload_action.setEnabled(True)
-        self.setWindowTitle(f"Motif Quantification Viewer — {reorganized}")
+        self.reload_action.setEnabled(not self.session.is_empty)
+
+        if self.session.is_empty:
+            self.setWindowTitle("Motif Quantification Viewer — no folder open (double-click to open)")
+        else:
+            self.setWindowTitle(f"Motif Quantification Viewer — {reorganized}")
 
     def create_spectra_widgets(self):
         self.file_combo = QComboBox()
