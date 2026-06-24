@@ -113,7 +113,8 @@ class RegionView(QWidget):
         self.status = QLabel("select a Sage ID (Spectra tab) or double-click a distribution candidate")
         self.status.setWordWrap(True)
 
-        controls = QWidget()
+        self.controls = QWidget()
+        controls = self.controls
         c = QHBoxLayout(controls)
         c.setContentsMargins(4, 4, 4, 4)
         c.addWidget(QLabel("source"))
@@ -170,6 +171,22 @@ class RegionView(QWidget):
         layout.addWidget(plots, stretch=1)
 
         self.apply_theme("dark")
+
+    def set_controls_visible(self, visible):
+        # Hide the internal control row when driven from the workspace toolbar,
+        # but keep the status line for render feedback.
+        self.controls.setVisible(visible)
+
+    def configure_window(self, mz_center, mz_half, rt_center, rt_half):
+        for spin, value in (
+            (self.mz_center, mz_center),
+            (self.mz_half, mz_half),
+            (self.rt_center, rt_center),
+            (self.rt_half, rt_half),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
 
     def _spin(self, low, high, decimals, value, step=1.0):
         spin = QDoubleSpinBox()
