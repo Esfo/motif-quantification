@@ -26,7 +26,7 @@ import re
 import traceback
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QEvent, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -115,14 +115,18 @@ class EvidenceWorker(QThread):
 
             points = None
             region = None
+            ms2 = []
             if self.rt is not None:
                 points = self.store.extract_points(self.mz_min, self.mz_max, self.rt_start, self.rt_end)
                 region = self.store.extract_region(
                     self.mz_min, self.mz_max, self.rt_start, self.rt_end,
                     mz_bins=self.mz_bins, mode=self.mode)
+                # MS2 scans always come from the centroid run (where they live).
+                ms2 = [{"rt": s.rt, "mz": s.precursor_mz, "number": s.number, "id": s.spectrum_id}
+                       for s in self.centroid.ms2_in_rt(self.rt_start, self.rt_end)]
 
             self.done.emit({"ms1_number": ms1_number, "scan_mz": scan_mz,
-                            "scan_int": scan_int, "points": points, "region": region})
+                            "scan_int": scan_int, "points": points, "region": region, "ms2": ms2})
         except Exception as exc:
             self.done.emit({"error": f"{exc}\n{traceback.format_exc()}"})
 
@@ -256,10 +260,14 @@ class MSViewerTab(QMainWindow):
         self.p1_2d.setDownsampling(auto=True, mode="peak")
         # 2D panel 1: only the m/z (x) axis is interactive; y stays auto-scaled.
         self.p1_2d.setMouseEnabled(x=True, y=False)
+        # Wheel over the y-axis label strip (left of the plot) scrolls intensity.
+        self.p1_2d.viewport().installEventFilter(self)
 
         if HAVE_GL:
             self.p1_3d = gl.GLViewWidget()
-            self.p1_3d.setCameraPosition(distance=3.2, elevation=30, azimuth=-60)
+            # Deterministic orientation: time runs left->right, m/z front->back,
+            # so the m/z axis reads the same direction as panel 2's x.
+            self.p1_3d.setCameraPosition(distance=3.4, elevation=22, azimuth=-90)
             self.p1_surface = gl.GLSurfacePlotItem(
                 x=np.array([0.0, 1.0], dtype=np.float32),
                 y=np.array([0.0, 1.0], dtype=np.float32),
@@ -269,8 +277,17 @@ class MSViewerTab(QMainWindow):
             self.p1_surface.setVisible(False)
             self.p1_scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3), dtype=np.float32), size=4.0)
             self.p1_scatter.setVisible(False)
+            axis = gl.GLAxisItem()
+            axis.setSize(2.2, 2.2, 1.2)
+            self.p1_3d.addItem(axis)
             self.p1_3d.addItem(self.p1_surface)
             self.p1_3d.addItem(self.p1_scatter)
+            # Axis name labels on the outside (x = time, y = m/z).
+            for text, pos in (("time (min)", (1.3, -1.1, -1.0)), ("m/z", (-1.1, 1.3, -1.0))):
+                try:
+                    self.p1_3d.addItem(gl.GLTextItem(pos=pos, text=text, color=(220, 220, 220, 255)))
+                except Exception:
+                    pass
         else:
             self.p1_3d = QLabel("3D needs pyqtgraph OpenGL (pip install PyOpenGL)")
             self.p1_3d.setAlignment(Qt.AlignCenter)
@@ -301,6 +318,20 @@ class MSViewerTab(QMainWindow):
         self.dock_panel1 = dock
 
     def build_panel2_dock(self):
+        # Thin MS2 strip to the left of panel 2: MS2 scans as clickable points,
+        # RT-aligned with panel 2 (shared y). It fits in the space panel 1's wide
+        # y-axis labels leave between panels 1 and 2.
+        self.ms2_plot = pg.PlotWidget()
+        self.ms2_plot.setFixedWidth(64)
+        self.ms2_plot.setMouseEnabled(x=False, y=True)
+        self.ms2_plot.getPlotItem().hideAxis("bottom")
+        self.ms2_plot.setLabel("left", "MS2 RT")
+        self.ms2_plot.setXRange(0, 1, padding=0)
+        self.ms2_scatter = pg.ScatterPlotItem(size=7, brush=pg.mkBrush(255, 180, 60, 220),
+                                              pen=pg.mkPen("#222"))
+        self.ms2_scatter.sigClicked.connect(self.on_ms2_clicked)
+        self.ms2_plot.addItem(self.ms2_scatter)
+
         # Panel 2: m/z on x (aligned with panel 1), RT on y.
         self.p2 = pg.PlotWidget()
         self.p2.setLabel("bottom", "m/z")
@@ -310,15 +341,23 @@ class MSViewerTab(QMainWindow):
             self.p2_image.setColorMap(self._cmap)
         self.p2.addItem(self.p2_image)
 
+        # MS2 strip shares panel 2's RT (y) axis.
+        self.ms2_plot.setYLink(self.p2)
         # panel 1 (2D) and panel 2 share the m/z (x) axis -> link them.
         self.p1_2d.setXLink(self.p2)
-        # User drags/zooms on either m/z axis or panel 2's RT -> reload window.
         self.p2.sigXRangeChanged.connect(self.on_view_range_changed)
         self.p2.sigYRangeChanged.connect(self.on_view_range_changed)
 
-        dock = QDockWidget("Panel 2 - m/z x RT map", self)
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addWidget(self.ms2_plot)
+        row.addWidget(self.p2, stretch=1)
+
+        dock = QDockWidget("Panel 2 - m/z x RT map (MS2 strip left)", self)
         dock.setObjectName("dock_panel2")
-        dock.setWidget(self.p2)
+        dock.setWidget(container)
         self.dock_panel2 = dock
 
     def build_panel3_dock(self):
@@ -603,26 +642,35 @@ class MSViewerTab(QMainWindow):
         region = result.get("region")
         scan_mz = result.get("scan_mz")
         scan_int = result.get("scan_int")
+        profile = bool(self.use_profile() and cur["profile"])
 
-        self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end)
+        self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end, profile)
         self.draw_panel2(region, mz_min, mz_max, rt_start, rt_end)
+        self.draw_ms2_strip(result.get("ms2", []))
         self.draw_panel3_ms1(cur, scan_mz, scan_int)
 
-    def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end):
-        # 2D: every datapoint in the window as m/z vs intensity.
+    def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end, profile):
+        self.p1_2d.clear()
         if isinstance(points, dict) and points["mz"].size:
-            self.p1_2d.clear()
             self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
-            self.p1_2d.plot(points["mz"], points["intensity"], pen=None,
-                            symbol="o", symbolSize=3, symbolPen=None,
-                            symbolBrush=pg.mkBrush(120, 170, 255, 160))
+            if profile:
+                # Profile data is continuous: draw one curve per scan so the
+                # envelope stays visible (and crisp) at any zoom, unlike fixed dots.
+                rts = points["rt"]
+                for r in np.unique(rts):
+                    m = rts == r
+                    order = np.argsort(points["mz"][m])
+                    self.p1_2d.plot(points["mz"][m][order], points["intensity"][m][order],
+                                    pen=pg.mkPen(120, 170, 255, 90))
+            else:
+                self.p1_2d.plot(points["mz"], points["intensity"], pen=None,
+                                symbol="o", symbolSize=4, symbolPen=None,
+                                symbolBrush=pg.mkBrush(120, 170, 255, 170))
             self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
                                 f"({points['mz'].size} pts)")
             self.p1_2d.getViewBox().setYRange(0, float(points["intensity"].max()) * 1.05, padding=0)
         else:
-            self.p1_2d.clear()
             self.p1_2d.setTitle("no MS1 points in window")
-        # 3D: same points + interpolated surface.
         self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
 
     def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
@@ -633,10 +681,14 @@ class MSViewerTab(QMainWindow):
 
         if isinstance(region, dict) and region.get("z") is not None and region["z"].size:
             z = region["z"]
+            rts = region["rts"]
+            mz_grid = region["mz_grid"]
             zmax = float(z.max()) or 1.0
             zr = (z / zmax).astype(np.float32)            # (n_rt, n_mz)
-            xs = np.linspace(-1.0, 1.0, z.shape[0]).astype(np.float32)  # rt
-            ys = np.linspace(-1.0, 1.0, z.shape[1]).astype(np.float32)  # mz
+            # Map surface to ACTUAL rt/mz (not even index spacing) so it lines up
+            # with the scatter points -- fixes the profile points/surface mismatch.
+            xs = ((rts - rt_start) / rt_span * 2 - 1).astype(np.float32)
+            ys = ((mz_grid - mz_min) / mz_span * 2 - 1).astype(np.float32)
             try:
                 self.p1_surface.setData(x=xs, y=ys, z=zr)
                 self.p1_surface.setColor((0.30, 0.45, 0.70, 0.45))
@@ -673,6 +725,45 @@ class MSViewerTab(QMainWindow):
         self.p2_image.setImage(np.log1p(z).T, autoLevels=True)
         rt_span = max(rts[-1] - rts[0], 1e-6) if rts.size > 1 else max(rt_end - rt_start, 1e-6)
         self.p2_image.setRect(pg.QtCore.QRectF(mz_min, rts[0], mz_max - mz_min, rt_span))
+
+    def draw_ms2_strip(self, ms2):
+        # Clickable MS2 scans as points at fixed x, RT on y (linked to panel 2).
+        spots = [{"pos": (0.5, m["rt"]), "data": m} for m in ms2 if m.get("rt") is not None]
+        self.ms2_scatter.setData(spots)
+
+    def on_ms2_clicked(self, _scatter, points):
+        if not points:
+            return
+        scan = points[0].data()
+        cur = self.current
+        if cur is None or cur["centroid"] is None:
+            return
+        try:
+            spectrum = cur["centroid"].get_scan_by_id(scan["id"])
+            if spectrum is None:
+                return
+            mz, inten = scan_arrays(spectrum)
+            plot_spectrum(self.p3, mz, inten,
+                          title=f"MS2  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
+            self.p3_title.setText(
+                f"MS2 scan {scan.get('number','')}  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
+        except Exception as exc:
+            self.p3_title.setText(f"MS2 load error: {exc}")
+
+    # Wheel over panel 1's y-axis strip scrolls intensity (y zoom), even though
+    # y-drag inside the plot is disabled.
+    def eventFilter(self, obj, event):
+        if obj is self.p1_2d.viewport() and event.type() == QEvent.Wheel:
+            axis = self.p1_2d.getPlotItem().getAxis("left")
+            if event.position().x() < axis.width():
+                vb = self.p1_2d.getViewBox()
+                (y0, y1) = vb.viewRange()[1]
+                factor = 0.85 if event.angleDelta().y() > 0 else 1.0 / 0.85
+                center = (y0 + y1) / 2
+                half = (y1 - y0) / 2 * factor
+                vb.setYRange(center - half, center + half, padding=0)
+                return True
+        return super().eventFilter(obj, event)
 
     def draw_panel3_ms1(self, cur, scan_mz, scan_int):
         self.p3.clear()

@@ -87,6 +87,7 @@ class MzmlStore:
         self.by_number = {}
         self.by_id = {}
         self.ms1 = []
+        self.ms2 = []
 
         self._data_reader = None
 
@@ -135,7 +136,14 @@ class MzmlStore:
         self.by_number = {summary.number: summary for summary in summaries if summary.number}
         self.by_id = {summary.spectrum_id: summary for summary in summaries if summary.spectrum_id}
         self.ms1 = [summary for summary in summaries if summary.level == 1 and summary.rt is not None]
+        self.ms2 = [summary for summary in summaries if summary.level == 2 and summary.rt is not None]
         self.loaded = True
+
+    def ms2_in_rt(self, rt_start, rt_end):
+        """MS2 scan summaries (rt, precursor m/z) inside an RT window."""
+        self.load_metadata()
+        return [s for s in getattr(self, "ms2", [])
+                if s.rt is not None and rt_start <= s.rt <= rt_end]
 
     def get_summary_by_number(self, number):
         self.load_metadata()
