@@ -131,6 +131,13 @@ class EvidenceWorker(QThread):
             self.done.emit({"error": f"{exc}\n{traceback.format_exc()}"})
 
 
+DIST_PALETTE = [
+    (76, 114, 176), (221, 132, 82), (85, 168, 104), (196, 78, 82),
+    (129, 114, 179), (147, 120, 96), (218, 139, 195), (140, 140, 140),
+    (204, 185, 116), (100, 181, 205),
+]
+
+
 LINE_METRIC_COLUMNS = [
     ("isotope_index", "iso"),
     ("area", "AUC"),
@@ -175,6 +182,7 @@ class MSViewerTab(QMainWindow):
         self.window = None        # [mz_min, mz_max, rt_start, rt_end] source of truth
         self.center = None        # (mz_center, rt_center) for the ± controls
         self._guard = False       # suppress range-change handling during programmatic set
+        self._dist_colors = {}    # distribution_id -> stable RGB colour
         try:
             self._cmap = pg.colormap.get("viridis")
         except Exception:
@@ -312,7 +320,7 @@ class MSViewerTab(QMainWindow):
         layout.addLayout(bar)
         layout.addWidget(self.p1_stack, stretch=1)
 
-        dock = QDockWidget("Panel 1 - spectrum", self)
+        dock = QDockWidget("", self)
         dock.setObjectName("dock_panel1")
         dock.setWidget(container)
         self.dock_panel1 = dock
@@ -326,9 +334,16 @@ class MSViewerTab(QMainWindow):
         self.ms2_plot.setMouseEnabled(x=False, y=True)
         self.ms2_plot.getPlotItem().hideAxis("bottom")
         self.ms2_plot.setLabel("left", "MS2 RT")
-        self.ms2_plot.setXRange(0, 1, padding=0)
-        self.ms2_scatter = pg.ScatterPlotItem(size=7, brush=pg.mkBrush(255, 180, 60, 220),
-                                              pen=pg.mkPen("#222"))
+        # Fix the x range so the strip never collapses when RT (y) is zoomed.
+        self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
+        self.ms2_plot.getViewBox().setMouseEnabled(x=False, y=True)
+        self.ms2_plot.getViewBox().disableAutoRange(axis=pg.ViewBox.XAxis)
+        # MS2 scans = horizontal lines across the strip; a thin clickable scatter
+        # sits on top for selection.
+        self.ms2_lines = self.ms2_plot.plot([], [], pen=pg.mkPen(255, 180, 60, 220, width=1),
+                                            connect="finite")
+        self.ms2_scatter = pg.ScatterPlotItem(size=9, symbol="o",
+                                              brush=pg.mkBrush(255, 180, 60, 120), pen=None)
         self.ms2_scatter.sigClicked.connect(self.on_ms2_clicked)
         self.ms2_plot.addItem(self.ms2_scatter)
 
@@ -355,7 +370,7 @@ class MSViewerTab(QMainWindow):
         row.addWidget(self.ms2_plot)
         row.addWidget(self.p2, stretch=1)
 
-        dock = QDockWidget("Panel 2 - m/z x RT map (MS2 strip left)", self)
+        dock = QDockWidget("", self)
         dock.setObjectName("dock_panel2")
         dock.setWidget(container)
         self.dock_panel2 = dock
@@ -652,7 +667,7 @@ class MSViewerTab(QMainWindow):
         profile = bool(self.use_profile() and cur["profile"])
 
         self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end, profile)
-        self.draw_panel2(region, mz_min, mz_max, rt_start, rt_end)
+        self.draw_panel2(points, (mz_min, mz_max, rt_start, rt_end))
         self.draw_ms2_strip(result.get("ms2", []))
         self.draw_panel3_ms1(cur, scan_mz, scan_int)
 
@@ -720,26 +735,62 @@ class MSViewerTab(QMainWindow):
             except Exception:
                 pass
 
-    def draw_panel2(self, region, mz_min, mz_max, rt_start, rt_end):
-        if not isinstance(region, dict):
+    def distribution_color(self, distribution_id):
+        """Stable colour per distribution (assigned in first-seen order)."""
+        if distribution_id not in self._dist_colors:
+            self._dist_colors[distribution_id] = DIST_PALETTE[len(self._dist_colors) % len(DIST_PALETTE)]
+        return self._dist_colors[distribution_id]
+
+    def draw_panel2(self, points, window):
+        # Connect-the-dots: raw points (m/z x, RT y) as dots + thin connecting
+        # lines, coloured by the sqlite distribution each line belongs to.
+        self.p2.clear()
+        if not isinstance(points, dict) or points["mz"].size == 0:
             return
-        z = region.get("z")
-        rts = region.get("rts")
-        if z is None or z.size == 0 or rts.size == 0:
-            self.p2_image.clear()
-            return
-        # x = m/z, y = RT -> image indexed [x=mz][y=rt] = z transposed.
-        self.p2_image.setImage(np.log1p(z).T, autoLevels=True)
-        rt_span = max(rts[-1] - rts[0], 1e-6) if rts.size > 1 else max(rt_end - rt_start, 1e-6)
-        self.p2_image.setRect(pg.QtCore.QRectF(mz_min, rts[0], mz_max - mz_min, rt_span))
+        mz_min, mz_max, rt_start, rt_end = window
+        mz = points["mz"]
+        rt = points["rt"]
+        assigned = np.zeros(mz.size, dtype=bool)
+
+        if self.db is not None:
+            for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
+                did = dist["distribution_id"]
+                color = self.distribution_color(did)
+                for feat in self.db.distribution_members(did):
+                    m = ((mz >= feat["mz_min"]) & (mz <= feat["mz_max"]) &
+                         (rt >= feat["rt_start"]) & (rt <= feat["rt_end"]) & (~assigned))
+                    if not m.any():
+                        continue
+                    assigned |= m
+                    order = np.argsort(rt[m])
+                    # thin connecting line (same colour) under fatter dots
+                    self.p2.plot(mz[m][order], rt[m][order],
+                                 pen=pg.mkPen(color=(*color, 200), width=1))
+                    self.p2.addItem(pg.ScatterPlotItem(
+                        x=mz[m], y=rt[m], size=5, pen=None,
+                        brush=pg.mkBrush(*color, 230)))
+
+        # points not in any distribution -> faint gray dots
+        if (~assigned).any():
+            self.p2.addItem(pg.ScatterPlotItem(
+                x=mz[~assigned], y=rt[~assigned], size=2, pen=None,
+                brush=pg.mkBrush(160, 160, 160, 70)))
 
     def draw_ms2_strip(self, ms2):
-        # Clickable MS2 scans as points at fixed x, RT on y (linked to panel 2).
+        # MS2 scans as horizontal lines spanning the strip at their RT, with a
+        # clickable point on each. RT (y) is shared with panel 2.
+        rts = [m["rt"] for m in ms2 if m.get("rt") is not None]
+        xs, ys = [], []
+        for rt in rts:
+            xs += [0.0, 1.0, np.nan]
+            ys += [rt, rt, np.nan]
+        self.ms2_lines.setData(xs, ys, connect="finite")
         spots = [{"pos": (0.5, m["rt"]), "data": m} for m in ms2 if m.get("rt") is not None]
         self.ms2_scatter.setData(spots)
+        self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
 
     def on_ms2_clicked(self, _scatter, points):
-        if not points:
+        if points is None or len(points) == 0:
             return
         scan = points[0].data()
         cur = self.current

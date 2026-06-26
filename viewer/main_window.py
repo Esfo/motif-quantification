@@ -73,6 +73,14 @@ class MainWindow(QMainWindow):
         QApplication.instance().installEventFilter(self)
         self.load_session(reorganized)
 
+        # Autosave the dock layout periodically so it persists even if the app
+        # is force-quit / Ctrl+C'd (closeEvent wouldn't run then).
+        from PySide6.QtCore import QTimer
+        self._layout_timer = QTimer(self)
+        self._layout_timer.setInterval(4000)
+        self._layout_timer.timeout.connect(self.save_layout)
+        self._layout_timer.start()
+
     # ---- chrome ----------------------------------------------------------
 
     def build_menu(self):
