@@ -23,6 +23,41 @@ The faithful reference algorithm is the authority for the pipeline; the active
 
 ---
 
+## 0.1 Original vision (the foundational goals)
+The project searches shotgun proteomics files via **Sage** (run through `execution.xsh`)
+and does **differential expression analysis via motifs**. The GUI must visualize all the
+data the pipeline produces. The four founding goals:
+1. ⬜ Visualize the **original MS1 profile data**, and put the **supposed (theoretical) MS1
+   distribution against the experimental one** (theoretical isotope envelope vs measured).
+2. ⬜ View the **MS2 fragments** and provide a way to **quantify**.
+3. ⬜ **Group multiple proteins together via motif** and do **DE**.
+4. ✅ Visualize the things the pipeline produces by file — the MS1 distributions found and the
+   Sage search results.
+(Isotopic-distribution *calculation* was deferred at the start; it is now in scope —
+`viewer/isotopes.py` + `examples/libraryadditions.py`.)
+
+## 0.2 Cross-cutting requirements (apply everywhere)
+- ⬜ **Seamless & crisp** — overall polish is an explicit, standing requirement.
+- ⬜ **Shared color gradient**: there is one user-defined **min/max color gradient** (the color-
+  settings dropdown, 1.12). It colors the **3D points by intensity** AND is the **same q-value
+  color scale** used for **Tab 2** protein coverage. Changing it changes both.
+- ⬜ **Document everything built, and every change/deviation from the provided reference/base
+  code** (`panel-3-plot.py`, `linemodel/distributionassembly/chargehandling.py`,
+  `peptidefragmentscoring.py`, `libraryadditions.py`) — the user asked for this explicitly.
+- 🟡 **Repo organization**: no redundant code; reorganize so it runs sensibly without losing
+  functionality; isotopic/chemistry functions live in importable shared modules (done:
+  `viewer/chemistry.py`, `viewer/isotopes.py`, removed dead `views.py`/`workspace.py`); ⬜ the
+  broader pipeline reorg (shared `chem/` package; thin re-exports) per `viewer/ARCHITECTURE.md`.
+- ✅ **PySide6 desktop** app (not web).
+- Data locations (not hard-coded; auto-detected from the project): the **distributions sqlite**
+  lives in `<project>/distributions/` (sibling of `/searches` and its `/reorganized`); an
+  `*.inspect.json` may sit alongside it; the **motif index** has the structure
+  `human-proteome-skeletons/{build_info.tsv,motifs.tsv,postings.bin,proteins.tsv}` under a
+  motifs dir (e.g. `~/data/proteomics/motifs/`); `experimental-setup` sits in the project root.
+- "**single-file view so far**" (Tab 1) — a multi-file Tab-1 mode may come later.
+
+---
+
 # TAB 1 — MS VIEWING
 
 ## 1.1 Dock layout & panes
@@ -70,6 +105,9 @@ The faithful reference algorithm is the authority for the pipeline; the active
 - ⬜ **Bug:** the MS2 RT lines **disappear when zooming** and look like arrows. They must get **WIDER, not thinner, as you zoom** (perspective-correct: render in RT data-space, not fixed-pixel strokes), and stay clickable.
 
 ## 1.6 Distribution & line selection + coloring
+- Distributions and their member **lines** come from the **sqlite in `<project>/distributions/`**
+  (the per-file `*.distributions.sqlite`); a "line" = a feature/isotope trace, a "distribution"
+  = its grouped members.
 - ⬜ From **Panel 1 or Panel 2**, the user can **select a distribution**.
 - ⬜ After selecting a distribution, the user can **select a single line trace** within it (clarifies the selection, **replaces** the distribution selection); **clicking again brings it back to the distribution**.
 - ⬜ A selected distribution/line is **highlighted in a color**; **all other distributions** are a different color. Both colors **user-selectable** via a **color settings drop-down**.
@@ -105,11 +143,17 @@ The faithful reference algorithm is the authority for the pipeline; the active
 ## 1.11 Panel 3 — MS2 view
 - ⬜ **Bug:** currently **can't reach the Panel 3 MS2 view** — clicking an MS2 point must reliably switch Panel 3 to the MS2 spectrum.
 - ⬜ Panel 3 MS2 is triggered by the user **clicking a sampled MS2 point**.
-- ⬜ **MS2 points must be visible in both the 2D and 3D Panel 1, and in Panel 2**, standing out as a **'start' point / a distinct color**.
+- ⬜ **MS2 points must be visible in both the 2D and 3D Panel 1, and in Panel 2** (overlaid on the
+  actual data, in addition to the left MS2 strip of 1.5), standing out as a **'start' point / a
+  distinct color** — these are the clickable trigger points.
 - ⬜ When an **identified peptide is assigned to that MS2 spectrum OR to the distribution sampled during that MS2 scan** (link the two via the search info if not already linked), **visualize the theoretical distribution of that specific MS1 progenitor**.
 - ⬜ Label the **MS1 progenitor isotopic distribution** and its **fragment isotopic compositions**, labeling the **ions by both type and number** (use `examples/peptidefragmentscoring.py`).
-- ⬜ Below the MS2 plot: **sequence coverage** of the peptide (from the sequence-coverage logic).
-- ⬜ **Table 2** (only appears below Panel 3 when MS2): **other candidate PSMs** for that MS1 distribution **with their relevant sequence coverage** (optional panel). 🟡 dock + candidate listing exists; ⬜ coverage column.
+- ⬜ Below the MS2 plot: **sequence coverage** of the peptide (the coverage/divider-string logic
+  the user provided — `coverage_print`-style: which residues each matched ion covers).
+- ⬜ **Table 2** (only appears below Panel 3 when MS2): the **other peptides this MS1 distribution
+  could have matched to** (the other candidate PSMs) **with their relevant sequence coverage**, so
+  the user can judge whether one peptide is distinguishable from another. Optional panel. 🟡 dock +
+  candidate listing exists; ⬜ coverage column + "could-have-matched" candidate logic.
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).
@@ -136,6 +180,9 @@ The faithful reference algorithm is the authority for the pipeline; the active
 ---
 
 # TAB 4 — MOTIF QUANTIFICATION ⬜
+- Motif index location is **auto-detected, not hard-coded**; expected structure is a
+  `human-proteome-skeletons/{build_info.tsv, motifs.tsv, postings.bin, proteins.tsv}` dir under a
+  motifs folder (e.g. `~/data/proteomics/motifs/`). Reader exists: `viewer/motifs.py`.
 - ⬜ Quantify the **motifs** found via `index-motifs.py`. **Time series + DE at the MOTIF level**, where proteins with specific motifs are **represented by that motif**.
 - ⬜ Look for **changes in expression of groups of proteins that all share a specific motif**.
 - ⬜ A functional database links proteins to **skeleton motifs**; **organize the different peptides within these skeletons**.
