@@ -179,7 +179,10 @@ class MSViewerTab(QMainWindow):
         self.worker = None
         self._pending = None
         self._win = None
-        self.window = None        # [mz_min, mz_max, rt_start, rt_end] source of truth
+        self.window = None        # [mz_min, mz_max, rt_start, rt_end] view (source of truth)
+        self._loaded_window = None # the padded region actually extracted/cached
+        self._p2_scatters = []    # (ScatterPlotItem, base_size) for zoom rescaling
+        self._p1_scatter_item = None  # panel-1 2D centroid scatter (for rescaling)
         self.center = None        # (mz_center, rt_center) for the ± controls
         self._guard = False       # suppress range-change handling during programmatic set
         self._dist_colors = {}    # distribution_id -> stable RGB colour
@@ -210,6 +213,9 @@ class MSViewerTab(QMainWindow):
         self.arrange_default()
         self._default_state = self.saveState()
         self.apply_theme(theme)
+        # Table 2 is MS2-only: hidden until the user clicks an MS2 point, so the
+        # MS1 panel 3 occupies the full panel-3 + table-2 space.
+        self.dock_table2.hide()
 
     # ---- docks -----------------------------------------------------------
 
@@ -324,7 +330,7 @@ class MSViewerTab(QMainWindow):
 
         # "loading… <context>" shown above panel 1 while its worker runs.
         self.p1_loading = QLabel("")
-        self.p1_loading.setStyleSheet("color: #d08a3a;")
+        self.p1_loading.setStyleSheet("color: black;")
 
         bar = QHBoxLayout()
         bar.addWidget(self.dim_toggle)
@@ -405,10 +411,13 @@ class MSViewerTab(QMainWindow):
         # RT-aligned with panel 2 (shared y). It fits in the space panel 1's wide
         # y-axis labels leave between panels 1 and 2.
         self.ms2_plot = pg.PlotWidget()
-        self.ms2_plot.setFixedWidth(50)
+        # The strip carries the RT (y) ruler for the whole row; panel 2's own
+        # left axis is value-less (below) so the two RT axes can never overlap and
+        # this left strip is always visible. Wide enough to fit the RT numbers.
+        self.ms2_plot.setFixedWidth(58)
         self.ms2_plot.setMouseEnabled(x=False, y=True)
         self.ms2_plot.getPlotItem().hideAxis("bottom")
-        self.ms2_plot.setLabel("left", "MS2 RT")
+        self.ms2_plot.setLabel("left", "MS2 RT", units="min")
         # Fix the x range so the strip never collapses when RT (y) is zoomed.
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
         self.ms2_plot.getViewBox().setMouseEnabled(x=False, y=True)
@@ -425,26 +434,21 @@ class MSViewerTab(QMainWindow):
         # Panel 2: m/z on x (aligned with panel 1), RT on y.
         self.p2 = pg.PlotWidget()
         self.p2.setLabel("bottom", "m/z")
-        self.p2.setLabel("left", "RT", units="min")
+        # No value labels on panel 2's own left axis -- the MS2 strip to its left
+        # is the RT ruler (shared y). This removes the duplicate/overlapping RT
+        # axis the user reported while keeping the width for m/z alignment.
+        self.p2.setLabel("left", "")
+        self.p2.getAxis("left").setStyle(showValues=False)
         self.p2_image = pg.ImageItem()
         if self._cmap is not None:
             self.p2_image.setColorMap(self._cmap)
         self.p2.addItem(self.p2_image)
 
-        # MS2 precursor markers overlaid on panel 2 (m/z x, RT y), in a distinct
-        # colour as the clickable "start point" trigger into the panel-3 MS2 view.
-        self.p2_ms2_scatter = pg.ScatterPlotItem(size=12, symbol="t",
-                                                 brush=pg.mkBrush(255, 90, 90, 220),
-                                                 pen=pg.mkPen(20, 20, 20, 200))
-        self.p2_ms2_scatter.setZValue(20)
-        self.p2_ms2_scatter.sigClicked.connect(self.on_ms2_clicked)
-        self.p2.addItem(self.p2_ms2_scatter)
-
         # Align panel 1 and panel 2 m/z (x) axes: their plot areas must start at
-        # the same screen x. Panel 2 is offset by the MS2 strip (50) + its own
-        # left axis; give panel 1's left axis the same total (50 + 50 = 100) so
+        # the same screen x. Panel 2 is offset by the MS2 strip (58) + its own
+        # value-less left axis (42); give panel 1's left axis the same total so
         # the m/z axes line up even though the y-axes intentionally differ.
-        self.p2.getAxis("left").setWidth(50)
+        self.p2.getAxis("left").setWidth(42)
         self.p1_2d.getAxis("left").setWidth(100)
 
         # MS2 strip shares panel 2's RT (y) axis.
@@ -455,7 +459,7 @@ class MSViewerTab(QMainWindow):
         self.p2.sigYRangeChanged.connect(self.on_view_range_changed)
 
         self.p2_loading = QLabel("")
-        self.p2_loading.setStyleSheet("color: #d08a3a;")
+        self.p2_loading.setStyleSheet("color: black;")
 
         row_widget = QWidget()
         row = QHBoxLayout(row_widget)
@@ -481,6 +485,13 @@ class MSViewerTab(QMainWindow):
         self.p3 = pg.PlotWidget()
         self.p3.setLabel("bottom", "m/z")
         self.p3.setLabel("left", "intensity")
+        # Panel 3 zooms like panel 1: dragging/scrolling inside the plot moves the
+        # m/z (x) axis only; wheel over the y-axis strip scrolls intensity with the
+        # baseline pinned at 0 (handled in eventFilter); double-click resets.
+        self.p3.setMouseEnabled(x=True, y=False)
+        self.p3.getAxis("left").setWidth(60)
+        self.p3.viewport().installEventFilter(self)
+        self.p3.scene().sigMouseClicked.connect(self._on_p3_clicked)
         self.p3_grid = pg.GraphicsLayoutWidget()
         self.p3_grid.scene().sigMouseClicked.connect(self._on_grid_clicked)
         self.p3_stack = QStackedWidget()
@@ -492,7 +503,7 @@ class MSViewerTab(QMainWindow):
         self.p3_title = QLabel("")
         self.p3_title.setStyleSheet("font-weight: bold;")
         self.p3_loading = QLabel("")
-        self.p3_loading.setStyleSheet("color: #d08a3a;")
+        self.p3_loading.setStyleSheet("color: black;")
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -736,11 +747,62 @@ class MSViewerTab(QMainWindow):
     def on_view_range_changed(self, *_):
         if self._guard or self.window is None:
             return
-        # Read the current window from panel 2 (m/z = x, RT = y) and debounce.
+        # Read the current window from panel 2 (m/z = x, RT = y).
         (mz0, mz1) = self.p2.getViewBox().viewRange()[0]
         (rt0, rt1) = self.p2.getViewBox().viewRange()[1]
         self.window = [mz0, mz1, max(0.0, rt0), rt1]
+        # Inverse-scale the point sizes so dots stay visible as you zoom in.
+        self._rescale_points()
+        # The big "data disappears on zoom" fix: we extract a PADDED region and
+        # cache it. Zooming/panning *within* that cached region is a pure view
+        # operation -- no re-extraction (which is what used to come back empty
+        # when the RT view got narrower than the MS1 scan spacing). Only reload
+        # when the view leaves the cached region.
+        if self._loaded_window is not None and self._within(self.window, self._loaded_window):
+            return
         self._reload_timer.start()
+
+    @staticmethod
+    def _within(inner, outer, eps=1e-9):
+        return (inner[0] >= outer[0] - eps and inner[1] <= outer[1] + eps and
+                inner[2] >= outer[2] - eps and inner[3] <= outer[3] + eps)
+
+    @staticmethod
+    def _padded(window):
+        """Grow a view window into the region we actually extract, so there is
+        margin to zoom/pan into before another reload is needed."""
+        mz0, mz1, rt0, rt1 = window
+        mz_pad = max((mz1 - mz0) * 0.6, 0.5)
+        rt_pad = max((rt1 - rt0) * 1.0, 0.05)
+        return [mz0 - mz_pad, mz1 + mz_pad, max(0.0, rt0 - rt_pad), rt1 + rt_pad]
+
+    def _rescale_points(self):
+        """Scale scatter point sizes up as the view zooms in (relative to the
+        cached region span), so datapoints stay visible instead of shrinking."""
+        lw = self._loaded_window
+        if lw is None:
+            return
+        lmz = max(lw[1] - lw[0], 1e-9)
+        lrt = max(lw[3] - lw[2], 1e-9)
+        try:
+            (vmz0, vmz1) = self.p2.getViewBox().viewRange()[0]
+            (vrt0, vrt1) = self.p2.getViewBox().viewRange()[1]
+        except Exception:
+            return
+        clamp = lambda f: min(max(f, 1.0), 4.0)
+        fmz = clamp((lmz / max(vmz1 - vmz0, 1e-9)) ** 0.5)
+        frt = clamp((lrt / max(vrt1 - vrt0, 1e-9)) ** 0.5)
+        f2 = clamp((fmz * frt) ** 0.5)
+        for scatter, base in self._p2_scatters:
+            try:
+                scatter.setSize(base * f2)
+            except Exception:
+                pass
+        if self._p1_scatter_item is not None:
+            try:
+                self._p1_scatter_item.setSymbolSize(4 * fmz)
+            except Exception:
+                pass
 
     def refresh(self):
         self._reload_timer.start()
@@ -754,7 +816,11 @@ class MSViewerTab(QMainWindow):
             self.p3_title.setText(f"no centroid mzML for {cur['filename']}")
             return
         self._record_nav()
-        mz_min, mz_max, rt_start, rt_end = self.window
+        # Extract a padded region around the view and cache its extent so zoom/pan
+        # within it never re-extracts (and never comes back empty).
+        load = self._padded(self.window)
+        self._loaded_window = load
+        mz_min, mz_max, rt_start, rt_end = load
         store = cur["profile"] if (self.use_profile() and cur["profile"]) else centroid
         self._win = (mz_min, mz_max, rt_start, rt_end)
         self._pending = dict(
@@ -804,6 +870,8 @@ class MSViewerTab(QMainWindow):
         scan_mz = result.get("scan_mz")
         scan_int = result.get("scan_int")
         self._last_points = points
+        self._last_scan_mz = scan_mz
+        self._last_scan_int = scan_int
         profile = bool(self.use_profile() and cur["profile"])
 
         self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end, profile)
@@ -819,6 +887,7 @@ class MSViewerTab(QMainWindow):
 
     def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end, profile):
         self.p1_2d.clear()
+        self._p1_scatter_item = None
         if isinstance(points, dict) and points["mz"].size:
             self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
             if profile:
@@ -831,9 +900,11 @@ class MSViewerTab(QMainWindow):
                     self.p1_2d.plot(points["mz"][m][order], points["intensity"][m][order],
                                     pen=pg.mkPen(120, 170, 255, 90))
             else:
-                self.p1_2d.plot(points["mz"], points["intensity"], pen=None,
-                                symbol="o", symbolSize=4, symbolPen=None,
-                                symbolBrush=pg.mkBrush(120, 170, 255, 170))
+                # Keep a handle on the scatter so its dot size can grow on zoom-in.
+                self._p1_scatter_item = self.p1_2d.plot(
+                    points["mz"], points["intensity"], pen=None,
+                    symbol="o", symbolSize=4, symbolPen=None,
+                    symbolBrush=pg.mkBrush(120, 170, 255, 170))
             self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
                                 f"({points['mz'].size} pts)")
             self.p1_2d.getViewBox().setYRange(0, float(points["intensity"].max()) * 1.05, padding=0)
@@ -896,8 +967,11 @@ class MSViewerTab(QMainWindow):
 
     def draw_panel2(self, points, window):
         # Connect-the-dots: raw points (m/z x, RT y) as dots + thin connecting
-        # lines, coloured by the sqlite distribution each line belongs to.
+        # lines, coloured by the sqlite distribution each line belongs to. Each
+        # distribution's dots are clickable -> selects it and shows the MS1
+        # panel 3 (charge grid / isotope overlay) for that distribution.
         self.p2.clear()
+        self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
         if not isinstance(points, dict) or points["mz"].size == 0:
             return
         mz_min, mz_max, rt_start, rt_end = window
@@ -919,19 +993,44 @@ class MSViewerTab(QMainWindow):
                     # thin connecting line (same colour) under fatter dots
                     self.p2.plot(mz[m][order], rt[m][order],
                                  pen=pg.mkPen(color=(*color, 200), width=1))
-                    self.p2.addItem(pg.ScatterPlotItem(
+                    scatter = pg.ScatterPlotItem(
                         x=mz[m], y=rt[m], size=5, pen=None,
-                        brush=pg.mkBrush(*color, 230)))
+                        brush=pg.mkBrush(*color, 230),
+                        data=[did] * int(m.sum()))
+                    scatter.sigClicked.connect(self.on_panel2_dist_clicked)
+                    self.p2.addItem(scatter)
+                    self._p2_scatters.append((scatter, 5))
 
-        # points not in any distribution -> faint gray dots
+        # points not in any distribution -> faint gray dots.
         if (~assigned).any():
-            self.p2.addItem(pg.ScatterPlotItem(
+            grey = pg.ScatterPlotItem(
                 x=mz[~assigned], y=rt[~assigned], size=2, pen=None,
-                brush=pg.mkBrush(160, 160, 160, 70)))
+                brush=pg.mkBrush(160, 160, 160, 70))
+            self.p2.addItem(grey)
+            self._p2_scatters.append((grey, 2))
 
-        # p2.clear() above drops the MS2 overlay; re-add it on top so the
-        # clickable precursor markers survive every reload.
-        self.p2.addItem(self.p2_ms2_scatter)
+        self._rescale_points()
+
+    def on_panel2_dist_clicked(self, _scatter, points):
+        """Clicking a distribution's dots in panel 2 selects it and brings up the
+        MS1 panel 3 for that distribution."""
+        if points is None or len(points) == 0 or self.current is None:
+            return
+        did = points[0].data()
+        if did is None:
+            return
+        self.current["distribution_id"] = did
+        # Selecting an MS1 distribution returns panel 3 to its MS1 view.
+        self._panel3_mode = "ms1"
+        self._ms2_scan = None
+        # Refresh table 1 to this distribution's members, then redraw panel 3.
+        try:
+            self.table1_for_distribution(did)
+        except Exception:
+            pass
+        self.draw_panel3_ms1(self.current,
+                             getattr(self, "_last_scan_mz", None),
+                             getattr(self, "_last_scan_int", None))
 
     def draw_ms2_strip(self, ms2):
         # MS2 scans as horizontal bands at their RT, drawn in RT data-space so
@@ -964,12 +1063,6 @@ class MSViewerTab(QMainWindow):
         self.ms2_scatter.setData(spots)
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
 
-        # Mirror the MS2 scans onto panel 2 at (precursor m/z, RT) so they are
-        # clickable directly over the data, not only from the thin left strip.
-        p2_spots = [{"pos": (m["mz"], m["rt"]), "data": m}
-                    for m in ms2 if m.get("rt") is not None and m.get("mz") is not None]
-        self.p2_ms2_scatter.setData(p2_spots)
-
     def on_ms2_clicked(self, _scatter, points):
         if points is None or len(points) == 0:
             return
@@ -984,6 +1077,8 @@ class MSViewerTab(QMainWindow):
             return
         self._panel3_mode = "ms2"
         self._ms2_scan = scan
+        # Table 2 (other candidate PSMs) only appears for the MS2 view.
+        self.dock_table2.show()
         try:
             spectrum = cur["centroid"].get_scan_by_id(scan["id"])
             if spectrum is None:
@@ -1019,13 +1114,19 @@ class MSViewerTab(QMainWindow):
                 self.table2.setItem(i, j, QTableWidgetItem(str(r.get(key, ""))))
             self.table2.setItem(i, 3, QTableWidgetItem("(staged)"))
 
-    # Wheel over panel 1's y-axis strip scrolls intensity (y zoom), even though
-    # y-drag inside the plot is disabled.
+    # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
+    # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
+    # by both panel 1 (2D) and panel 3.
     def eventFilter(self, obj, event):
-        if obj is self.p1_2d.viewport() and event.type() == QEvent.Wheel:
-            axis = self.p1_2d.getPlotItem().getAxis("left")
+        target = None
+        if obj is self.p1_2d.viewport():
+            target = self.p1_2d
+        elif obj is self.p3.viewport():
+            target = self.p3
+        if target is not None and event.type() == QEvent.Wheel:
+            axis = target.getPlotItem().getAxis("left")
             if event.position().x() < axis.width():
-                vb = self.p1_2d.getViewBox()
+                vb = target.getViewBox()
                 (y0, y1) = vb.viewRange()[1]
                 factor = 0.85 if event.angleDelta().y() > 0 else 1.0 / 0.85
                 # Keep the baseline pinned at 0 (intensity is always >= 0); only
@@ -1034,7 +1135,29 @@ class MSViewerTab(QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
+    def _on_p3_clicked(self, event):
+        # Double-click resets panel 3's zoom: auto-range m/z, ground intensity at 0.
+        if not event.double():
+            return
+        vb = self.p3.getViewBox()
+        vb.enableAutoRange(axis=vb.XAxis)
+        (x0, x1) = vb.viewRange()[0]
+        # Re-ground the y baseline at 0 against the data's max in view.
+        try:
+            ymax = 0.0
+            for item in self.p3.getPlotItem().listDataItems():
+                yd = item.yData
+                if yd is not None and len(yd):
+                    ymax = max(ymax, float(np.nanmax(yd)))
+            if ymax > 0:
+                vb.setYRange(0.0, ymax * 1.05, padding=0)
+        except Exception:
+            vb.enableAutoRange(axis=vb.YAxis)
+
     def draw_panel3_ms1(self, cur, scan_mz, scan_int):
+        # Table 2 (MS2 candidates) only belongs to the MS2 view; hide it so the
+        # MS1 panel 3 takes the full panel-3 + table-2 space.
+        self.dock_table2.hide()
         # If this match maps to a distribution with charge states, show the
         # charge-comparison grid; otherwise fall back to the isotope overlay.
         dist_id = cur.get("distribution_id")
@@ -1083,7 +1206,15 @@ class MSViewerTab(QMainWindow):
             if dists:
                 cur["distribution_id"] = dists[0]["distribution_id"]
                 rows = self.db.distribution_members(dists[0]["distribution_id"])
+        self._fill_table1(rows)
 
+    def table1_for_distribution(self, distribution_id):
+        """Fill table 1 with a specific distribution's line metrics (used when a
+        distribution is clicked directly in panel 2)."""
+        rows = self.db.distribution_members(distribution_id) if self.db is not None else []
+        self._fill_table1(rows)
+
+    def _fill_table1(self, rows):
         self.table1.setRowCount(len(rows))
         for i, row in enumerate(rows):
             for j, (field, _) in enumerate(LINE_METRIC_COLUMNS):

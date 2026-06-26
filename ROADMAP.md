@@ -114,14 +114,16 @@ data the pipeline produces. The four founding goals:
 - ✅ The **mass and time window of Panel 1 = the exact region shown in Panel 2.** Panel 2 is zoomable/movable and **shifts everything in Panel 1**.
 - ✅ Axes: m/z on **x** (swapped to align with Panel 1's x), time on **y**. (Original ask was m/z on y / time on x; swapped per later request so Panel 1↔2 x-axes align — ✅ now aligned.)
 - ✅ Moving Panel 1 (in 2D) pans horizontally on the **mass axis** and moves Panel 2's mass axis too (synchronized). ✅ Moving Panel 2 realigns Panel 1's (2D) mass axis.
-- ✅ Zoom/drag on Panel 2 (both axes + scroll-to-zoom) **reloads the data** for the viewed region.
+- ✅ Zoom/drag on Panel 2 (both axes + scroll-to-zoom) reloads the data only when the view **leaves the cached region**.
 - ✅ Render as **connect-the-dots**: individual datapoints as **dots** for time vs mass, **plus thin connecting lines**; the **line is thinner than the dots and the same color**; **each distribution a separate color** (colors from the sqlite). Points not in any distribution = faint gray. (Like the matplotlib time-vs-mass "connect the dots" reference.)
-- ⬜ Data should **not disappear on zoom** — investigate (re-extract on zoom + the distribution over-generation may be making artifacts look like data).
+- ✅ **Data no longer disappears on zoom** (was the BIGGEST bug). Root cause: every zoom re-extracted only the *visible* window, and an RT view narrower than the MS1 scan spacing returned **zero scans** → blank. Fix: extract a **padded region** (`_padded`, m/z ×1.6, RT ×3) and **cache its extent** (`_loaded_window`); zoom/pan **within** the cache is now a pure view operation (no re-extraction, never empty), reloading only when the view leaves the cached region.
+- ✅ Zooming in **inverse-scales the datapoint size** (`_rescale_points`, √ of the cached-vs-view span, clamped 1–4×) so dots stay visible as you zoom in, in both Panel 1 (2D) and Panel 2.
+- ✅ Clicking a **distribution's dots in Panel 2 selects it** and brings up the matching **MS1 Panel 3** (charge grid / isotope overlay) for that distribution.
 
 ## 1.5 MS2 strip (left of Panel 2)
-- ✅ A **tall thin plot just to the left of Panel 2** (fits in the space Panel 1's wider y-axis labels create). It shares Panel 2's **time (y) axis**.
-- ✅ MS2 scans shown as **horizontal lines that align with the time axis**, clickable.
-- ✅ **Bug fixed:** the MS2 RT lines are now drawn as **horizontal bands in RT data-space** (`LinearRegionItem`, half-height ≈ 0.18× median MS2 spacing) instead of fixed-pixel strokes, so they get **WIDER, not thinner, as you zoom** in; a clickable scatter still sits on each.
+- ✅ A **tall thin plot just to the left of Panel 2**. It shares Panel 2's **time (y) axis** and is **the sole RT ruler** for the row: Panel 2's own left axis is value-less, so the two RT axes **can never overlap** and this left strip is always visible.
+- ✅ MS2 scans shown as **horizontal lines/bands that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.**
+- ✅ **Bug fixed:** the MS2 RT lines are drawn as **horizontal bands in RT data-space** (`LinearRegionItem`, half-height ≈ 0.18× median MS2 spacing) instead of fixed-pixel strokes, so they get **WIDER / more visible, not thinner, as you zoom** in; a clickable scatter sits on each.
 
 ## 1.6 Distribution & line selection + coloring
 - Distributions and their member **lines** come from the **sqlite in `<project>/distributions/`**
@@ -157,27 +159,33 @@ data the pipeline produces. The four founding goals:
   - 🟡 grid renders; ⬜ make it **faithful to `panel-3-plot.py`** (per-row scales — peak-area log, charge-distance ylim, cross-charge log, intensity-sum% log, adjacency symlog; the white-on-gray styling adapted to theme; spine hiding; per-column titles `z(distid)`); ⬜ fix colors/readability.
 - ⬜ Use **`descending_partial_products` (`libraryadditions.py` / `isotopes.py`)** to compute the **expected isotopic distribution of the peptide** if a peptide is being viewed and found via the search, and **twin-plot** it with the experimental on **different x-axes**, scaled so the **theoretically-most-abundant isotope and the max experimentally-measured datapoint are at the same height**.
 - ✅ All MS1 Panel 3 plots that **share the mass x-axis are synchronized** when moved; ✅ **double-click resets** them all.
+- ✅ **Panel 3 (single-plot) zoom** matches Panel 1: dragging/scrolling inside the plot zooms the **m/z (x) axis only**; wheel over the **y-axis strip zooms intensity** with the **baseline pinned at 0**; **double-click resets** the zoom.
+- ✅ The MS1 Panel 3 now takes the **full Panel 3 + Table 2 space**: Table 2 is **hidden unless Panel 3 is in MS2 mode** (see 1.11 / Table 2).
 - ✅ Removed the leftover **"Panel 3"** title text (both the in-panel caption and the dock title).
 
 ## 1.11 Panel 3 — MS2 view
 - ✅ **Bug fixed:** clicking an MS2 point now reliably switches Panel 3 to the MS2 spectrum and a `_panel3_mode` flag **keeps it on MS2** across background reloads (was snapping back to MS1).
-- ✅ Panel 3 MS2 is triggered by the user **clicking a sampled MS2 point** (left strip **or** the Panel 2 overlay).
-- 🟡 **MS2 points** are now overlaid on **Panel 2** as distinct red 'start' triangles (clickable trigger points), in addition to the left MS2 strip; ⬜ still to overlay them on the 2D/3D Panel 1.
+- ✅ Panel 3 MS2 is triggered by the user **clicking a sampled MS2 point** on the **left MS2 RT strip** (1.5).
+- ⬜ **MS2 trigger markers live on the left MS2 RT strip only** — per the user, they must **not** sit inside the Panel 2 plot (an earlier Panel-2 red-triangle overlay was wrong and has been removed). Overlaying clickable MS2 points on the 2D/3D Panel 1 is still open but, if added, must follow this same "distinct start-point" rule without cluttering the data plots.
 - ⬜ When an **identified peptide is assigned to that MS2 spectrum OR to the distribution sampled during that MS2 scan** (link the two via the search info if not already linked), **visualize the theoretical distribution of that specific MS1 progenitor**.
 - ⬜ Label the **MS1 progenitor isotopic distribution** and its **fragment isotopic compositions**, labeling the **ions by both type and number** (use `examples/peptidefragmentscoring.py`).
-- ⬜ Below the MS2 plot: **sequence coverage** of the peptide (the coverage/divider-string logic
-  the user provided — `coverage_print`-style: which residues each matched ion covers).
+- ⬜ Below the MS2 plot: **sequence coverage** of the peptide (the coverage/divider-string logic —
+  `coverage_print`-style). **DEFERRED**: the sequence-coverage reference is not yet in `examples/`;
+  on hold until the user adds it.
 - ⬜ **Table 2** (only appears below Panel 3 when MS2): the **other peptides this MS1 distribution
   could have matched to** (the other candidate PSMs) **with their relevant sequence coverage**, so
   the user can judge whether one peptide is distinguishable from another. Optional panel. 🟡 dock +
-  candidate listing exists; ⬜ coverage column + "could-have-matched" candidate logic.
+  candidate listing exists, and **Table 2 now only appears when Panel 3 is in MS2 mode** (hidden for
+  MS1 so the MS1 view takes the full space); ⬜ "could-have-matched" candidate logic. **Sequence
+  coverage is deferred** — the user has not yet added the sequence-coverage reference to `examples/`,
+  so the coverage column/string (here and in 1.11) is on hold until that reference lands.
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).
 - ✅ Reset zoom; ✅ charge ◀/▶ + history ⟲/⟳; ✅ theme toggle.
 - ⬜ **Color settings drop-down** on the top bar: selected-distribution color, other-distributions color, **3D gradient min/max via a full color selector for both values**, and a **normal/log color-scale switch** (same fixed-size switch style as the 2D/3D and profile/centroid toggles).
 - ⬜ Manual **charge** entry field; ✅ **"align/reset 3D"** button (top bar + Panel 1 toolbar).
-- 🟡 **"loading… <context>"** label now shown above **Panel 1, Panel 2, and Panel 3** while the evidence worker runs, cleared when drawn (`_set_loading`); ⬜ Panel 3 MS2 / charge-grid sub-loads not yet separately labelled.
+- 🟡 **"loading… <context>"** label (rendered in **black**, not the old amber) now shown above **Panel 1, Panel 2, and Panel 3** while the evidence worker runs, cleared when drawn (`_set_loading`); ⬜ Panel 3 MS2 / charge-grid sub-loads not yet separately labelled.
 
 ---
 
