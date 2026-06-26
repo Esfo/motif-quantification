@@ -361,9 +361,16 @@ class MSViewerTab(QMainWindow):
         self.dock_panel2 = dock
 
     def build_panel3_dock(self):
+        # Single plot (isotope overlay / MS2 spectrum) and the multi-distribution
+        # charge-comparison grid live in a stack; panel 3 shows whichever fits.
         self.p3 = pg.PlotWidget()
         self.p3.setLabel("bottom", "m/z")
         self.p3.setLabel("left", "intensity")
+        self.p3_grid = pg.GraphicsLayoutWidget()
+        self.p3_stack = QStackedWidget()
+        self.p3_stack.addWidget(self.p3)        # 0 = single plot
+        self.p3_stack.addWidget(self.p3_grid)   # 1 = charge grid
+
         self.p3_title = QLabel("Panel 3")
         self.p3_title.setStyleSheet("font-weight: bold;")
 
@@ -371,7 +378,7 @@ class MSViewerTab(QMainWindow):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.addWidget(self.p3_title)
-        layout.addWidget(self.p3, stretch=1)
+        layout.addWidget(self.p3_stack, stretch=1)
 
         dock = QDockWidget("Panel 3 - MS1 / MS2", self)
         dock.setObjectName("dock_panel3")
@@ -743,6 +750,7 @@ class MSViewerTab(QMainWindow):
             if spectrum is None:
                 return
             mz, inten = scan_arrays(spectrum)
+            self.p3_stack.setCurrentIndex(0)
             plot_spectrum(self.p3, mz, inten,
                           title=f"MS2  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
             self.p3_title.setText(
@@ -766,6 +774,16 @@ class MSViewerTab(QMainWindow):
         return super().eventFilter(obj, event)
 
     def draw_panel3_ms1(self, cur, scan_mz, scan_int):
+        # If this match maps to a distribution with charge states, show the
+        # charge-comparison grid; otherwise fall back to the isotope overlay.
+        dist_id = cur.get("distribution_id")
+        if dist_id is not None:
+            group = self.db.charge_group(dist_id)
+            if group:
+                self.draw_charge_grid(group, cur)
+                self.p3_stack.setCurrentIndex(1)
+                return
+        self.p3_stack.setCurrentIndex(0)
         self.p3.clear()
         self.p3.setLabel("bottom", "m/z")
         plain = plain_seq(cur["row"].get("peptide", ""))
@@ -793,6 +811,7 @@ class MSViewerTab(QMainWindow):
 
     def render_table1(self, cur):
         rows = []
+        cur["distribution_id"] = None
         if self.db is not None and cur["rt"] is not None and cur["charge"]:
             mz_min, mz_max = cur["mz_center"] - self.mz_half, cur["mz_center"] + self.mz_half
             dists = self.db.distributions_in_window(
@@ -801,6 +820,7 @@ class MSViewerTab(QMainWindow):
                 charge=cur["charge"], limit=1,
             )
             if dists:
+                cur["distribution_id"] = dists[0]["distribution_id"]
                 rows = self.db.distribution_members(dists[0]["distribution_id"])
 
         self.table1.setRowCount(len(rows))
@@ -810,6 +830,61 @@ class MSViewerTab(QMainWindow):
                 if isinstance(value, float):
                     value = f"{value:.4g}"
                 self.table1.setItem(i, j, QTableWidgetItem(str(value)))
+
+    # ---- panel 3 charge-comparison grid ----------------------------------
+
+    CHARGE_ROWS = [
+        ("envelope", "height", False),
+        ("peak area", "area", True),
+        ("charge dist", None, False),     # diff(mz) * charge
+        ("intensity %", None, False),     # height / sum(height)
+    ]
+
+    def draw_charge_grid(self, group, cur):
+        """First-pass charge-comparison grid: columns = charge states of the
+        analyte, rows = per-charge metrics from the sqlite features. Cross-charge
+        rows (ppm alignment, cross-charge ratios) and RT traces are staged
+        (need feature raw points) -- see ARCHITECTURE.md."""
+        self.p3_grid.clear()
+        charges = sorted(group)
+        self.p3_title.setText(
+            f"charge comparison - {plain_seq(cur['row'].get('peptide',''))}  "
+            f"analyte charges: {', '.join(map(str, charges))}")
+
+        colors = [(76, 114, 176), (221, 132, 82), (85, 168, 104), (196, 78, 82),
+                  (129, 114, 179), (147, 120, 96)]
+
+        for ci, charge in enumerate(charges):
+            feats = sorted(group[charge]["features"], key=lambda f: f.get("isotope_index", 0))
+            mz = np.array([f.get("mz_mean", 0.0) for f in feats], dtype=float)
+            height = np.array([f.get("height", 0.0) for f in feats], dtype=float)
+            area = np.array([f.get("area", 0.0) for f in feats], dtype=float)
+            color = colors[ci % len(colors)]
+
+            for ri, (label, field, logy) in enumerate(self.CHARGE_ROWS):
+                plot = self.p3_grid.addPlot(row=ri, col=ci)
+                plot.showGrid(x=True, y=True, alpha=0.2)
+                if ri == 0:
+                    plot.setTitle(f"z={charge}")
+                if ci == 0:
+                    plot.setLabel("left", label)
+                if mz.size == 0:
+                    continue
+
+                if field == "height":
+                    plot.addItem(pg.BarGraphItem(x=mz, height=height, width=0.02, brush=color))
+                elif field == "area":
+                    plot.addItem(pg.BarGraphItem(x=mz, height=area, width=0.02, brush=color))
+                    if logy:
+                        plot.setLogMode(y=True)
+                elif label == "charge dist":
+                    if mz.size > 1:
+                        mids = mz[:-1] + np.diff(mz) / 2
+                        cd = np.diff(mz) * charge
+                        plot.addItem(pg.BarGraphItem(x=mids, height=cd, width=0.02, brush=color))
+                elif label == "intensity %":
+                    total = height.sum() or 1.0
+                    plot.addItem(pg.BarGraphItem(x=mz, height=height / total, width=0.02, brush=color))
 
     # ---- toggles + sync --------------------------------------------------
 
