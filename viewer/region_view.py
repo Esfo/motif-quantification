@@ -147,8 +147,19 @@ class RegionView(QWidget):
         if HAVE_GL:
             self.gl_view = gl.GLViewWidget()
             self.gl_view.setCameraPosition(distance=3.2, elevation=30, azimuth=-60)
-            self.surface = gl.GLSurfacePlotItem(shader="shaded", smooth=True)
-            self.scatter = gl.GLScatterPlotItem(size=3.0)
+            # GLSurfacePlotItem crashes in paint() if it is drawn before any z
+            # grid is set (vertexNormals on None). Seed it with a valid 2x2 grid
+            # and keep both items hidden until the first real region renders.
+            self.surface = gl.GLSurfacePlotItem(
+                x=np.array([0.0, 1.0], dtype=np.float32),
+                y=np.array([0.0, 1.0], dtype=np.float32),
+                z=np.zeros((2, 2), dtype=np.float32),
+                shader="shaded",
+                smooth=True,
+            )
+            self.surface.setVisible(False)
+            self.scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3), dtype=np.float32), size=3.0)
+            self.scatter.setVisible(False)
             self.gl_view.addItem(self.surface)
             self.gl_view.addItem(self.scatter)
             view_3d = self.gl_view

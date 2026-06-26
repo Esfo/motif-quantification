@@ -1,0 +1,112 @@
+"""Reader for the MS1 distributions sqlite (the ``distributions/`` output).
+
+Schema mirrors ``distributions/store.py``: ``scans``, ``lines``, ``features``,
+``distributions``, ``distribution_members``, ``analytes``, ``analyte_members``.
+A "line" the spec talks about is a ``feature`` here (one isotope trace's peak);
+a "distribution" is the group of features linked through ``distribution_members``
+with an ``isotope_index``.
+
+This reader is read-only and stateless beyond a cached connection, so it is safe
+to query from the UI thread for the small windowed lookups the viewer needs.
+Raw per-point arrays are *not* in the DB; the viewer re-extracts those from the
+mzML window (see ``mzml_store.extract_region``).
+"""
+
+import sqlite3
+from pathlib import Path
+
+
+class DistributionsDB:
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        self._conn = None
+
+    def connect(self):
+        if self._conn is None:
+            self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            self._conn.row_factory = sqlite3.Row
+        return self._conn
+
+    def close(self):
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def parameters(self):
+        rows = self.connect().execute("SELECT key, value FROM parameters").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def distributions_in_window(self, mz_min=None, mz_max=None, rt_start=None,
+                                rt_end=None, charge=None, limit=2000):
+        """Distributions whose mono m/z and RT apex fall in the window."""
+        clauses = []
+        params = []
+
+        if mz_min is not None:
+            clauses.append("mono_mz >= ?")
+            params.append(mz_min)
+        if mz_max is not None:
+            clauses.append("mono_mz <= ?")
+            params.append(mz_max)
+        if rt_start is not None:
+            clauses.append("rt_end >= ?")
+            params.append(rt_start)
+        if rt_end is not None:
+            clauses.append("rt_start <= ?")
+            params.append(rt_end)
+        if charge is not None:
+            clauses.append("charge = ?")
+            params.append(int(charge))
+
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+
+        rows = self.connect().execute(
+            f"SELECT * FROM distributions {where} ORDER BY quality DESC LIMIT ?", params
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def distribution(self, distribution_id):
+        row = self.connect().execute(
+            "SELECT * FROM distributions WHERE distribution_id = ?", (distribution_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def distribution_members(self, distribution_id):
+        """Member features (the isotope lines) of a distribution, ordered by isotope."""
+        rows = self.connect().execute(
+            """
+            SELECT f.*, m.isotope_index, m.member_score
+            FROM distribution_members m
+            JOIN features f ON f.feature_id = m.feature_id
+            WHERE m.distribution_id = ?
+            ORDER BY m.isotope_index
+            """,
+            (distribution_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def feature(self, feature_id):
+        row = self.connect().execute(
+            "SELECT * FROM features WHERE feature_id = ?", (feature_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def line(self, line_id):
+        row = self.connect().execute(
+            "SELECT * FROM lines WHERE line_id = ?", (line_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def scan_rt(self, ms1_index):
+        row = self.connect().execute(
+            "SELECT rt FROM scans WHERE ms1_index = ?", (ms1_index,)
+        ).fetchone()
+        return row["rt"] if row else None
+
+    def analyte_for_distribution(self, distribution_id):
+        row = self.connect().execute(
+            "SELECT analyte_id FROM analyte_members WHERE distribution_id = ?",
+            (distribution_id,),
+        ).fetchone()
+        return row["analyte_id"] if row else None
