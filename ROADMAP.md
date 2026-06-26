@@ -56,6 +56,25 @@ data the pipeline produces. The four founding goals:
   motifs dir (e.g. `~/data/proteomics/motifs/`); `experimental-setup` sits in the project root.
 - "**single-file view so far**" (Tab 1) — a multi-file Tab-1 mode may come later.
 
+## 0.3 Miscellaneous small requests (mostly done — listed so nothing is lost)
+- ✅ **Open via a folder dialog, not flags**; accept the **project folder** directly (auto-finds
+  `searches/reorganized`, `distributions/`, `experimental-setup`); **remember the last location**.
+- ✅ **Empty GUI by default** — start filled with empty widgets (not a blank placeholder);
+  **double-click the empty area** to open the folder dialog (in addition to File ▸ Open).
+- ✅ **Ctrl+C from the CLI quits** cleanly (no force-kill needed).
+- ✅ **Instant light/dark theme** toggle (button press, applies to all plots + GL).
+- ✅ Removed the **"Panel 1"/"Panel 2"** dock title text (the **"Panel 3"** text removal is still ⬜, see 1.10).
+- ✅ **Bounded region** — the profile/region view is the ID's ± m/z / ± RT window, **never the
+  entire spectrum** (which was unreadable).
+- ✅ Removed the **orange 3D background** (was the height-color shader).
+- ✅ **No UI freeze** — selection reads run on a worker thread; rapid changes are latest-wins.
+- ✅ Sync model decision: **"forget the old generic sync"** — synchronization is now per-shared-
+  axis (Panel 1↔2 m/z; Panel 3 columns on mass), not a single global lock.
+- ✅ Pipeline driver runs from a **top-level `.py`** (`index-distributions.py`) via `execution.xsh`,
+  writing to the project's `/distributions/`.
+- ⬜ A short **"how to run"** note / README for launching the viewer and the pipeline.
+- ⬜ **General "seamless & crisp"** polish pass once features land (see 0.2).
+
 ---
 
 # TAB 1 — MS VIEWING
@@ -203,6 +222,19 @@ from-scratch reimplementation **missing whole reference stages**. The faithful r
 `examples/linemodel.py` + `distributionassembly.py` + `chargehandling.py`. Keep the sqlite
 schema (`distributions/store.py`); the GUI needs it. Validate each step on a real file
 (user runs it — I can't run the pipeline here).
+
+**Intent of the rework — derive constants, don't hardcode them.** The *point* of
+rewriting the distribution functions is to get rid of the magic numbers
+(`step_limit`, `new_inc_limit`, `charge_tolerance`, `mass_width_limit`,
+`roundcutoff`, etc.) by making them **data-adaptive / derived from the data** rather
+than fixed. The reference already shows the mechanism: `roundcutoff` is a per-scan
+moving average of the knee of sorted match distances (init 0), `masswidthlimit =
+roundcutoff*2`, and `madiff` is a per-trace moving average — i.e. the thresholds
+should fall out of the signal's own spacing/intensity statistics. Prefer that for
+every constant we can. **If a given value genuinely can't be derived, keeping it as a
+tunable constant (with a sensible default + CLI flag) is an acceptable fallback** —
+this is not a hard requirement, just the guiding intent. Note in code which constants
+ended up derived vs. left fixed and why.
 
 ### Stage-1 line model (`linemodel.py`)
 - ✅ acdiff acceptance (asymmetric, proton-spacing, `charge_tolerance`) — ported.
