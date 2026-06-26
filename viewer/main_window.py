@@ -173,11 +173,14 @@ class MainWindow(QMainWindow):
             return
         self._opening = True
         try:
-            start = str(self.session.reorganized) if (self.session and self.session.reorganized) else ""
+            start = self.settings.value("last_open_dir", "")
+            if self.session and self.session.reorganized:
+                start = str(self.session.reorganized)
             path = QFileDialog.getExistingDirectory(self, "Open project or reorganized folder", start)
         finally:
             self._opening = False
         if path:
+            self.settings.setValue("last_open_dir", path)
             self.open_reorganized(path)
 
     def reload_current(self):

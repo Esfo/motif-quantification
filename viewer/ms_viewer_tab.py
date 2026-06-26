@@ -128,6 +128,17 @@ class MSViewerTab(QMainWindow):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(4, 4, 4, 4)
 
+        # Tab 1 is a single-file view: a file must be chosen first. Default to
+        # the first file so the lists are never empty/ambiguous on open.
+        self.file_combo = QComboBox()
+        for row in self.session.files():
+            name = row.get("filename", "")
+            if name:
+                self.file_combo.addItem(name, name)
+        self.file_combo.currentIndexChanged.connect(self.on_file_changed)
+        layout.addWidget(QLabel("file"))
+        layout.addWidget(self.file_combo)
+
         self.search = QLineEdit()
         self.search.setPlaceholderText("filter…")
         self.search.textChanged.connect(self.repopulate_active_list)
@@ -142,9 +153,13 @@ class MSViewerTab(QMainWindow):
         dock.setWidget(container)
         self.dock_lists = dock
 
-        self.show_all_proteins()
-        self.show_all_peptides()
-        self.show_all_psms()
+        self.current_file = self.file_combo.currentData()
+        self.repopulate_active_list()
+
+    def on_file_changed(self):
+        self.current_file = self.file_combo.currentData()
+        self.search.clear()
+        self.repopulate_active_list()
 
     def _titled_list(self, layout, title, on_select, on_all):
         header = QHBoxLayout()
@@ -261,12 +276,14 @@ class MSViewerTab(QMainWindow):
         self.dock_table1 = dock
 
     def arrange_default(self):
+        # Three columns: lists | [panel1 / panel2 / table1] | panel3
         self.addDockWidget(Qt.LeftDockWidgetArea, self.dock_lists)
         self.addDockWidget(Qt.RightDockWidgetArea, self.dock_panel1)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.dock_panel3)
+        self.splitDockWidget(self.dock_panel1, self.dock_panel3, Qt.Horizontal)
         self.splitDockWidget(self.dock_panel1, self.dock_panel2, Qt.Vertical)
         self.splitDockWidget(self.dock_panel2, self.dock_table1, Qt.Vertical)
         self.resizeDocks([self.dock_lists], [320], Qt.Horizontal)
+        self.resizeDocks([self.dock_panel1, self.dock_panel3], [600, 460], Qt.Horizontal)
 
     def reset_layout(self):
         self.restoreState(self._default_state)
@@ -294,20 +311,28 @@ class MSViewerTab(QMainWindow):
         t = self.search.text().strip().lower()
         return (not t) or (t in text.lower())
 
+    # All list content is scoped to the selected file (single-file view).
+    def file_psms(self):
+        rows = []
+        for row in self.session.load_psms(self.current_file or ""):
+            row = dict(row)
+            row["filename"] = self.current_file
+            rows.append(row)
+        return rows
+
     def show_all_proteins(self):
-        self.active_list = "protein"
-        self._fill(self.protein_list, [(r.get("protein_id", ""), r) for r in self.session.global_proteins()
+        rows = self.session.file_proteins(self.current_file or "")
+        self._fill(self.protein_list, [(r.get("protein_id", ""), r) for r in rows
                                        if r.get("protein_id") and self._filter(r["protein_id"])])
 
     def show_all_peptides(self):
-        self._fill(self.peptide_list, [(r.get("peptide", ""), r) for r in self.session.global_peptides()
+        rows = self.session.file_peptides(self.current_file or "")
+        self._fill(self.peptide_list, [(r.get("peptide", ""), r) for r in rows
                                        if r.get("peptide") and self._filter(r["peptide"])])
 
     def show_all_psms(self):
-        rows = []
-        for gp in self.session.global_peptides():
-            rows.append((gp.get("peptide", ""), gp))
-        self._fill(self.psm_list, [r for r in rows if self._filter(r[0])])
+        self.psm_rows = [r for r in self.file_psms() if self._filter(r.get("peptide", ""))]
+        self._fill(self.psm_list, [(f"{r.get('scan','')}  {r.get('peptide','')}", r) for r in self.psm_rows])
 
     def repopulate_active_list(self):
         self.show_all_proteins()
@@ -319,8 +344,12 @@ class MSViewerTab(QMainWindow):
         if not items:
             return
         row = items[0].data(Qt.UserRole)
-        peptides = [p for p in str(row.get("peptides", "")).split(";") if p]
-        self._fill(self.peptide_list, [(p, {"peptide": p}) for p in peptides])
+        peptides = set(p for p in str(row.get("peptides", "")).split(";") if p)
+        plains = {plain_seq(p) for p in peptides}
+        # show this protein's peptides (matched within the file's peptide table)
+        matched = [r for r in self.session.file_peptides(self.current_file or "")
+                   if r.get("peptide") in peptides or plain_seq(r.get("peptide", "")) in plains]
+        self._fill(self.peptide_list, [(r.get("peptide", ""), r) for r in matched])
 
     def on_peptide_selected(self):
         items = self.peptide_list.selectedItems()
@@ -328,48 +357,28 @@ class MSViewerTab(QMainWindow):
             return
         row = items[0].data(Qt.UserRole)
         plain = plain_seq(row.get("peptide", ""))
-        # cross-link proteins
+        # cross-link proteins of this peptide
         proteins = [p for p in str(row.get("proteins", "")).split(";") if p]
         if proteins:
-            self._fill(self.protein_list, [(p, {"protein_id": p, "peptides": ""}) for p in proteins])
-        # list the PSMs of this peptide
-        self.psm_rows = self.psms_for_peptide(plain)
+            self._fill(self.protein_list, [(p, {"protein_id": p, "peptides": row.get("peptide", "")}) for p in proteins])
+        # scope the PSM list to this peptide (within the file); don't auto-load
+        # the (potentially huge) mzML until a PSM is explicitly chosen.
+        self.psm_rows = [r for r in self.file_psms() if plain_seq(r.get("peptide", "")) == plain]
         self._fill(self.psm_list, [(f"{r.get('scan','')}  {r.get('peptide','')}", r) for r in self.psm_rows])
-        if self.psm_rows:
-            self.update_evidence(self.psm_rows[0])
 
     def on_psm_selected(self):
         items = self.psm_list.selectedItems()
         if not items:
             return
         row = items[0].data(Qt.UserRole)
-        if "scan" in row:
+        if "scan" not in row:
+            return
+        try:
             self.update_evidence(row)
-        else:
-            # a peptide row from the all-PSMs list
-            plain = plain_seq(row.get("peptide", ""))
-            self.psm_rows = self.psms_for_peptide(plain)
-            self._fill(self.psm_list, [(f"{r.get('scan','')}  {r.get('peptide','')}", r) for r in self.psm_rows])
-            if self.psm_rows:
-                self.update_evidence(self.psm_rows[0])
-
-    def psms_for_peptide(self, plain):
-        rows = []
-        files = set()
-        for gp in self.session.global_peptides():
-            if plain_seq(gp.get("peptide", "")) == plain:
-                for f in str(gp.get("files", "")).split(";"):
-                    if f:
-                        files.add(f)
-        if not files:
-            files = {r.get("filename", "") for r in self.session.files()}
-        for filename in sorted(files):
-            for row in self.session.load_psms(filename):
-                if plain_seq(row.get("peptide", "")) == plain:
-                    row = dict(row)
-                    row["filename"] = filename
-                    rows.append(row)
-        return rows
+        except Exception as exc:
+            import traceback
+            self.p3_title.setText(f"evidence error: {exc}")
+            traceback.print_exc()
 
     # ---- store access ----------------------------------------------------
 
@@ -413,6 +422,14 @@ class MSViewerTab(QMainWindow):
         return self.source_toggle.isChecked()
 
     def refresh(self):
+        try:
+            self._refresh()
+        except Exception as exc:
+            import traceback
+            self.p3_title.setText(f"render error: {exc}")
+            traceback.print_exc()
+
+    def _refresh(self):
         cur = self.current
         if cur is None:
             return
