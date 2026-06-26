@@ -23,9 +23,10 @@ here gives each of those a defined home.
 """
 
 import re
+import traceback
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -49,14 +50,14 @@ import pyqtgraph as pg
 try:
     from .mzml_store import MzmlStore, scan_arrays
     from .plots import plot_points, plot_spectrum
-    from .region_view import HAVE_GL, RegionWorker, gl
+    from .region_view import HAVE_GL, gl
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     from . import isotopes
     from .theming import palette, style_plot, style_gl
 except ImportError:
     from mzml_store import MzmlStore, scan_arrays
     from plots import plot_points, plot_spectrum
-    from region_view import HAVE_GL, RegionWorker, gl
+    from region_view import HAVE_GL, gl
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     import isotopes
     from theming import palette, style_plot, style_gl
@@ -69,6 +70,59 @@ def plain_seq(peptide):
         value = value[2:-2]
     value = re.sub(r"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}", "", value)
     return re.sub(r"[^A-Za-z]", "", value).upper()
+
+
+class EvidenceWorker(QThread):
+    """Reads everything a selection needs from the mzML off the UI thread.
+
+    All mzML access for one selection happens here (metadata parse, the MS1 scan
+    window, and the RT x m/z region), so the (multi-GB) file is never touched on
+    the UI thread and the two reads never race on the same reader.
+    """
+
+    done = Signal(object)
+
+    def __init__(self, centroid, store, scan, rt, mz_min, mz_max,
+                 rt_start, rt_end, mz_bins, mode):
+        super().__init__()
+        self.centroid = centroid
+        self.store = store
+        self.scan = scan
+        self.rt = rt
+        self.mz_min = mz_min
+        self.mz_max = mz_max
+        self.rt_start = rt_start
+        self.rt_end = rt_end
+        self.mz_bins = mz_bins
+        self.mode = mode
+
+    def run(self):
+        try:
+            self.centroid.load_metadata()
+            if self.store is not self.centroid:
+                self.store.load_metadata()
+
+            if self.rt is not None:
+                ms1 = self.centroid.nearest_ms1_by_rt(self.rt)
+            else:
+                ms1 = self.centroid.preceding_ms1_for_scan(self.scan)
+
+            scan_mz = scan_int = None
+            ms1_number = None
+            if ms1 is not None:
+                ms1_number = ms1.number
+                scan_mz, scan_int = self.store.scan_window_by_number(ms1.number, self.mz_min, self.mz_max)
+
+            region = None
+            if self.rt is not None:
+                region = self.store.extract_region(
+                    self.mz_min, self.mz_max, self.rt_start, self.rt_end,
+                    mz_bins=self.mz_bins, mode=self.mode)
+
+            self.done.emit({"ms1_number": ms1_number, "scan_mz": scan_mz,
+                            "scan_int": scan_int, "region": region})
+        except Exception as exc:
+            self.done.emit({"error": f"{exc}\n{traceback.format_exc()}"})
 
 
 LINE_METRIC_COLUMNS = [
@@ -110,6 +164,8 @@ class MSViewerTab(QMainWindow):
         self.current = None
         self.psm_rows = []
         self.worker = None
+        self._pending = None
+        self._win = None
 
         self.setDockNestingEnabled(True)
         self.build_lists_dock()
@@ -437,72 +493,92 @@ class MSViewerTab(QMainWindow):
         if centroid is None:
             self.p3_title.setText(f"no centroid mzML for {cur['filename']}")
             return
-        centroid.load_metadata()
 
         mz_center = cur["mz_center"]
         rt = cur["rt"]
         mz_min, mz_max = mz_center - self.mz_half, mz_center + self.mz_half
-
-        # Panel 1 - 2D spectrum (m/z x intensity) of nearest MS1 scan in window
+        rt_start = max(0.0, rt - self.rt_half) if rt is not None else None
+        rt_end = rt + self.rt_half if rt is not None else None
         store = cur["profile"] if (self.use_profile() and cur["profile"]) else centroid
-        ms1 = centroid.nearest_ms1_by_rt(rt) if rt is not None else centroid.preceding_ms1_for_scan(cur["scan"])
-        if ms1 is not None:
-            mz, inten = store.scan_window_by_number(ms1.number, mz_min, mz_max)
-            plot_points(self.p1_2d, mz, inten, title=f"{cur['row'].get('peptide','')} z={cur['charge']}")
+
+        # Table 1 (sqlite) is cheap -> main thread now.
+        self.render_table1(cur)
+
+        # Everything that touches the mzML goes to a worker (latest-wins).
+        self._win = (mz_min, mz_max, rt_start, rt_end)
+        self._pending = dict(
+            centroid=centroid, store=store, scan=cur["scan"], rt=rt,
+            mz_min=mz_min, mz_max=mz_max, rt_start=rt_start or 0.0, rt_end=rt_end or 0.0,
+            mz_bins=400, mode="profile" if (self.use_profile() and cur["profile"]) else "centroid")
+        self.p3_title.setText(f"loading {cur['row'].get('peptide','')}…")
+        self._start_evidence()
+
+    def _start_evidence(self):
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if self._pending is None:
+            return
+        params = self._pending
+        self._pending = None
+        self.worker = EvidenceWorker(**params)
+        self.worker.done.connect(self.on_evidence_done)
+        self.worker.start()
+
+    def on_evidence_done(self, result):
+        # If a newer selection arrived while this ran, draw nothing stale and go.
+        if self._pending is not None:
+            self._start_evidence()
+            return
+
+        cur = self.current
+        if cur is None or not isinstance(result, dict):
+            return
+        if "error" in result:
+            self.p3_title.setText(f"evidence error: {result['error'].splitlines()[0]}")
+            return
+
+        mz_min, mz_max, rt_start, rt_end = self._win
+        scan_mz = result.get("scan_mz")
+        scan_int = result.get("scan_int")
+        region = result.get("region")
+
+        # Panel 1 - 2D spectrum
+        if scan_mz is not None and len(scan_mz):
+            plot_points(self.p1_2d, scan_mz, scan_int,
+                        title=f"{cur['row'].get('peptide','')} z={cur['charge']}")
         else:
             plot_points(self.p1_2d, [], [], title="MS1 scan unavailable")
 
-        # Panel 2 - RT x m/z map (threaded extract)
-        self.render_panel2(store, mz_min, mz_max, rt)
+        # Panel 2 - RT x m/z map
+        self.draw_panel2(region, mz_min, mz_max, rt_start, rt_end)
 
-        # Panel 3 - MS1 isotope overlay (theoretical vs experimental)
-        self.render_panel3_ms1(cur, ms1, store, mz_min, mz_max)
+        # Panel 3 - MS1 isotope overlay
+        self.draw_panel3_ms1(cur, scan_mz, scan_int)
 
-        # Table 1 - distribution lines (from sqlite if present)
-        self.render_table1(cur)
-
-    def render_panel2(self, store, mz_min, mz_max, rt):
-        if rt is None:
-            return
-        if self.worker is not None and self.worker.isRunning():
-            return
-        params = dict(mz_min=mz_min, mz_max=mz_max,
-                      rt_start=max(0.0, rt - self.rt_half), rt_end=rt + self.rt_half,
-                      mz_bins=400, mode="profile" if self.use_profile() else "centroid")
-        self._p2_win = (mz_min, mz_max, params["rt_start"], params["rt_end"])
-        self.worker = RegionWorker(store, params)
-        self.worker.done.connect(self.on_panel2_done)
-        self.worker.start()
-
-    def on_panel2_done(self, region):
-        if not isinstance(region, dict) or "error" in region:
+    def draw_panel2(self, region, mz_min, mz_max, rt_start, rt_end):
+        if not isinstance(region, dict):
             return
         z = region.get("z")
         rts = region.get("rts")
         if z is None or z.size == 0 or rts.size == 0:
             self.p2_image.clear()
             return
-        mz_min, mz_max, rt_start, rt_end = self._p2_win
         self.p2_image.setImage(np.log1p(z), autoLevels=True)
-        rt_span = max(rts[-1] - rts[0], 1e-6) if rts.size > 1 else max(rt_end - rt_start, 1e-6)
+        rt_span = max(rts[-1] - rts[0], 1e-6) if rts.size > 1 else max((rt_end or 1) - (rt_start or 0), 1e-6)
         self.p2_image.setRect(pg.QtCore.QRectF(rts[0], mz_min, rt_span, mz_max - mz_min))
 
-    def render_panel3_ms1(self, cur, ms1, store, mz_min, mz_max):
+    def draw_panel3_ms1(self, cur, scan_mz, scan_int):
         self.p3.clear()
         self.p3.setLabel("bottom", "m/z")
         plain = plain_seq(cur["row"].get("peptide", ""))
         charge = cur["charge"] or 1
         title = f"MS1 isotope envelope - {plain} z={charge}"
 
-        # experimental sticks
         exp_peak = 1.0
-        if ms1 is not None:
-            mz, inten = store.scan_window_by_number(ms1.number, mz_min, mz_max)
-            if len(inten):
-                exp_peak = float(np.max(inten)) or 1.0
-                plot_spectrum(self.p3, mz, inten, title=title)
+        if scan_mz is not None and len(scan_int):
+            exp_peak = float(np.max(scan_int)) or 1.0
+            plot_spectrum(self.p3, scan_mz, scan_int, title=title)
 
-        # theoretical overlay scaled to the experimental peak height
         if plain and set(plain) <= set("ACDEFGHIKLMNPQRSTVWYUO"):
             try:
                 t_mz, t_norm = isotopes.peptide_isotope_mzs(plain, charge)
