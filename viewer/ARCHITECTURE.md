@@ -71,12 +71,23 @@ buttons (All preserves selection+scroll; LFQ-only peptides labelled); evidence
 read off the UI thread (`EvidenceWorker`, latest-wins). Panels are **window-driven**
 (`self.window = [mz_min, mz_max, rt_start, rt_end]` is the source of truth):
 - Panel 1 2D shows **every datapoint** in the window (m/z vs intensity,
-  `extract_points`); only the m/z axis is interactive.
-- Panel 1 3D renders the raw points (coloured by intensity) + interpolated surface.
-- Panel 2 is **m/z (x) × RT (y)**, X-linked to panel 1; dragging/zooming either
-  m/z axis or panel 2's RT **reloads** the viewed region (debounced).
-- Panel 3 MS1 currently shows the theoretical-vs-experimental isotope overlay.
+  `extract_points`); profile draws per-scan curves, centroid draws dots; only the
+  m/z axis is interactive, wheel over the y-axis strip scrolls intensity.
+- Panel 1 3D renders the raw points (coloured by intensity) + interpolated surface
+  (mapped to actual rt/mz so points and surface align), with m/z/time labels.
+- Panel 2 is a **connect-the-dots** view: raw points (m/z x, RT y) as dots + thin
+  connecting lines, coloured per sqlite **distribution** (stable colour per
+  distribution_id); X-linked to panel 1, drag/zoom reloads the window.
+- A thin clickable **MS2 strip** sits left of panel 2 (horizontal lines at each
+  MS2 RT, shared y); clicking loads that MS2 spectrum into panel 3.
+- Panel 3: **charge-comparison grid** (columns = analyte charge states, rows =
+  retention time / peak area / charge distances / cross-charge / intensity sum %
+  / adjacency / ppm-to-mean / ppm-error) when the match maps to a distribution;
+  else the isotope overlay; MS2 spectrum on an MS2 click. Cross-charge rows use
+  base-mass (`mz*z - proton*z`) nearest alignment; the RT row uses the window
+  raw points filtered to each feature.
 - Table 1: line metrics from the sqlite distribution members.
+- Dock layout autosaves (4s) and restores (version-gated).
 
 ### Panel 3 MS1 — charge-comparison grid (staged, next major build)
 

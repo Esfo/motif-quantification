@@ -664,6 +664,7 @@ class MSViewerTab(QMainWindow):
         region = result.get("region")
         scan_mz = result.get("scan_mz")
         scan_int = result.get("scan_int")
+        self._last_points = points
         profile = bool(self.use_profile() and cur["profile"])
 
         self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end, profile)
@@ -884,58 +885,179 @@ class MSViewerTab(QMainWindow):
 
     # ---- panel 3 charge-comparison grid ----------------------------------
 
-    CHARGE_ROWS = [
-        ("envelope", "height", False),
-        ("peak area", "area", True),
-        ("charge dist", None, False),     # diff(mz) * charge
-        ("intensity %", None, False),     # height / sum(height)
-    ]
+    # 8 rows, one column per charge state (port of the charge-state comparison
+    # plot). Labels match the original axis labels.
+    CHARGE_ROW_LABELS = ["retention time", "peak area", "charge distances",
+                         "cross-charge", "intensity sum %", "adjacency",
+                         "ppm to mean", "ppm error"]
+
+    @staticmethod
+    def _align(a, b):
+        """Align two base-mass arrays by nearest match; returns (ai, bi, size)
+        index offsets into a and b and the overlapping length (per the original
+        argwhere-min alignment)."""
+        if a.size == 0 or b.size == 0:
+            return 0, 0, 0
+        basediffs = np.abs(b - a[:, None])
+        loc = np.argwhere(basediffs == basediffs.min())[0].tolist()
+        minindex = min(loc)
+        loc = [i - minindex for i in loc]
+        amax = a.size - loc[0]
+        bmax = b.size - loc[1]
+        return loc[0], loc[1], max(0, min(amax, bmax))
 
     def draw_charge_grid(self, group, cur):
-        """First-pass charge-comparison grid: columns = charge states of the
-        analyte, rows = per-charge metrics from the sqlite features. Cross-charge
-        rows (ppm alignment, cross-charge ratios) and RT traces are staged
-        (need feature raw points) -- see ARCHITECTURE.md."""
+        """Charge-comparison grid: columns = the analyte's charge states, rows =
+        the eight metrics from the charge-state-determination plot. Built on the
+        sqlite features (mz_mean / height / area) plus the window raw points for
+        the retention-time row."""
         self.p3_grid.clear()
         charges = sorted(group)
         self.p3_title.setText(
             f"charge comparison - {plain_seq(cur['row'].get('peptide',''))}  "
             f"analyte charges: {', '.join(map(str, charges))}")
 
-        colors = [(76, 114, 176), (221, 132, 82), (85, 168, 104), (196, 78, 82),
-                  (129, 114, 179), (147, 120, 96)]
+        proton = isotopes.proton
+        cols = {c: i for i, c in enumerate(charges)}
 
-        for ci, charge in enumerate(charges):
-            feats = sorted(group[charge]["features"], key=lambda f: f.get("isotope_index", 0))
-            mz = np.array([f.get("mz_mean", 0.0) for f in feats], dtype=float)
-            height = np.array([f.get("height", 0.0) for f in feats], dtype=float)
-            area = np.array([f.get("area", 0.0) for f in feats], dtype=float)
-            color = colors[ci % len(colors)]
+        # Per-charge arrays (sorted by isotope index).
+        masses, intens, areas, bases = {}, {}, {}, {}
+        for c in charges:
+            feats = sorted(group[c]["features"], key=lambda f: f.get("isotope_index", 0))
+            m = np.array([f.get("mz_mean", 0.0) for f in feats], dtype=float)
+            masses[c] = m
+            intens[c] = np.array([f.get("height", 0.0) for f in feats], dtype=float)
+            areas[c] = np.array([f.get("area", 0.0) for f in feats], dtype=float)
+            bases[c] = m * c - proton * c
 
-            for ri, (label, field, logy) in enumerate(self.CHARGE_ROWS):
-                plot = self.p3_grid.addPlot(row=ri, col=ci)
-                plot.showGrid(x=True, y=True, alpha=0.2)
-                if ri == 0:
-                    plot.setTitle(f"z={charge}")
-                if ci == 0:
-                    plot.setLabel("left", label)
-                if mz.size == 0:
-                    continue
+        # Cross-charge mean base masses + summed intensities (size-ordered align).
+        order = sorted(charges, key=lambda c: -bases[c].size)
+        moving = bases[order[0]].copy()
+        size0 = moving.size
+        arraysums = np.zeros(size0)
+        intsums = np.zeros(size0)
+        divs = np.zeros(size0)
+        for c in order:
+            ai, bi, size = self._align(bases[c], moving)
+            if size <= 0:
+                continue
+            arraysums[bi:bi + size] += bases[c][ai:ai + size]
+            intsums[bi:bi + size] += intens[c][ai:ai + size]
+            divs[bi:bi + size] += 1
+        divs[divs == 0] = 1
+        arraymeans = arraysums / divs
 
-                if field == "height":
-                    plot.addItem(pg.BarGraphItem(x=mz, height=height, width=0.02, brush=color))
-                elif field == "area":
-                    plot.addItem(pg.BarGraphItem(x=mz, height=area, width=0.02, brush=color))
-                    if logy:
-                        plot.setLogMode(y=True)
-                elif label == "charge dist":
-                    if mz.size > 1:
-                        mids = mz[:-1] + np.diff(mz) / 2
-                        cd = np.diff(mz) * charge
-                        plot.addItem(pg.BarGraphItem(x=mids, height=cd, width=0.02, brush=color))
-                elif label == "intensity %":
-                    total = height.sum() or 1.0
-                    plot.addItem(pg.BarGraphItem(x=mz, height=height / total, width=0.02, brush=color))
+        points = getattr(self, "_last_points", None)
+
+        def cell(ri, ci):
+            p = self.p3_grid.addPlot(row=ri, col=ci)
+            p.showGrid(x=True, y=True, alpha=0.2)
+            if ri == 0:
+                p.setTitle(f"z={charges[ci]}")
+            if ci == 0:
+                p.setLabel("left", self.CHARGE_ROW_LABELS[ri])
+            return p
+
+        for c in charges:
+            ci = cols[c]
+            cmz = masses[c]
+            cint = intens[c]
+            carea = areas[c]
+            cbase = bases[c]
+            color = self.distribution_color(group[c]["distribution"]["distribution_id"]) \
+                if group[c].get("distribution") else DIST_PALETTE[ci % len(DIST_PALETTE)]
+
+            try:
+                # Row 0: retention time -- raw points (m/z vs rt) for this charge's lines.
+                p0 = cell(0, ci)
+                if isinstance(points, dict) and points["mz"].size:
+                    for feat in group[c]["features"]:
+                        m = ((points["mz"] >= feat["mz_min"]) & (points["mz"] <= feat["mz_max"]) &
+                             (points["rt"] >= feat["rt_start"]) & (points["rt"] <= feat["rt_end"]))
+                        if m.any():
+                            o = np.argsort(points["rt"][m])
+                            p0.plot(points["mz"][m][o], points["rt"][m][o],
+                                    pen=pg.mkPen(*color, 200, width=1))
+                            p0.addItem(pg.ScatterPlotItem(x=points["mz"][m], y=points["rt"][m],
+                                                          size=3, pen=None, brush=pg.mkBrush(*color, 200)))
+
+                # Row 1: peak area (log).
+                p1 = cell(1, ci)
+                p1.setLogMode(y=True)
+                if cmz.size:
+                    p1.addItem(pg.BarGraphItem(x=cmz, height=np.maximum(carea, 1e-9), width=0.02, brush=color))
+
+                # Row 2: charge distances = diff(mz) * charge.
+                p2 = cell(2, ci)
+                if cmz.size > 1:
+                    mids = cmz[:-1] + np.diff(cmz) / 2
+                    p2.addItem(pg.BarGraphItem(x=mids, height=np.diff(cmz) * c, width=0.02, brush=color))
+
+                # Row 3: cross-charge intensity ratios vs every other charge (log).
+                p3 = cell(3, ci)
+                p3.setLogMode(y=True)
+                for nc in charges:
+                    ai, bi, size = self._align(cbase, bases[nc])
+                    if size <= 0:
+                        continue
+                    denom = cint[ai:ai + size]
+                    ratio = np.divide(intens[nc][bi:bi + size], denom,
+                                      out=np.ones(size), where=denom > 0)
+                    bx = cmz[ai:ai + size] + 0.004 * cols[nc]
+                    p3.addItem(pg.BarGraphItem(x=bx, height=np.maximum(ratio, 1e-9),
+                                               width=0.004, brush=self.distribution_color(
+                                                   group[nc]["distribution"]["distribution_id"])
+                                               if group[nc].get("distribution") else color))
+
+                # Row 4: intensity sum % (log).
+                p4 = cell(4, ci)
+                p4.setLogMode(y=True)
+                n = min(cint.size, intsums.size)
+                if n:
+                    denom = np.where(intsums[:n] > 0, intsums[:n], 1.0)
+                    p4.addItem(pg.BarGraphItem(x=cmz[:n], height=np.maximum(cint[:n] / denom, 1e-9),
+                                               width=0.02, brush=color))
+
+                # Row 5: adjacency = signed adjacent intensity ratios (symlog-ish).
+                p5 = cell(5, ci)
+                if cint.size > 1:
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        cr = cint[:-1] / cint[1:]
+                    cr[~np.isfinite(cr)] = 0
+                    cr[cr < 1] = -1.0 / np.where(cr[cr < 1] == 0, 1, cr[cr < 1])
+                    mids = cmz[:-1] + np.diff(cmz) / 2
+                    p5.addItem(pg.BarGraphItem(x=mids, height=cr, width=0.02, brush=color))
+
+                # Row 6: ppm of base mass to cross-charge mean.
+                p6 = cell(6, ci)
+                ai, bi, size = self._align(cbase, arraymeans)
+                if size > 0:
+                    base = cbase[ai:ai + size]
+                    mean = arraymeans[bi:bi + size]
+                    ppm = (mean - base) / np.where(base == 0, 1, base) * 1e6
+                    p6.addItem(pg.BarGraphItem(x=cmz[ai:ai + size], height=ppm, width=0.02, brush=color))
+
+                # Row 7: ppm error of base mass vs each other charge's base mass.
+                p7 = cell(7, ci)
+                bn = 0.0
+                for nc in charges:
+                    if nc == c:
+                        continue
+                    ai, bi, size = self._align(cbase, bases[nc])
+                    if size <= 0:
+                        continue
+                    base = cbase[ai:ai + size]
+                    other = bases[nc][bi:bi + size]
+                    ppm = (other - base) / np.where(other == 0, 1, other) * 1e6
+                    p7.addItem(pg.BarGraphItem(x=cmz[ai:ai + size] + bn, height=ppm, width=0.003,
+                                               brush=self.distribution_color(
+                                                   group[nc]["distribution"]["distribution_id"])
+                                               if group[nc].get("distribution") else color))
+                    bn += 0.004
+            except Exception as exc:
+                # one bad column shouldn't blank the whole grid
+                import traceback
+                traceback.print_exc()
 
     # ---- toggles + sync --------------------------------------------------
 
