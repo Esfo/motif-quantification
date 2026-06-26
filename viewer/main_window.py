@@ -300,12 +300,24 @@ class MainWindow(QMainWindow):
             self.settings.setValue("ms_tab_layout_version", self.LAYOUT_VERSION)
 
     def restore_geometry(self):
+        self._geometry_restored = False
         geom = self.settings.value("window_geometry")
         if geom is not None:
             try:
-                self.restoreGeometry(geom)
+                if self.restoreGeometry(geom):
+                    self._geometry_restored = True
             except Exception:
                 pass
+
+    def showEvent(self, event):
+        # Re-apply the saved dock layout once the window is actually shown: a
+        # restoreState done before the first show can be discarded as the nested
+        # tab/dock geometry settles, which left panels back at their defaults.
+        super().showEvent(event)
+        if not getattr(self, "_shown_once", False):
+            self._shown_once = True
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self.restore_layout)
 
     def restore_layout(self):
         if self.ms_tab is None:

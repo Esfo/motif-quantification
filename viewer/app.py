@@ -89,7 +89,10 @@ def main():
         xics_rt_window=args.xics_rt_window,
     )
 
-    window.resize(1600, 950)
+    # Only fall back to a default size if no saved geometry was restored --
+    # otherwise this would clobber the remembered window/dock layout every launch.
+    if not getattr(window, "_geometry_restored", False):
+        window.resize(1600, 950)
     window.show()
 
     raise SystemExit(app.exec())

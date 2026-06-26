@@ -183,6 +183,9 @@ class MSViewerTab(QMainWindow):
         self._loaded_window = None # the padded region actually extracted/cached
         self._p2_scatters = []    # (ScatterPlotItem, base_size) for zoom rescaling
         self._p1_scatter_item = None  # panel-1 2D centroid scatter (for rescaling)
+        self._assigned = None     # bool mask: which raw points are in a distribution
+        self._groups = []         # [(distribution_id, colour, point_mask)]
+        self._last_region = None
         self.center = None        # (mz_center, rt_center) for the ± controls
         self._guard = False       # suppress range-change handling during programmatic set
         self._dist_colors = {}    # distribution_id -> stable RGB colour
@@ -320,6 +323,10 @@ class MSViewerTab(QMainWindow):
         self.dim_toggle.clicked.connect(self.toggle_dimension)
         self.source_toggle = fixed_toggle("profile", "centroid")
         self.source_toggle.clicked.connect(self.refresh)
+        # Noise = points not in any distribution. Default shows noise; pressing
+        # hides it (label flips to what the next press does, like the others).
+        self.noise_toggle = fixed_toggle("noise off", "noise on", width=80)
+        self.noise_toggle.clicked.connect(self._toggle_noise)
         # Snap the 3D view back to its default upright orientation (recovers a
         # stuck / upside-down camera); only meaningful in 3D mode.
         self.reset3d_button = QPushButton("align 3D")
@@ -335,10 +342,15 @@ class MSViewerTab(QMainWindow):
         bar = QHBoxLayout()
         bar.addWidget(self.dim_toggle)
         bar.addWidget(self.source_toggle)
+        bar.addWidget(self.noise_toggle)
         bar.addWidget(self.reset3d_button)
         bar.addSpacing(8)
         bar.addWidget(self.p1_loading)
         bar.addStretch(1)
+
+        # Hide pyqtgraph's in-plot auto-range "A" button: fit-to-data makes no
+        # sense for the window-driven panels and it kept overlapping the data.
+        self.p1_2d.getPlotItem().hideButtons()
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -422,14 +434,14 @@ class MSViewerTab(QMainWindow):
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
         self.ms2_plot.getViewBox().setMouseEnabled(x=False, y=True)
         self.ms2_plot.getViewBox().disableAutoRange(axis=pg.ViewBox.XAxis)
-        # MS2 scans = horizontal bands drawn in RT data-space (not fixed-pixel
-        # strokes), so they get WIDER as you zoom into RT instead of thinning to
-        # invisible arrowheads. A clickable scatter sits on top for selection.
-        self._ms2_bands = []   # LinearRegionItem per MS2 scan (data-space height)
-        self.ms2_scatter = pg.ScatterPlotItem(size=11, symbol="o",
-                                              brush=pg.mkBrush(255, 180, 60, 160), pen=None)
-        self.ms2_scatter.sigClicked.connect(self.on_ms2_clicked)
-        self.ms2_plot.addItem(self.ms2_scatter)
+        # MS2 scans = solid horizontal bands drawn in RT data-space (not
+        # fixed-pixel strokes and not dots), so they read as distinct lines and
+        # get WIDER as you zoom into RT. Clicking the strip selects the nearest
+        # band (handled via a scene click, since the bands themselves aren't
+        # individually clickable items).
+        self._ms2_bands = []    # QGraphicsRectItem-like bars per MS2 scan
+        self._ms2_scans = []    # sorted [(rt, scan_dict)] for click hit-testing
+        self.ms2_plot.scene().sigMouseClicked.connect(self._on_ms2_strip_clicked)
 
         # Panel 2: m/z on x (aligned with panel 1), RT on y.
         self.p2 = pg.PlotWidget()
@@ -450,6 +462,10 @@ class MSViewerTab(QMainWindow):
         # the m/z axes line up even though the y-axes intentionally differ.
         self.p2.getAxis("left").setWidth(42)
         self.p1_2d.getAxis("left").setWidth(100)
+
+        # No in-plot auto-range "A" buttons (they overlapped the data).
+        self.p2.getPlotItem().hideButtons()
+        self.ms2_plot.getPlotItem().hideButtons()
 
         # MS2 strip shares panel 2's RT (y) axis.
         self.ms2_plot.setYLink(self.p2)
@@ -492,6 +508,7 @@ class MSViewerTab(QMainWindow):
         self.p3.getAxis("left").setWidth(60)
         self.p3.viewport().installEventFilter(self)
         self.p3.scene().sigMouseClicked.connect(self._on_p3_clicked)
+        self.p3.getPlotItem().hideButtons()
         self.p3_grid = pg.GraphicsLayoutWidget()
         self.p3_grid.scene().sigMouseClicked.connect(self._on_grid_clicked)
         self.p3_stack = QStackedWidget()
@@ -725,6 +742,24 @@ class MSViewerTab(QMainWindow):
     def use_profile(self):
         return self.source_toggle.isChecked()
 
+    def use_noise(self):
+        # Noise shown by default; the toggle (when checked) hides it.
+        return not self.noise_toggle.isChecked()
+
+    def _toggle_noise(self):
+        self.noise_toggle.setText("noise on" if self.noise_toggle.isChecked() else "noise off")
+        # Pure redraw from cached data -- no re-extraction needed.
+        self._redraw_from_cache()
+
+    def _redraw_from_cache(self):
+        """Redraw panels 1 & 2 from the last extracted points (e.g. after the
+        noise toggle) without hitting the mzML again."""
+        if not isinstance(getattr(self, "_last_points", None), dict) or self._win is None:
+            return
+        mz_min, mz_max, rt_start, rt_end = self._win
+        self.draw_panel1(self._last_points, self._last_region, mz_min, mz_max, rt_start, rt_end)
+        self.draw_panel2(self._last_points, (mz_min, mz_max, rt_start, rt_end))
+
     # ---- window-driven extraction ----------------------------------------
 
     def set_window(self, window, set_view=False):
@@ -772,8 +807,11 @@ class MSViewerTab(QMainWindow):
         """Grow a view window into the region we actually extract, so there is
         margin to zoom/pan into before another reload is needed."""
         mz0, mz1, rt0, rt1 = window
-        mz_pad = max((mz1 - mz0) * 0.6, 0.5)
-        rt_pad = max((rt1 - rt0) * 1.0, 0.05)
+        # Modest margin: enough to pan/zoom a bit before reloading, without
+        # extracting a huge region every time (keeps it snappy). Zoom-IN within
+        # the cache never reloads regardless of this size.
+        mz_pad = max((mz1 - mz0) * 0.5, 0.4)
+        rt_pad = max((rt1 - rt0) * 0.6, 0.05)
         return [mz0 - mz_pad, mz1 + mz_pad, max(0.0, rt0 - rt_pad), rt1 + rt_pad]
 
     def _rescale_points(self):
@@ -870,11 +908,14 @@ class MSViewerTab(QMainWindow):
         scan_mz = result.get("scan_mz")
         scan_int = result.get("scan_int")
         self._last_points = points
+        self._last_region = region
         self._last_scan_mz = scan_mz
         self._last_scan_int = scan_int
-        profile = bool(self.use_profile() and cur["profile"])
+        # Compute distribution membership once (shared by panels 1 and 2, and the
+        # noise toggle), so we don't query the sqlite twice per draw.
+        self._assigned, self._groups = self._assignment(points, (mz_min, mz_max, rt_start, rt_end))
 
-        self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end, profile)
+        self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end)
         self.draw_panel2(points, (mz_min, mz_max, rt_start, rt_end))
         self.draw_ms2_strip(result.get("ms2", []))
         # Keep the MS2 spectrum up if the user is in MS2 mode; otherwise (re)draw
@@ -885,29 +926,35 @@ class MSViewerTab(QMainWindow):
             self.draw_panel3_ms1(cur, scan_mz, scan_int)
         self._set_loading(False)
 
-    def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end, profile):
+    def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end):
+        profile = bool(self.use_profile() and self.current and self.current.get("profile"))
         self.p1_2d.clear()
         self._p1_scatter_item = None
         if isinstance(points, dict) and points["mz"].size:
-            self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
-            if profile:
-                # Profile data is continuous: draw one curve per scan so the
-                # envelope stays visible (and crisp) at any zoom, unlike fixed dots.
-                rts = points["rt"]
-                for r in np.unique(rts):
-                    m = rts == r
-                    order = np.argsort(points["mz"][m])
-                    self.p1_2d.plot(points["mz"][m][order], points["intensity"][m][order],
-                                    pen=pg.mkPen(120, 170, 255, 90))
+            # Noise off -> drop points not in any distribution (faster + cleaner).
+            pmz = points["mz"]; prt = points["rt"]; pint = points["intensity"]
+            if not self.use_noise() and self._assigned is not None and self._assigned.any():
+                pmz, prt, pint = pmz[self._assigned], prt[self._assigned], pint[self._assigned]
+            if pmz.size:
+                self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
+                if profile:
+                    # Profile data is continuous: draw one curve per scan so the
+                    # envelope stays visible (and crisp) at any zoom.
+                    for r in np.unique(prt):
+                        m = prt == r
+                        order = np.argsort(pmz[m])
+                        self.p1_2d.plot(pmz[m][order], pint[m][order],
+                                        pen=pg.mkPen(120, 170, 255, 90, width=0.5))
+                else:
+                    # Small dots (matplotlib-style), grown on zoom-in by _rescale_points.
+                    self._p1_scatter_item = self.p1_2d.plot(
+                        pmz, pint, pen=None, symbol="o", symbolSize=3, symbolPen=None,
+                        symbolBrush=pg.mkBrush(120, 170, 255, 170))
+                self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
+                                    f"({pmz.size} pts)")
+                self.p1_2d.getViewBox().setYRange(0, float(pint.max()) * 1.05, padding=0)
             else:
-                # Keep a handle on the scatter so its dot size can grow on zoom-in.
-                self._p1_scatter_item = self.p1_2d.plot(
-                    points["mz"], points["intensity"], pen=None,
-                    symbol="o", symbolSize=4, symbolPen=None,
-                    symbolBrush=pg.mkBrush(120, 170, 255, 170))
-            self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
-                                f"({points['mz'].size} pts)")
-            self.p1_2d.getViewBox().setYRange(0, float(points["intensity"].max()) * 1.05, padding=0)
+                self.p1_2d.setTitle("no in-distribution points (noise off)")
         else:
             self.p1_2d.setTitle("no MS1 points in window")
         self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
@@ -965,49 +1012,65 @@ class MSViewerTab(QMainWindow):
             self._dist_colors[distribution_id] = DIST_PALETTE[len(self._dist_colors) % len(DIST_PALETTE)]
         return self._dist_colors[distribution_id]
 
+    def _assignment(self, points, window):
+        """Membership of each raw point in a sqlite distribution. Returns
+        ``(assigned_mask, groups)`` where groups is a list of
+        ``(distribution_id, colour, point_mask)``. Computed once per reload and
+        shared by panels 1 and 2 + the noise toggle."""
+        if not isinstance(points, dict) or points["mz"].size == 0 or self.db is None:
+            return None, []
+        mz = points["mz"]; rt = points["rt"]
+        mz_min, mz_max, rt_start, rt_end = window
+        assigned = np.zeros(mz.size, dtype=bool)
+        groups = []
+        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
+            did = dist["distribution_id"]
+            dmask = np.zeros(mz.size, dtype=bool)
+            for feat in self.db.distribution_members(did):
+                m = ((mz >= feat["mz_min"]) & (mz <= feat["mz_max"]) &
+                     (rt >= feat["rt_start"]) & (rt <= feat["rt_end"]) & (~assigned))
+                if m.any():
+                    assigned |= m
+                    dmask |= m
+            if dmask.any():
+                groups.append((did, self.distribution_color(did), dmask))
+        return assigned, groups
+
     def draw_panel2(self, points, window):
-        # Connect-the-dots: raw points (m/z x, RT y) as dots + thin connecting
-        # lines, coloured by the sqlite distribution each line belongs to. Each
-        # distribution's dots are clickable -> selects it and shows the MS1
-        # panel 3 (charge grid / isotope overlay) for that distribution.
+        # Connect-the-dots: raw points (m/z x, RT y) as small dots + thin
+        # connecting lines, coloured by the sqlite distribution each line belongs
+        # to. Each distribution's dots are clickable -> selects it and shows the
+        # MS1 panel 3. Sizing follows the user's matplotlib reference (tiny dots,
+        # 0.2-ish line width), still inverse-scaled on zoom by _rescale_points.
         self.p2.clear()
         self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
         if not isinstance(points, dict) or points["mz"].size == 0:
             return
-        mz_min, mz_max, rt_start, rt_end = window
         mz = points["mz"]
         rt = points["rt"]
-        assigned = np.zeros(mz.size, dtype=bool)
 
-        if self.db is not None:
-            for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
-                did = dist["distribution_id"]
-                color = self.distribution_color(did)
-                for feat in self.db.distribution_members(did):
-                    m = ((mz >= feat["mz_min"]) & (mz <= feat["mz_max"]) &
-                         (rt >= feat["rt_start"]) & (rt <= feat["rt_end"]) & (~assigned))
-                    if not m.any():
-                        continue
-                    assigned |= m
-                    order = np.argsort(rt[m])
-                    # thin connecting line (same colour) under fatter dots
-                    self.p2.plot(mz[m][order], rt[m][order],
-                                 pen=pg.mkPen(color=(*color, 200), width=1))
-                    scatter = pg.ScatterPlotItem(
-                        x=mz[m], y=rt[m], size=5, pen=None,
-                        brush=pg.mkBrush(*color, 230),
-                        data=[did] * int(m.sum()))
-                    scatter.sigClicked.connect(self.on_panel2_dist_clicked)
-                    self.p2.addItem(scatter)
-                    self._p2_scatters.append((scatter, 5))
+        for did, color, dmask in (self._groups or []):
+            order = np.argsort(rt[dmask])
+            # thin connecting line (same colour) under the dots
+            self.p2.plot(mz[dmask][order], rt[dmask][order],
+                         pen=pg.mkPen(color=(*color, 200), width=0.5))
+            scatter = pg.ScatterPlotItem(
+                x=mz[dmask], y=rt[dmask], size=3, pen=None,
+                brush=pg.mkBrush(*color, 230),
+                data=[did] * int(dmask.sum()))
+            scatter.sigClicked.connect(self.on_panel2_dist_clicked)
+            self.p2.addItem(scatter)
+            self._p2_scatters.append((scatter, 3))
 
-        # points not in any distribution -> faint gray dots.
-        if (~assigned).any():
-            grey = pg.ScatterPlotItem(
-                x=mz[~assigned], y=rt[~assigned], size=2, pen=None,
-                brush=pg.mkBrush(160, 160, 160, 70))
-            self.p2.addItem(grey)
-            self._p2_scatters.append((grey, 2))
+        # points not in any distribution -> faint gray dots, unless noise is off.
+        if self.use_noise():
+            unassigned = ~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)
+            if unassigned.any():
+                grey = pg.ScatterPlotItem(
+                    x=mz[unassigned], y=rt[unassigned], size=1.5, pen=None,
+                    brush=pg.mkBrush(160, 160, 160, 70))
+                self.p2.addItem(grey)
+                self._p2_scatters.append((grey, 1.5))
 
         self._rescale_points()
 
@@ -1033,40 +1096,52 @@ class MSViewerTab(QMainWindow):
                              getattr(self, "_last_scan_int", None))
 
     def draw_ms2_strip(self, ms2):
-        # MS2 scans as horizontal bands at their RT, drawn in RT data-space so
-        # they widen (not thin) as the time axis is zoomed in. RT (y) is shared
-        # with panel 2; a clickable point sits on each band.
+        # MS2 scans as solid horizontal bands at their RT, drawn in RT data-space
+        # so they widen (not thin) as the time axis is zoomed in and read as
+        # distinct lines. RT (y) is shared with panel 2.
         for band in self._ms2_bands:
             self.ms2_plot.removeItem(band)
         self._ms2_bands = []
 
-        rts = sorted(m["rt"] for m in ms2 if m.get("rt") is not None)
-        # Band half-height in RT minutes: a fraction of the typical MS2 spacing
-        # (so bands stay distinct), with a small floor. Being in data-space is
-        # what makes them grow on zoom-in.
+        scans = sorted(((m["rt"], m) for m in ms2 if m.get("rt") is not None),
+                       key=lambda t: t[0])
+        self._ms2_scans = scans
+        rts = [rt for rt, _ in scans]
+        # Band half-height in RT minutes ~ 1/3 of the typical MS2 spacing: thick
+        # enough to see and tell apart, with gaps preserved between adjacent
+        # scans. Data-space => grows on zoom-in.
         if len(rts) > 1:
             spacing = float(np.median(np.diff(rts)))
-            half = max(spacing * 0.18, 1e-4)
+            half = max(spacing * 0.33, 1e-4)
         else:
-            half = 1e-3
-        pen = pg.mkPen(255, 180, 60, 0)
-        brush = pg.mkBrush(255, 180, 60, 110)
+            half = 5e-3
+        self._ms2_half = half
+        brush = pg.mkBrush(255, 170, 50, 235)
+        pen = pg.mkPen(255, 170, 50, 235)
         for rt in rts:
-            region = pg.LinearRegionItem(values=(rt - half, rt + half),
-                                         orientation="horizontal", movable=False,
-                                         brush=brush, pen=pen)
-            region.setZValue(-5)
-            self.ms2_plot.addItem(region)
-            self._ms2_bands.append(region)
+            band = pg.LinearRegionItem(values=(rt - half, rt + half),
+                                       orientation="horizontal", movable=False,
+                                       brush=brush, pen=pen)
+            band.setZValue(-5)
+            self.ms2_plot.addItem(band)
+            self._ms2_bands.append(band)
 
-        spots = [{"pos": (0.5, m["rt"]), "data": m} for m in ms2 if m.get("rt") is not None]
-        self.ms2_scatter.setData(spots)
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
 
-    def on_ms2_clicked(self, _scatter, points):
-        if points is None or len(points) == 0:
+    def _on_ms2_strip_clicked(self, event):
+        """Click anywhere on the MS2 strip -> select the nearest MS2 band by RT."""
+        if not self._ms2_scans:
             return
-        self.render_ms2(points[0].data())
+        try:
+            pos = self.ms2_plot.getViewBox().mapSceneToView(event.scenePos())
+        except Exception:
+            return
+        y = pos.y()
+        rt_arr = np.array([rt for rt, _ in self._ms2_scans])
+        i = int(np.argmin(np.abs(rt_arr - y)))
+        # Only act if the click is reasonably near a band (within ~2 half-heights).
+        if abs(rt_arr[i] - y) <= max(getattr(self, "_ms2_half", 5e-3) * 2.0, 1e-3):
+            self.render_ms2(self._ms2_scans[i][1])
 
     def render_ms2(self, scan):
         """Switch panel 3 to the MS2 spectrum for ``scan`` and remember it, so a
@@ -1293,6 +1368,7 @@ class MSViewerTab(QMainWindow):
         def cell(ri, ci):
             p = self.p3_grid.addPlot(row=ri, col=ci)
             p.showGrid(x=True, y=True, alpha=0.2)
+            p.hideButtons()
             if ri == 0:
                 p.setTitle(f"z={charges[ci]}")
             if ci == 0:

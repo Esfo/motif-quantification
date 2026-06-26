@@ -83,7 +83,7 @@ data the pipeline produces. The four founding goals:
 - ⬜ A **default pane setup**; provide a **"reset to default" pane** option that returns to this default.
 - ✅ Panes are **completely movable and resizable**: Ctrl+click+drag to move, drag edges/corners to resize.
 - ✅ Layout **auto-saves** and **remembers the user's prior personalization** for next launch (geometry + dock state).
-- ✅ Window geometry persists; opening a file no longer resets the layout.
+- ✅ Window geometry persists; opening a file no longer resets the layout. **Bug fixed:** `app.py` was calling `window.resize(1600×950)` *after* the saved geometry was restored, clobbering it every launch — it now only applies the default size when nothing was restored, and the dock layout is re-applied once on first `showEvent` (a restore before the first show was being discarded as the nested tab settled).
 - Default arrangement: left = the 3 lists; middle column = Panel 1 (top) / Panel 2 (mid) / Table 1 (below Panel 2); right column = Panel 3 (with Table 2 below it when MS2). ✅ structure, ⬜ "reset to default" exactly matching this.
 
 ## 1.2 Left lists (single-file view)
@@ -116,14 +116,17 @@ data the pipeline produces. The four founding goals:
 - ✅ Moving Panel 1 (in 2D) pans horizontally on the **mass axis** and moves Panel 2's mass axis too (synchronized). ✅ Moving Panel 2 realigns Panel 1's (2D) mass axis.
 - ✅ Zoom/drag on Panel 2 (both axes + scroll-to-zoom) reloads the data only when the view **leaves the cached region**.
 - ✅ Render as **connect-the-dots**: individual datapoints as **dots** for time vs mass, **plus thin connecting lines**; the **line is thinner than the dots and the same color**; **each distribution a separate color** (colors from the sqlite). Points not in any distribution = faint gray. (Like the matplotlib time-vs-mass "connect the dots" reference.)
-- ✅ **Data no longer disappears on zoom** (was the BIGGEST bug). Root cause: every zoom re-extracted only the *visible* window, and an RT view narrower than the MS1 scan spacing returned **zero scans** → blank. Fix: extract a **padded region** (`_padded`, m/z ×1.6, RT ×3) and **cache its extent** (`_loaded_window`); zoom/pan **within** the cache is now a pure view operation (no re-extraction, never empty), reloading only when the view leaves the cached region.
+- ✅ **Data no longer disappears on zoom** (was the BIGGEST bug). Root cause: every zoom re-extracted only the *visible* window, and an RT view narrower than the MS1 scan spacing returned **zero scans** → blank. Fix: extract a **padded region** (`_padded`, m/z ×2, RT ×2.2) and **cache its extent** (`_loaded_window`); zoom/pan **within** the cache is now a pure view operation (no re-extraction, never empty), reloading only when the view leaves the cached region.
 - ✅ Zooming in **inverse-scales the datapoint size** (`_rescale_points`, √ of the cached-vs-view span, clamped 1–4×) so dots stay visible as you zoom in, in both Panel 1 (2D) and Panel 2.
 - ✅ Clicking a **distribution's dots in Panel 2 selects it** and brings up the matching **MS1 Panel 3** (charge grid / isotope overlay) for that distribution.
+- ✅ **Noise on/off toggle** (fixed-size switch on the Panel 1 bar, like 2D/3D & profile/centroid): "noise off" drops all points **not in any distribution** from Panel 1 and Panel 2 (redrawn from cache, no re-extraction).
+- ✅ **Dot/line sizing** follows the user's matplotlib reference (tiny dots `s≈0.02`, line width `≈0.2`): Panel 2 distribution dots base **3 px** / connecting line **0.5 px**, gray noise dots **1.5 px**, Panel 1 dots **3 px** — all still inverse-scaled on zoom-in.
+- ✅ Removed pyqtgraph's in-plot **auto-range "A" button** from every panel (Panel 1/2/3, MS2 strip, charge-grid cells) — fit-to-data made no sense for the window-driven panels and the buttons overlapped the data.
 
 ## 1.5 MS2 strip (left of Panel 2)
 - ✅ A **tall thin plot just to the left of Panel 2**. It shares Panel 2's **time (y) axis** and is **the sole RT ruler** for the row: Panel 2's own left axis is value-less, so the two RT axes **can never overlap** and this left strip is always visible.
 - ✅ MS2 scans shown as **horizontal lines/bands that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.**
-- ✅ **Bug fixed:** the MS2 RT lines are drawn as **horizontal bands in RT data-space** (`LinearRegionItem`, half-height ≈ 0.18× median MS2 spacing) instead of fixed-pixel strokes, so they get **WIDER / more visible, not thinner, as you zoom** in; a clickable scatter sits on each.
+- ✅ **Bug fixed:** the MS2 RT lines are drawn as **solid horizontal bands in RT data-space** (`LinearRegionItem`, opaque, half-height ≈ **0.33× median MS2 spacing**) — distinct lines, not dots — so they get **WIDER / more visible as you zoom in** (and thinner as you zoom out). The earlier thin-dots look came from a constant-pixel scatter overlay, which has been **removed**; selection is now a **click anywhere on the strip → nearest band by RT**.
 
 ## 1.6 Distribution & line selection + coloring
 - Distributions and their member **lines** come from the **sqlite in `<project>/distributions/`**
