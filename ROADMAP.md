@@ -63,7 +63,7 @@ data the pipeline produces. The four founding goals:
   **double-click the empty area** to open the folder dialog (in addition to File ▸ Open).
 - ✅ **Ctrl+C from the CLI quits** cleanly (no force-kill needed).
 - ✅ **Instant light/dark theme** toggle (button press, applies to all plots + GL).
-- ✅ Removed the **"Panel 1"/"Panel 2"** dock title text (the **"Panel 3"** text removal is still ⬜, see 1.10).
+- ✅ Removed the **"Panel 1"/"Panel 2"** dock title text (and now the **"Panel 3"** text too — see 1.10).
 - ✅ **Bounded region** — the profile/region view is the ID's ± m/z / ± RT window, **never the
   entire spectrum** (which was unreadable).
 - ✅ Removed the **orange 3D background** (was the height-color shader).
@@ -107,7 +107,7 @@ data the pipeline produces. The four founding goals:
   - ⬜ **Grid lines on the m/z and time axes** marking where each scan was; ⬜ measured datapoints shown as **spherical points** along the grid at their intensity height.
   - ⬜ Points **colored by intensity** via a **gradient**; ⬜ the **3D peaks are a continuous surface** built from the **area between the 3D datapoints** (the surface legitimately represents each time×mass datapoint), with the **datapoints keeping their own point color** on top.
   - 🟡 surface renders; ⬜ make it the true point-to-point area-fill, and ⬜ profile points must **align with the surface** (was misaligned).
-  - **3D bugs (reported):** ⬜ remove the **central gnomon/axis line** (the giant line aiming up) — only m/z and time need labeling; ⬜ axis **labels must be theme-adaptive** (currently only visible in dark mode); ⬜ labels must **attach to the axis ends** (they float freely now); ⬜ it must **start x-aligned with Panel 2** orientation; ⬜ add an **"align/reset 3D" button** to snap it back; ⬜ fix the **upside-down / stuck orientation** (can't recover currently); ⬜ reduce **zoom lag** (decimate/cap on zoom, reuse cached region).
+  - **3D bugs (reported):** ✅ removed the **central gnomon/axis line** (the giant line aiming up) — only the m/z and time edge axes are drawn now; ✅ axis **labels are theme-adaptive** (recoloured to the palette fg on theme switch); ✅ labels **attach to the axis ends** (pinned to the far end of each edge axis); 🟡 it **starts x-aligned with Panel 2** orientation (default camera azimuth=-90 so time→right, m/z→back); ✅ added an **"align/reset 3D" button** (Panel 1 toolbar + top bar) to snap it back; ✅ **upside-down / stuck orientation** recoverable via that button; 🟡 reduced **zoom lag** (intensity-priority decimation to 12k points; ⬜ reuse cached region still).
   - ✅ In 3D, moving/rotating **does not move the m/z or time axes** — it only changes the 3D perspective. ✅ When the perspective is rearranged and Panel 2 moves, the perspective stays the same even though the data/axes change.
 
 ## 1.4 Panel 2 — m/z × time map
@@ -121,7 +121,7 @@ data the pipeline produces. The four founding goals:
 ## 1.5 MS2 strip (left of Panel 2)
 - ✅ A **tall thin plot just to the left of Panel 2** (fits in the space Panel 1's wider y-axis labels create). It shares Panel 2's **time (y) axis**.
 - ✅ MS2 scans shown as **horizontal lines that align with the time axis**, clickable.
-- ⬜ **Bug:** the MS2 RT lines **disappear when zooming** and look like arrows. They must get **WIDER, not thinner, as you zoom** (perspective-correct: render in RT data-space, not fixed-pixel strokes), and stay clickable.
+- ✅ **Bug fixed:** the MS2 RT lines are now drawn as **horizontal bands in RT data-space** (`LinearRegionItem`, half-height ≈ 0.18× median MS2 spacing) instead of fixed-pixel strokes, so they get **WIDER, not thinner, as you zoom** in; a clickable scatter still sits on each.
 
 ## 1.6 Distribution & line selection + coloring
 - Distributions and their member **lines** come from the **sqlite in `<project>/distributions/`**
@@ -157,14 +157,12 @@ data the pipeline produces. The four founding goals:
   - 🟡 grid renders; ⬜ make it **faithful to `panel-3-plot.py`** (per-row scales — peak-area log, charge-distance ylim, cross-charge log, intensity-sum% log, adjacency symlog; the white-on-gray styling adapted to theme; spine hiding; per-column titles `z(distid)`); ⬜ fix colors/readability.
 - ⬜ Use **`descending_partial_products` (`libraryadditions.py` / `isotopes.py`)** to compute the **expected isotopic distribution of the peptide** if a peptide is being viewed and found via the search, and **twin-plot** it with the experimental on **different x-axes**, scaled so the **theoretically-most-abundant isotope and the max experimentally-measured datapoint are at the same height**.
 - ✅ All MS1 Panel 3 plots that **share the mass x-axis are synchronized** when moved; ✅ **double-click resets** them all.
-- ⬜ Remove the leftover **"Panel 3"** title text.
+- ✅ Removed the leftover **"Panel 3"** title text (both the in-panel caption and the dock title).
 
 ## 1.11 Panel 3 — MS2 view
-- ⬜ **Bug:** currently **can't reach the Panel 3 MS2 view** — clicking an MS2 point must reliably switch Panel 3 to the MS2 spectrum.
-- ⬜ Panel 3 MS2 is triggered by the user **clicking a sampled MS2 point**.
-- ⬜ **MS2 points must be visible in both the 2D and 3D Panel 1, and in Panel 2** (overlaid on the
-  actual data, in addition to the left MS2 strip of 1.5), standing out as a **'start' point / a
-  distinct color** — these are the clickable trigger points.
+- ✅ **Bug fixed:** clicking an MS2 point now reliably switches Panel 3 to the MS2 spectrum and a `_panel3_mode` flag **keeps it on MS2** across background reloads (was snapping back to MS1).
+- ✅ Panel 3 MS2 is triggered by the user **clicking a sampled MS2 point** (left strip **or** the Panel 2 overlay).
+- 🟡 **MS2 points** are now overlaid on **Panel 2** as distinct red 'start' triangles (clickable trigger points), in addition to the left MS2 strip; ⬜ still to overlay them on the 2D/3D Panel 1.
 - ⬜ When an **identified peptide is assigned to that MS2 spectrum OR to the distribution sampled during that MS2 scan** (link the two via the search info if not already linked), **visualize the theoretical distribution of that specific MS1 progenitor**.
 - ⬜ Label the **MS1 progenitor isotopic distribution** and its **fragment isotopic compositions**, labeling the **ions by both type and number** (use `examples/peptidefragmentscoring.py`).
 - ⬜ Below the MS2 plot: **sequence coverage** of the peptide (the coverage/divider-string logic
@@ -178,8 +176,8 @@ data the pipeline produces. The four founding goals:
 - ✅ ± m/z and ± RT window controls (live).
 - ✅ Reset zoom; ✅ charge ◀/▶ + history ⟲/⟳; ✅ theme toggle.
 - ⬜ **Color settings drop-down** on the top bar: selected-distribution color, other-distributions color, **3D gradient min/max via a full color selector for both values**, and a **normal/log color-scale switch** (same fixed-size switch style as the 2D/3D and profile/centroid toggles).
-- ⬜ Manual **charge** entry field; ⬜ **"align/reset 3D"** button.
-- ⬜ **"loading… <context>"** label shown above **every** plot while its data worker runs, cleared when drawn — must happen **everywhere** (Panel 1 2D/3D, Panel 2, Panel 3, MS2), not just some places.
+- ⬜ Manual **charge** entry field; ✅ **"align/reset 3D"** button (top bar + Panel 1 toolbar).
+- 🟡 **"loading… <context>"** label now shown above **Panel 1, Panel 2, and Panel 3** while the evidence worker runs, cleared when drawn (`_set_loading`); ⬜ Panel 3 MS2 / charge-grid sub-loads not yet separately labelled.
 
 ---
 
