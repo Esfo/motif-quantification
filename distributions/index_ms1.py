@@ -67,6 +67,15 @@ class Config:
     charge_mass_ppm: float = 12.0
     min_charge_group_rt_score: float = 0.10
 
+    # Reference (distributionassembly.py) isotope-edge acceptance, ported faithfully:
+    # asymmetric acdiff tolerance around proton-spacing, plus intensity-step gating.
+    # mass_width_limit stands in for the reference masswidthlimit (=roundcutoff*2),
+    # which this pipeline does not track per-scan; tune if needed.
+    charge_tolerance: float = 0.1
+    mass_width_limit: float = 0.002
+    step_limit: float = 0.5
+    new_inc_limit: float = 0.1
+
 
 @dataclass(slots=True)
 class Trace:
@@ -550,22 +559,40 @@ def _score_edge(left_i, right_i, charge):
     rt_apex = _EDGE["rt_apex"]
     rt_end = _EDGE["rt_end"]
 
-    expected = C13_DELTA / charge
+    # Faithful to the reference (distributionassembly.py:226-231): acdiff is the
+    # signed deviation of the observed isotope spacing from proton/charge, with an
+    # ASYMMETRIC tolerance scaled by charge_tolerance (+ mass_width_limit).
+    expdiff = proton / charge
     observed = mz[right_i] - mz[left_i]
-    mz_error = observed - expected
+    acdiff = expdiff - observed
+    diffcut = expdiff * cfg["charge_tolerance"]
+    masswidthlimit = cfg["mass_width_limit"]
+    lower = -(diffcut * cfg["charge_tolerance"] + masswidthlimit)
+    upper = diffcut + masswidthlimit
 
-    tolerance = max(
-        cfg["isotope_mz_abs"],
-        mz[right_i] * cfg["isotope_mz_ppm"] / 1_000_000.0,
-    )
-
-    if abs(mz_error) > tolerance:
+    if not (acdiff > lower and acdiff <= upper):
         return None
+
+    mz_error = -acdiff
+    tolerance = upper if upper > 0 else max(cfg["isotope_mz_abs"], 1e-9)
 
     neutral_mass = (mz[left_i] - proton) * charge
 
     if neutral_mass <= 0 or neutral_mass > cfg["max_neutral_mass"]:
         return None
+
+    # Reference intensity-step gating (distributionassembly.py:240-278): the
+    # fractional intensity difference between adjacent isotopes is gated more
+    # strictly when intensity is increasing (new_inc_limit) than decreasing
+    # (step_limit).
+    left_h = _EDGE["height"][left_i]
+    right_h = _EDGE["height"][right_i]
+    denom = left_h + right_h
+    if denom > 0:
+        intensitypercdiff = abs(right_h - left_h) / denom / 2.0
+        ratiocheck = cfg["new_inc_limit"] if right_h > left_h else cfg["step_limit"]
+        if intensitypercdiff > ratiocheck:
+            return None
 
     left_width = rt_end[left_i] - rt_start[left_i]
     right_width = rt_end[right_i] - rt_start[right_i]
@@ -1155,6 +1182,10 @@ def make_config(args):
         min_distribution_members=args.min_distribution_members,
         charge_mass_ppm=args.charge_mass_ppm,
         min_charge_group_rt_score=args.min_charge_group_rt_score,
+        charge_tolerance=args.charge_tolerance,
+        mass_width_limit=args.mass_width_limit,
+        step_limit=args.step_limit,
+        new_inc_limit=args.new_inc_limit,
     )
 
 
@@ -1378,6 +1409,12 @@ def parse_args():
 
     parser.add_argument("--charge-mass-ppm", type=float, default=12.0)
     parser.add_argument("--min-charge-group-rt-score", type=float, default=0.10)
+
+    # reference isotope-edge acceptance (acdiff + intensity-step gating)
+    parser.add_argument("--charge-tolerance", type=float, default=0.1)
+    parser.add_argument("--mass-width-limit", type=float, default=0.002)
+    parser.add_argument("--step-limit", type=float, default=0.5)
+    parser.add_argument("--new-inc-limit", type=float, default=0.1)
 
     return parser.parse_args()
 
