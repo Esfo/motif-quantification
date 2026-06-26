@@ -17,6 +17,7 @@ searches_dir = project_dir / "searches"
 proteome_fasta = Path("/home/sfo/data/proteomics/fastas/human_uniprot_reviewed_plus_contaminants.fasta")
 
 reorganize_py = Path("/home/sfo/motif-quantification/reorganize-results.py")
+distributions_py = Path("/home/sfo/motif-quantification/index-distributions.py")
 
 decoy_tag = "decoy_"
 batch_size = 4
@@ -25,6 +26,7 @@ run_sage = True
 patch_pins = True
 run_percolator = True
 run_reorganize = True
+run_distributions = True
 
 
 # ----------------------------
@@ -521,3 +523,15 @@ if run_reorganize:
         --percolator-dir @(str(percolator_dir)) \
         --out-dir @(str(reorganized_dir)) \
         --q-max 0.01
+
+
+# ----------------------------
+# ms1 distribution determination -> project/distributions/<file>.distributions.sqlite
+# ----------------------------
+
+distributions_dir = project_dir / "distributions"
+
+if run_distributions:
+    python @(str(distributions_py)) \
+        --mzml-dir @(str(mzml_dir)) \
+        --out-dir @(str(distributions_dir))
