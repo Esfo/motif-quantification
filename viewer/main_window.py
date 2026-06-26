@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         self.build_menu()
         self.build_toolbar()
         QApplication.instance().installEventFilter(self)
+        self.restore_geometry()
         self.load_session(reorganized)
 
         # Autosave the dock layout periodically so it persists even if the app
@@ -113,6 +114,21 @@ class MainWindow(QMainWindow):
         bar.addWidget(QLabel("  ± RT "))
         self.rt_spin = self._spin(0.02, 10.0, 2, self.xics_rt_window, 0.1, self.on_rt_changed)
         bar.addWidget(self.rt_spin)
+        bar.addSeparator()
+        bar.addWidget(QLabel(" charge "))
+        back = bar.addAction("◀")
+        back.setToolTip("charge search: one charge lower at the same RT")
+        back.triggered.connect(lambda: self.ms_tab and self.ms_tab.charge_step(-1))
+        fwd = bar.addAction("▶")
+        fwd.setToolTip("charge search: one charge higher at the same RT")
+        fwd.triggered.connect(lambda: self.ms_tab and self.ms_tab.charge_step(1))
+        hist_back = bar.addAction("⟲")
+        hist_back.setToolTip("navigation history: back")
+        hist_back.triggered.connect(lambda: self.ms_tab and self.ms_tab.nav_back())
+        hist_fwd = bar.addAction("⟳")
+        hist_fwd.setToolTip("navigation history: forward")
+        hist_fwd.triggered.connect(lambda: self.ms_tab and self.ms_tab.nav_forward())
+
         bar.addSeparator()
         reset_zoom = bar.addAction("Reset zoom")
         reset_zoom.setShortcut("Ctrl+0")
@@ -210,7 +226,6 @@ class MainWindow(QMainWindow):
         self.load_session(reorganized)
 
     def load_session(self, reorganized):
-        self.save_layout()
         try:
             self.session = ViewerSession(
                 reorganized=reorganized, distribution_db=self.distribution_db,
@@ -230,7 +245,6 @@ class MainWindow(QMainWindow):
         self.ms_tab = MSViewerTab(self.session, distributions_db=db,
                                   xics_ppm=self.xics_ppm, xics_rt_window=self.rt_spin.value(),
                                   theme=self.theme)
-        self.restore_layout()
 
         tabs = QTabWidget()
         tabs.addTab(self.ms_tab, "MS viewing")
@@ -248,6 +262,10 @@ class MainWindow(QMainWindow):
                     "motif, with include/exclude refinement saved back to a motif-sets folder. "
                     "— staged, see ARCHITECTURE.md"), "Motifs")
         self.setCentralWidget(tabs)
+        # Restore the dock arrangement after the tab is laid out (sizes depend on
+        # the final widget geometry), so opening a file doesn't reset it.
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self.restore_layout)
 
         self.apply_theme(self.theme)
         self.reload_action.setEnabled(not self.session.is_empty)
@@ -270,12 +288,21 @@ class MainWindow(QMainWindow):
 
     # Bump when the default dock arrangement changes so a stale saved layout
     # doesn't override the new default (the user can still rearrange + it saves).
-    LAYOUT_VERSION = 2
+    LAYOUT_VERSION = 3
 
     def save_layout(self):
+        self.settings.setValue("window_geometry", self.saveGeometry())
         if self.ms_tab is not None:
             self.settings.setValue("ms_tab_state", self.ms_tab.saveState())
             self.settings.setValue("ms_tab_layout_version", self.LAYOUT_VERSION)
+
+    def restore_geometry(self):
+        geom = self.settings.value("window_geometry")
+        if geom is not None:
+            try:
+                self.restoreGeometry(geom)
+            except Exception:
+                pass
 
     def restore_layout(self):
         if self.ms_tab is None:

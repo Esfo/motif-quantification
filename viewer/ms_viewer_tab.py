@@ -183,6 +183,10 @@ class MSViewerTab(QMainWindow):
         self.center = None        # (mz_center, rt_center) for the ± controls
         self._guard = False       # suppress range-change handling during programmatic set
         self._dist_colors = {}    # distribution_id -> stable RGB colour
+        self.assumed_charge = None
+        self._nav = []            # navigation history of (window, charge)
+        self._nav_i = -1
+        self._suppress_record = False
         try:
             self._cmap = pg.colormap.get("viridis")
         except Exception:
@@ -200,6 +204,7 @@ class MSViewerTab(QMainWindow):
         self.build_panel2_dock()
         self.build_panel3_dock()
         self.build_table1_dock()
+        self.build_table2_dock()
         self.arrange_default()
         self._default_state = self.saveState()
         self.apply_theme(theme)
@@ -330,7 +335,7 @@ class MSViewerTab(QMainWindow):
         # RT-aligned with panel 2 (shared y). It fits in the space panel 1's wide
         # y-axis labels leave between panels 1 and 2.
         self.ms2_plot = pg.PlotWidget()
-        self.ms2_plot.setFixedWidth(64)
+        self.ms2_plot.setFixedWidth(50)
         self.ms2_plot.setMouseEnabled(x=False, y=True)
         self.ms2_plot.getPlotItem().hideAxis("bottom")
         self.ms2_plot.setLabel("left", "MS2 RT")
@@ -355,6 +360,13 @@ class MSViewerTab(QMainWindow):
         if self._cmap is not None:
             self.p2_image.setColorMap(self._cmap)
         self.p2.addItem(self.p2_image)
+
+        # Align panel 1 and panel 2 m/z (x) axes: their plot areas must start at
+        # the same screen x. Panel 2 is offset by the MS2 strip (50) + its own
+        # left axis; give panel 1's left axis the same total (50 + 50 = 100) so
+        # the m/z axes line up even though the y-axes intentionally differ.
+        self.p2.getAxis("left").setWidth(50)
+        self.p1_2d.getAxis("left").setWidth(100)
 
         # MS2 strip shares panel 2's RT (y) axis.
         self.ms2_plot.setYLink(self.p2)
@@ -382,6 +394,7 @@ class MSViewerTab(QMainWindow):
         self.p3.setLabel("bottom", "m/z")
         self.p3.setLabel("left", "intensity")
         self.p3_grid = pg.GraphicsLayoutWidget()
+        self.p3_grid.scene().sigMouseClicked.connect(self._on_grid_clicked)
         self.p3_stack = QStackedWidget()
         self.p3_stack.addWidget(self.p3)        # 0 = single plot
         self.p3_stack.addWidget(self.p3_grid)   # 1 = charge grid
@@ -412,6 +425,19 @@ class MSViewerTab(QMainWindow):
         dock.setWidget(self.table1)
         self.dock_table1 = dock
 
+    def build_table2_dock(self):
+        # Shown for MS2: candidate PSMs for the sampled precursor (+ sequence
+        # coverage, staged). Lives under panel 3.
+        self.table2 = QTableWidget()
+        cols = ["peptide", "protein", "q", "coverage"]
+        self.table2.setColumnCount(len(cols))
+        self.table2.setHorizontalHeaderLabels(cols)
+        self.table2.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        dock = QDockWidget("Table 2 - MS2 candidates", self)
+        dock.setObjectName("dock_table2")
+        dock.setWidget(self.table2)
+        self.dock_table2 = dock
+
     def arrange_default(self):
         # Three columns: lists | [panel1 / panel2 / table1] | panel3
         self.addDockWidget(Qt.LeftDockWidgetArea, self.dock_lists)
@@ -419,6 +445,7 @@ class MSViewerTab(QMainWindow):
         self.splitDockWidget(self.dock_panel1, self.dock_panel3, Qt.Horizontal)
         self.splitDockWidget(self.dock_panel1, self.dock_panel2, Qt.Vertical)
         self.splitDockWidget(self.dock_panel2, self.dock_table1, Qt.Vertical)
+        self.splitDockWidget(self.dock_panel3, self.dock_table2, Qt.Vertical)
         self.resizeDocks([self.dock_lists], [320], Qt.Horizontal)
         self.resizeDocks([self.dock_panel1, self.dock_panel3], [600, 460], Qt.Horizontal)
 
@@ -578,6 +605,7 @@ class MSViewerTab(QMainWindow):
             "centroid": self.centroid_store(filename), "profile": self.profile_store(filename),
         }
         self.center = (mz_center, rt)
+        self.assumed_charge = charge or 1
         self.render_table1(self.current)
         # Initialize the window from the ± controls and snap the views to it.
         rt_start = max(0.0, rt - self.rt_half) if rt is not None else 0.0
@@ -627,6 +655,7 @@ class MSViewerTab(QMainWindow):
         if centroid is None:
             self.p3_title.setText(f"no centroid mzML for {cur['filename']}")
             return
+        self._record_nav()
         mz_min, mz_max, rt_start, rt_end = self.window
         store = cur["profile"] if (self.use_profile() and cur["profile"]) else centroid
         self._win = (mz_min, mz_max, rt_start, rt_end)
@@ -807,8 +836,29 @@ class MSViewerTab(QMainWindow):
                           title=f"MS2  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
             self.p3_title.setText(
                 f"MS2 scan {scan.get('number','')}  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
+            self.populate_table2(scan)
         except Exception as exc:
             self.p3_title.setText(f"MS2 load error: {exc}")
+
+    def populate_table2(self, scan):
+        # Candidate PSMs near this precursor m/z in the current file (sequence
+        # coverage column is staged).
+        prec = scan.get("mz")
+        rows = []
+        for r in self.file_psms():
+            try:
+                row_mz = peptide_mass(r)
+                z = peptide_charge(r) or 1
+                psm_mz = (row_mz / z + 1.007276) if row_mz else None
+            except Exception:
+                psm_mz = None
+            if prec is None or (psm_mz is not None and abs(psm_mz - prec) < 3.0):
+                rows.append(r)
+        self.table2.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for j, key in enumerate(("peptide", "proteins", "percolator_q")):
+                self.table2.setItem(i, j, QTableWidgetItem(str(r.get(key, ""))))
+            self.table2.setItem(i, 3, QTableWidgetItem("(staged)"))
 
     # Wheel over panel 1's y-axis strip scrolls intensity (y zoom), even though
     # y-drag inside the plot is disabled.
@@ -819,9 +869,9 @@ class MSViewerTab(QMainWindow):
                 vb = self.p1_2d.getViewBox()
                 (y0, y1) = vb.viewRange()[1]
                 factor = 0.85 if event.angleDelta().y() > 0 else 1.0 / 0.85
-                center = (y0 + y1) / 2
-                half = (y1 - y0) / 2 * factor
-                vb.setYRange(center - half, center + half, padding=0)
+                # Keep the baseline pinned at 0 (intensity is always >= 0); only
+                # the top of the y range moves, so the data baseline never lifts.
+                vb.setYRange(0.0, y1 * factor, padding=0)
                 return True
         return super().eventFilter(obj, event)
 
@@ -948,6 +998,7 @@ class MSViewerTab(QMainWindow):
         arraymeans = arraysums / divs
 
         points = getattr(self, "_last_points", None)
+        self._grid_cells = {}
 
         def cell(ri, ci):
             p = self.p3_grid.addPlot(row=ri, col=ci)
@@ -956,6 +1007,7 @@ class MSViewerTab(QMainWindow):
                 p.setTitle(f"z={charges[ci]}")
             if ci == 0:
                 p.setLabel("left", self.CHARGE_ROW_LABELS[ri])
+            self._grid_cells[(ri, ci)] = p
             return p
 
         for c in charges:
@@ -1059,6 +1111,26 @@ class MSViewerTab(QMainWindow):
                 import traceback
                 traceback.print_exc()
 
+        # Each column shares one m/z (x) axis -> link all rows in a column to the
+        # top cell so panning/zooming mass moves them together (per-column, since
+        # different charges have different m/z scales). Double-click resets all.
+        for ci in range(len(charges)):
+            top = self._grid_cells.get((0, ci))
+            if top is None:
+                continue
+            for ri in range(1, len(self.CHARGE_ROW_LABELS)):
+                c = self._grid_cells.get((ri, ci))
+                if c is not None:
+                    c.setXLink(top)
+
+    def reset_charge_grid_zoom(self):
+        for cellplot in getattr(self, "_grid_cells", {}).values():
+            cellplot.enableAutoRange()
+
+    def _on_grid_clicked(self, event):
+        if event.double():
+            self.reset_charge_grid_zoom()
+
     # ---- toggles + sync --------------------------------------------------
 
     def toggle_dimension(self):
@@ -1081,3 +1153,63 @@ class MSViewerTab(QMainWindow):
     def set_rt_half(self, value):
         self.rt_half = float(value)
         self._recenter_window()
+
+    # ---- charge search + navigation history ------------------------------
+
+    def _recenter_for_charge(self):
+        """Recentre the m/z window on the same neutral mass at the assumed charge,
+        keeping the RT window -- this is the charge-search 'lock on'."""
+        cur = self.current
+        if cur is None or cur.get("neutral_mass") is None:
+            return
+        z = max(1, self.assumed_charge or 1)
+        mzs = isotope_mzs(cur["neutral_mass"], z, n=6)
+        center = sum(mzs) / len(mzs)
+        if self.window is not None:
+            rt_start, rt_end = self.window[2], self.window[3]
+        elif cur["rt"] is not None:
+            rt_start, rt_end = max(0.0, cur["rt"] - self.rt_half), cur["rt"] + self.rt_half
+        else:
+            rt_start, rt_end = 0.0, 1.0
+        self.set_window([center - self.mz_half, center + self.mz_half, rt_start, rt_end], set_view=True)
+
+    def charge_step(self, delta):
+        if self.current is None:
+            return
+        self.assumed_charge = max(1, (self.assumed_charge or self.current.get("charge") or 1) + delta)
+        self._recenter_for_charge()
+
+    def set_charge(self, z):
+        if self.current is None:
+            return
+        self.assumed_charge = max(1, int(z))
+        self._recenter_for_charge()
+
+    def _record_nav(self):
+        if self.window is None:
+            return
+        entry = (list(self.window), self.assumed_charge)
+        if self._suppress_record:
+            self._suppress_record = False
+            return
+        if self._nav and self._nav[self._nav_i][0] == entry[0]:
+            return
+        self._nav = self._nav[:self._nav_i + 1]
+        self._nav.append(entry)
+        self._nav_i = len(self._nav) - 1
+
+    def _apply_nav(self):
+        window, charge = self._nav[self._nav_i]
+        self.assumed_charge = charge
+        self._suppress_record = True
+        self.set_window(list(window), set_view=True)
+
+    def nav_back(self):
+        if self._nav_i > 0:
+            self._nav_i -= 1
+            self._apply_nav()
+
+    def nav_forward(self):
+        if self._nav_i < len(self._nav) - 1:
+            self._nav_i += 1
+            self._apply_nav()
