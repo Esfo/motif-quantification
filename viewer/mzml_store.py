@@ -321,6 +321,43 @@ class MzmlStore:
             "z": z,
         }
 
+    def extract_points(self, mz_min, mz_max, rt_start, rt_end):
+        """Every measured point in an RT x m/z window, across all MS1 scans.
+
+        Returns parallel arrays (mz, rt, intensity) of the raw datapoints -- not
+        binned or averaged -- so panel 1 can show every point of a line in 2D
+        (m/z vs intensity) and 3D (m/z, rt, intensity).
+        """
+        reader = self.data_reader()
+        mzs, rts, intens = [], [], []
+
+        for summary in self.ms1_in_rt(rt_start, rt_end):
+            scan = reader.get_by_id(summary.spectrum_id)
+            if scan is None:
+                continue
+            mza, inten = scan_arrays(scan)
+            if mza.size == 0:
+                continue
+            keep = (mza >= mz_min) & (mza <= mz_max)
+            if not keep.any():
+                continue
+            kept_mz = mza[keep]
+            mzs.append(kept_mz)
+            intens.append(inten[keep])
+            rts.append(np.full(kept_mz.size, summary.rt, dtype=np.float64))
+
+        if mzs:
+            return {
+                "mz": np.concatenate(mzs),
+                "rt": np.concatenate(rts),
+                "intensity": np.concatenate(intens),
+            }
+        return {
+            "mz": np.array([], dtype=np.float64),
+            "rt": np.array([], dtype=np.float64),
+            "intensity": np.array([], dtype=np.float64),
+        }
+
     def scan_window_by_number(self, number, mz_min, mz_max):
         scan = self.get_scan_by_number(number)
 

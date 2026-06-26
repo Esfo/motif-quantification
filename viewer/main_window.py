@@ -260,13 +260,21 @@ class MainWindow(QMainWindow):
 
     # ---- dock layout persistence ----------------------------------------
 
+    # Bump when the default dock arrangement changes so a stale saved layout
+    # doesn't override the new default (the user can still rearrange + it saves).
+    LAYOUT_VERSION = 2
+
     def save_layout(self):
         if self.ms_tab is not None:
             self.settings.setValue("ms_tab_state", self.ms_tab.saveState())
+            self.settings.setValue("ms_tab_layout_version", self.LAYOUT_VERSION)
 
     def restore_layout(self):
+        if self.ms_tab is None:
+            return
+        version = self.settings.value("ms_tab_layout_version")
         state = self.settings.value("ms_tab_state")
-        if state is not None and self.ms_tab is not None:
+        if state is not None and str(version) == str(self.LAYOUT_VERSION):
             try:
                 self.ms_tab.restoreState(state)
             except Exception:

@@ -113,14 +113,16 @@ class EvidenceWorker(QThread):
                 ms1_number = ms1.number
                 scan_mz, scan_int = self.store.scan_window_by_number(ms1.number, self.mz_min, self.mz_max)
 
+            points = None
             region = None
             if self.rt is not None:
+                points = self.store.extract_points(self.mz_min, self.mz_max, self.rt_start, self.rt_end)
                 region = self.store.extract_region(
                     self.mz_min, self.mz_max, self.rt_start, self.rt_end,
                     mz_bins=self.mz_bins, mode=self.mode)
 
             self.done.emit({"ms1_number": ms1_number, "scan_mz": scan_mz,
-                            "scan_int": scan_int, "region": region})
+                            "scan_int": scan_int, "points": points, "region": region})
         except Exception as exc:
             self.done.emit({"error": f"{exc}\n{traceback.format_exc()}"})
 
@@ -166,6 +168,19 @@ class MSViewerTab(QMainWindow):
         self.worker = None
         self._pending = None
         self._win = None
+        self.window = None        # [mz_min, mz_max, rt_start, rt_end] source of truth
+        self.center = None        # (mz_center, rt_center) for the ± controls
+        self._guard = False       # suppress range-change handling during programmatic set
+        try:
+            self._cmap = pg.colormap.get("viridis")
+        except Exception:
+            self._cmap = None
+
+        from PySide6.QtCore import QTimer
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.setInterval(140)
+        self._reload_timer.timeout.connect(self.do_extract)
 
         self.setDockNestingEnabled(True)
         self.build_lists_dock()
@@ -223,7 +238,7 @@ class MSViewerTab(QMainWindow):
         header.addStretch(1)
         all_button = QPushButton("All")
         all_button.setFixedWidth(40)
-        all_button.clicked.connect(on_all)
+        all_button.clicked.connect(lambda: on_all())
         header.addWidget(all_button)
         layout.addLayout(header)
 
@@ -239,7 +254,8 @@ class MSViewerTab(QMainWindow):
         self.p1_2d.setLabel("left", "intensity")
         self.p1_2d.setClipToView(True)
         self.p1_2d.setDownsampling(auto=True, mode="peak")
-        self.p1_2d.sigXRangeChanged.connect(self.on_panel1_mz_changed)
+        # 2D panel 1: only the m/z (x) axis is interactive; y stays auto-scaled.
+        self.p1_2d.setMouseEnabled(x=True, y=False)
 
         if HAVE_GL:
             self.p1_3d = gl.GLViewWidget()
@@ -285,18 +301,22 @@ class MSViewerTab(QMainWindow):
         self.dock_panel1 = dock
 
     def build_panel2_dock(self):
+        # Panel 2: m/z on x (aligned with panel 1), RT on y.
         self.p2 = pg.PlotWidget()
-        self.p2.setLabel("bottom", "RT", units="min")
-        self.p2.setLabel("left", "m/z")
+        self.p2.setLabel("bottom", "m/z")
+        self.p2.setLabel("left", "RT", units="min")
         self.p2_image = pg.ImageItem()
-        try:
-            self.p2_image.setColorMap(pg.colormap.get("viridis"))
-        except Exception:
-            pass
+        if self._cmap is not None:
+            self.p2_image.setColorMap(self._cmap)
         self.p2.addItem(self.p2_image)
-        self.p2.sigYRangeChanged.connect(self.on_panel2_mz_changed)
 
-        dock = QDockWidget("Panel 2 - RT x m/z map", self)
+        # panel 1 (2D) and panel 2 share the m/z (x) axis -> link them.
+        self.p1_2d.setXLink(self.p2)
+        # User drags/zooms on either m/z axis or panel 2's RT -> reload window.
+        self.p2.sigXRangeChanged.connect(self.on_view_range_changed)
+        self.p2.sigYRangeChanged.connect(self.on_view_range_changed)
+
+        dock = QDockWidget("Panel 2 - m/z x RT map", self)
         dock.setObjectName("dock_panel2")
         dock.setWidget(self.p2)
         self.dock_panel2 = dock
@@ -354,14 +374,27 @@ class MSViewerTab(QMainWindow):
 
     # ---- list population + cross-linking ---------------------------------
 
-    def _fill(self, listw, entries):
+    def _fill(self, listw, entries, preserve=False):
+        # Optionally keep the current selection (by text) and scroll position,
+        # so clicking "All" doesn't jump the list or lose the highlight.
+        sel = listw.currentItem().text() if (preserve and listw.currentItem()) else None
+        scroll = listw.verticalScrollBar().value() if preserve else 0
+
         listw.blockSignals(True)
         listw.clear()
-        for text, data in entries:
+        restore_row = -1
+        for i, (text, data) in enumerate(entries):
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, data)
             listw.addItem(item)
+            if sel is not None and text == sel:
+                restore_row = i
+        if restore_row >= 0:
+            listw.setCurrentRow(restore_row)
         listw.blockSignals(False)
+
+        if preserve:
+            listw.verticalScrollBar().setValue(scroll)
 
     def _filter(self, text):
         t = self.search.text().strip().lower()
@@ -376,24 +409,35 @@ class MSViewerTab(QMainWindow):
             rows.append(row)
         return rows
 
-    def show_all_proteins(self):
+    def _peptide_label(self, row):
+        # Annotate LFQ-only peptides (quantified but with no PSM in this file).
+        n = str(row.get("n_psms", "") or "").strip()
+        pep = row.get("peptide", "")
+        if n in ("", "0"):
+            return f"{pep}   · LFQ-only"
+        return f"{pep}   ({n})"
+
+    def show_all_proteins(self, preserve=True):
         rows = self.session.file_proteins(self.current_file or "")
         self._fill(self.protein_list, [(r.get("protein_id", ""), r) for r in rows
-                                       if r.get("protein_id") and self._filter(r["protein_id"])])
+                                       if r.get("protein_id") and self._filter(r["protein_id"])],
+                   preserve=preserve)
 
-    def show_all_peptides(self):
+    def show_all_peptides(self, preserve=True):
         rows = self.session.file_peptides(self.current_file or "")
-        self._fill(self.peptide_list, [(r.get("peptide", ""), r) for r in rows
-                                       if r.get("peptide") and self._filter(r["peptide"])])
+        self._fill(self.peptide_list, [(self._peptide_label(r), r) for r in rows
+                                       if r.get("peptide") and self._filter(r["peptide"])],
+                   preserve=preserve)
 
-    def show_all_psms(self):
+    def show_all_psms(self, preserve=True):
         self.psm_rows = [r for r in self.file_psms() if self._filter(r.get("peptide", ""))]
-        self._fill(self.psm_list, [(f"{r.get('scan','')}  {r.get('peptide','')}", r) for r in self.psm_rows])
+        self._fill(self.psm_list, [(f"{r.get('scan','')}  {r.get('peptide','')}", r) for r in self.psm_rows],
+                   preserve=preserve)
 
     def repopulate_active_list(self):
-        self.show_all_proteins()
-        self.show_all_peptides()
-        self.show_all_psms()
+        self.show_all_proteins(preserve=False)
+        self.show_all_peptides(preserve=False)
+        self.show_all_psms(preserve=False)
 
     def on_protein_selected(self):
         items = self.protein_list.selectedItems()
@@ -472,43 +516,62 @@ class MSViewerTab(QMainWindow):
             "targets": targets, "mz_center": mz_center,
             "centroid": self.centroid_store(filename), "profile": self.profile_store(filename),
         }
-        self.refresh()
+        self.center = (mz_center, rt)
+        self.render_table1(self.current)
+        # Initialize the window from the ± controls and snap the views to it.
+        rt_start = max(0.0, rt - self.rt_half) if rt is not None else 0.0
+        rt_end = rt + self.rt_half if rt is not None else 1.0
+        self.set_window([mz_center - self.mz_half, mz_center + self.mz_half, rt_start, rt_end],
+                        set_view=True)
 
     def use_profile(self):
         return self.source_toggle.isChecked()
 
-    def refresh(self):
-        try:
-            self._refresh()
-        except Exception as exc:
-            import traceback
-            self.p3_title.setText(f"render error: {exc}")
-            traceback.print_exc()
+    # ---- window-driven extraction ----------------------------------------
 
-    def _refresh(self):
+    def set_window(self, window, set_view=False):
+        """Set the m/z x RT window (source of truth) and reload it.
+
+        ``set_view`` snaps the panel views to the window (used on selection /
+        ± changes). User drag/zoom calls this with set_view=False so the view the
+        user produced is what gets reloaded.
+        """
+        self.window = [float(window[0]), float(window[1]), float(window[2]), float(window[3])]
+        if set_view:
+            self._guard = True
+            try:
+                self.p2.setXRange(self.window[0], self.window[1], padding=0)
+                self.p2.setYRange(self.window[2], self.window[3], padding=0)
+            finally:
+                self._guard = False
+        self.refresh()
+
+    def on_view_range_changed(self, *_):
+        if self._guard or self.window is None:
+            return
+        # Read the current window from panel 2 (m/z = x, RT = y) and debounce.
+        (mz0, mz1) = self.p2.getViewBox().viewRange()[0]
+        (rt0, rt1) = self.p2.getViewBox().viewRange()[1]
+        self.window = [mz0, mz1, max(0.0, rt0), rt1]
+        self._reload_timer.start()
+
+    def refresh(self):
+        self._reload_timer.start()
+
+    def do_extract(self):
         cur = self.current
-        if cur is None:
+        if cur is None or self.window is None:
             return
         centroid = cur["centroid"]
         if centroid is None:
             self.p3_title.setText(f"no centroid mzML for {cur['filename']}")
             return
-
-        mz_center = cur["mz_center"]
-        rt = cur["rt"]
-        mz_min, mz_max = mz_center - self.mz_half, mz_center + self.mz_half
-        rt_start = max(0.0, rt - self.rt_half) if rt is not None else None
-        rt_end = rt + self.rt_half if rt is not None else None
+        mz_min, mz_max, rt_start, rt_end = self.window
         store = cur["profile"] if (self.use_profile() and cur["profile"]) else centroid
-
-        # Table 1 (sqlite) is cheap -> main thread now.
-        self.render_table1(cur)
-
-        # Everything that touches the mzML goes to a worker (latest-wins).
         self._win = (mz_min, mz_max, rt_start, rt_end)
         self._pending = dict(
-            centroid=centroid, store=store, scan=cur["scan"], rt=rt,
-            mz_min=mz_min, mz_max=mz_max, rt_start=rt_start or 0.0, rt_end=rt_end or 0.0,
+            centroid=centroid, store=store, scan=cur["scan"], rt=cur["rt"],
+            mz_min=mz_min, mz_max=mz_max, rt_start=rt_start, rt_end=rt_end,
             mz_bins=400, mode="profile" if (self.use_profile() and cur["profile"]) else "centroid")
         self.p3_title.setText(f"loading {cur['row'].get('peptide','')}…")
         self._start_evidence()
@@ -525,11 +588,9 @@ class MSViewerTab(QMainWindow):
         self.worker.start()
 
     def on_evidence_done(self, result):
-        # If a newer selection arrived while this ran, draw nothing stale and go.
         if self._pending is not None:
             self._start_evidence()
             return
-
         cur = self.current
         if cur is None or not isinstance(result, dict):
             return
@@ -538,22 +599,67 @@ class MSViewerTab(QMainWindow):
             return
 
         mz_min, mz_max, rt_start, rt_end = self._win
+        points = result.get("points")
+        region = result.get("region")
         scan_mz = result.get("scan_mz")
         scan_int = result.get("scan_int")
-        region = result.get("region")
 
-        # Panel 1 - 2D spectrum
-        if scan_mz is not None and len(scan_mz):
-            plot_points(self.p1_2d, scan_mz, scan_int,
-                        title=f"{cur['row'].get('peptide','')} z={cur['charge']}")
-        else:
-            plot_points(self.p1_2d, [], [], title="MS1 scan unavailable")
-
-        # Panel 2 - RT x m/z map
+        self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end)
         self.draw_panel2(region, mz_min, mz_max, rt_start, rt_end)
-
-        # Panel 3 - MS1 isotope overlay
         self.draw_panel3_ms1(cur, scan_mz, scan_int)
+
+    def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end):
+        # 2D: every datapoint in the window as m/z vs intensity.
+        if isinstance(points, dict) and points["mz"].size:
+            self.p1_2d.clear()
+            self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
+            self.p1_2d.plot(points["mz"], points["intensity"], pen=None,
+                            symbol="o", symbolSize=3, symbolPen=None,
+                            symbolBrush=pg.mkBrush(120, 170, 255, 160))
+            self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
+                                f"({points['mz'].size} pts)")
+            self.p1_2d.getViewBox().setYRange(0, float(points["intensity"].max()) * 1.05, padding=0)
+        else:
+            self.p1_2d.clear()
+            self.p1_2d.setTitle("no MS1 points in window")
+        # 3D: same points + interpolated surface.
+        self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
+
+    def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
+        if not HAVE_GL:
+            return
+        mz_span = max(mz_max - mz_min, 1e-6)
+        rt_span = max(rt_end - rt_start, 1e-6)
+
+        if isinstance(region, dict) and region.get("z") is not None and region["z"].size:
+            z = region["z"]
+            zmax = float(z.max()) or 1.0
+            zr = (z / zmax).astype(np.float32)            # (n_rt, n_mz)
+            xs = np.linspace(-1.0, 1.0, z.shape[0]).astype(np.float32)  # rt
+            ys = np.linspace(-1.0, 1.0, z.shape[1]).astype(np.float32)  # mz
+            try:
+                self.p1_surface.setData(x=xs, y=ys, z=zr)
+                self.p1_surface.setColor((0.30, 0.45, 0.70, 0.45))
+                self.p1_surface.setVisible(True)
+            except Exception:
+                pass
+
+        if isinstance(points, dict) and points["mz"].size:
+            x = ((points["rt"] - rt_start) / rt_span * 2 - 1).astype(np.float32)
+            y = ((points["mz"] - mz_min) / mz_span * 2 - 1).astype(np.float32)
+            inten = points["intensity"]
+            zmax = float(inten.max()) or 1.0
+            z = (inten / zmax).astype(np.float32)
+            pos = np.column_stack([x, y, z])
+            if self._cmap is not None:
+                colors = self._cmap.map(z, mode="float")
+            else:
+                colors = np.tile(np.array([1, 1, 1, 1], dtype=np.float32), (z.size, 1))
+            try:
+                self.p1_scatter.setData(pos=pos, color=colors, size=4.0)
+                self.p1_scatter.setVisible(True)
+            except Exception:
+                pass
 
     def draw_panel2(self, region, mz_min, mz_max, rt_start, rt_end):
         if not isinstance(region, dict):
@@ -563,9 +669,10 @@ class MSViewerTab(QMainWindow):
         if z is None or z.size == 0 or rts.size == 0:
             self.p2_image.clear()
             return
-        self.p2_image.setImage(np.log1p(z), autoLevels=True)
-        rt_span = max(rts[-1] - rts[0], 1e-6) if rts.size > 1 else max((rt_end or 1) - (rt_start or 0), 1e-6)
-        self.p2_image.setRect(pg.QtCore.QRectF(rts[0], mz_min, rt_span, mz_max - mz_min))
+        # x = m/z, y = RT -> image indexed [x=mz][y=rt] = z transposed.
+        self.p2_image.setImage(np.log1p(z).T, autoLevels=True)
+        rt_span = max(rts[-1] - rts[0], 1e-6) if rts.size > 1 else max(rt_end - rt_start, 1e-6)
+        self.p2_image.setRect(pg.QtCore.QRectF(mz_min, rts[0], mz_max - mz_min, rt_span))
 
     def draw_panel3_ms1(self, cur, scan_mz, scan_int):
         self.p3.clear()
@@ -620,29 +727,18 @@ class MSViewerTab(QMainWindow):
         self.dim_toggle.setText("2D" if to_3d else "3D")
         self.p1_stack.setCurrentIndex(1 if to_3d else 0)
 
-    def on_panel1_mz_changed(self, _vb, rng):
-        if getattr(self, "_syncing", False) or self.p1_stack.currentIndex() != 0:
+    def _recenter_window(self):
+        if self.center is None:
             return
-        self._syncing = True
-        try:
-            self.p2.setYRange(rng[0], rng[1], padding=0)
-        finally:
-            self._syncing = False
-
-    def on_panel2_mz_changed(self, _vb, rng):
-        if getattr(self, "_syncing", False):
-            return
-        self._syncing = True
-        try:
-            if self.p1_stack.currentIndex() == 0:
-                self.p1_2d.setXRange(rng[0], rng[1], padding=0)
-        finally:
-            self._syncing = False
+        mz_c, rt_c = self.center
+        rt_start = max(0.0, rt_c - self.rt_half) if rt_c is not None else 0.0
+        rt_end = rt_c + self.rt_half if rt_c is not None else 1.0
+        self.set_window([mz_c - self.mz_half, mz_c + self.mz_half, rt_start, rt_end], set_view=True)
 
     def set_mz_half(self, value):
         self.mz_half = float(value)
-        self.refresh()
+        self._recenter_window()
 
     def set_rt_half(self, value):
         self.rt_half = float(value)
-        self.refresh()
+        self._recenter_window()
