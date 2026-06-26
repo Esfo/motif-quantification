@@ -21,9 +21,6 @@ struct Args {
     #[arg(long, default_value_t = 0.35)]
     specificity: f64,
 
-    #[arg(long, default_value_t = 2)]
-    min_proteins: usize,
-
     #[arg(long)]
     include_trembl: bool,
 
@@ -36,10 +33,10 @@ struct Args {
     #[arg(long)]
     no_expand_duplicates: bool,
 
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 16)]
     chunk_size: usize,
 
-    #[arg(long, default_value_t = 8192)]
+    #[arg(long, default_value_t = 2048)]
     branch_min_hits: usize,
 
     #[arg(long)]
@@ -122,12 +119,11 @@ struct SplitScore {
     coverage_count: usize,
     new_child_count: usize,
     total_child_count: usize,
-    center_score: usize,
-    same_parent_count: usize,
 }
 
 #[derive(Clone, Debug)]
 struct AcceptedSplit {
+    position: usize,
     children: Vec<SplitChild>,
 }
 
@@ -234,9 +230,7 @@ fn main() -> Result<()> {
         for batch in bucket_items.chunks(args.chunk_size) {
             let mut batch_candidates: Vec<CandidateMotif> = batch
                 .par_iter()
-                .flat_map_iter(|(_, hits)| {
-                    build_candidates_for_endpoint_group(k, hits, &args, &groups)
-                })
+                .flat_map_iter(|(_, hits)| build_candidates_for_endpoint_group(k, hits, &args, &groups))
                 .collect();
 
             batch_candidates.sort_by(|a, b| {
@@ -271,9 +265,6 @@ fn validate_args(args: &Args) -> Result<()> {
     }
     if !(args.specificity > 0.0 && args.specificity <= 1.0) {
         bail!("--specificity must be > 0 and <= 1");
-    }
-    if args.min_proteins < 1 {
-        bail!("--min-proteins must be >= 1");
     }
     if args.chunk_size == 0 {
         bail!("--chunk-size must be >= 1");
@@ -457,6 +448,25 @@ fn required_coverage_count(parent_support: usize, specificity: f64) -> usize {
     ((parent_support as f64) * required_split_coverage(specificity)).ceil() as usize
 }
 
+fn required_child_support(
+    parent_support: usize,
+    fixed_internal: usize,
+    budget: usize,
+    specificity: f64,
+) -> usize {
+    if budget == 0 {
+        return 1;
+    }
+
+    let next_fixed_internal = fixed_internal + 1;
+    let progress = (next_fixed_internal as f64) / (budget as f64);
+    let required_fraction = specificity * progress;
+
+    ((parent_support as f64) * required_fraction)
+        .ceil()
+        .max(1.0) as usize
+}
+
 fn collect_endpoint_buckets(
     k: usize,
     groups: &[RepresentativeGroup],
@@ -498,13 +508,10 @@ fn collect_group_windows(
         return;
     }
 
-    let mut bad = 0usize;
-
-    for &b in &bytes[..k] {
-        if invalid[b as usize] {
-            bad += 1;
-        }
-    }
+    let mut bad = bytes[..k]
+        .iter()
+        .filter(|&&b| invalid[b as usize])
+        .count();
 
     if bad == 0 {
         add_window_hit(group_index, group, 0, k, buckets);
@@ -565,7 +572,15 @@ fn build_candidates_for_endpoint_group(
         vec![0, k - 1]
     };
 
-    let mut candidates = refine_node(k, hits.to_vec(), fixed_positions, args, groups);
+    let mut candidates = refine_node(
+        k,
+        hits.to_vec(),
+        fixed_positions,
+        Vec::new(),
+        args,
+        groups,
+    );
+
     dedup_candidates(&mut candidates);
     candidates
 }
@@ -574,6 +589,7 @@ fn refine_node(
     k: usize,
     entries: Vec<WindowHit>,
     fixed_positions: Vec<usize>,
+    blocked_positions: Vec<usize>,
     args: &Args,
     groups: &[RepresentativeGroup],
 ) -> Vec<CandidateMotif> {
@@ -582,11 +598,6 @@ fn refine_node(
     }
 
     let parent_postings = postings_from_entries(&entries);
-
-    if parent_postings.len() < args.min_proteins {
-        return Vec::new();
-    }
-
     let budget = internal_budget(k, args.specificity);
 
     let fixed_internal = fixed_positions
@@ -604,11 +615,20 @@ fn refine_node(
         )];
     }
 
+    let child_min = required_child_support(
+        parent_postings.len(),
+        fixed_internal,
+        budget,
+        args.specificity,
+    );
+
     let splits = choose_best_splits(
         k,
         &entries,
         &fixed_positions,
+        &blocked_positions,
         &parent_postings,
+        child_min,
         args,
         groups,
     );
@@ -623,11 +643,23 @@ fn refine_node(
         )];
     }
 
-    let mut branches: Vec<(usize, Vec<WindowHit>)> = Vec::new();
+    let tie_positions: Vec<usize> = splits.iter().map(|split| split.position).collect();
+    let mut branches: Vec<(usize, Vec<WindowHit>, Vec<usize>)> = Vec::new();
 
     for split in splits {
+        let mut child_blocked = blocked_positions.clone();
+
+        for &position in &tie_positions {
+            if position < split.position {
+                child_blocked.push(position);
+            }
+        }
+
+        child_blocked.sort_unstable();
+        child_blocked.dedup();
+
         for child in split.children {
-            branches.push((child.position, child.entries));
+            branches.push((child.position, child.entries, child_blocked.clone()));
         }
     }
 
@@ -636,7 +668,7 @@ fn refine_node(
     if parallel {
         branches
             .into_par_iter()
-            .flat_map_iter(|(position, child_entries)| {
+            .flat_map_iter(|(position, child_entries, child_blocked)| {
                 let mut next_fixed = fixed_positions.clone();
 
                 if !next_fixed.contains(&position) {
@@ -644,13 +676,13 @@ fn refine_node(
                     next_fixed.sort_unstable();
                 }
 
-                refine_node(k, child_entries, next_fixed, args, groups)
+                refine_node(k, child_entries, next_fixed, child_blocked, args, groups)
             })
             .collect()
     } else {
         let mut out = Vec::new();
 
-        for (position, child_entries) in branches {
+        for (position, child_entries, child_blocked) in branches {
             let mut next_fixed = fixed_positions.clone();
 
             if !next_fixed.contains(&position) {
@@ -658,7 +690,14 @@ fn refine_node(
                 next_fixed.sort_unstable();
             }
 
-            out.extend(refine_node(k, child_entries, next_fixed, args, groups));
+            out.extend(refine_node(
+                k,
+                child_entries,
+                next_fixed,
+                child_blocked,
+                args,
+                groups,
+            ));
         }
 
         out
@@ -669,7 +708,9 @@ fn choose_best_splits(
     k: usize,
     entries: &[WindowHit],
     fixed_positions: &[usize],
+    blocked_positions: &[usize],
     parent_postings: &[u32],
+    child_min: usize,
     args: &Args,
     groups: &[RepresentativeGroup],
 ) -> Vec<AcceptedSplit> {
@@ -678,7 +719,7 @@ fn choose_best_splits(
     let mut best_splits: Vec<AcceptedSplit> = Vec::new();
 
     for position in 1..(k - 1) {
-        if fixed_positions.contains(&position) {
+        if fixed_positions.contains(&position) || blocked_positions.contains(&position) {
             continue;
         }
 
@@ -694,7 +735,7 @@ fn choose_best_splits(
         for (aa, child_entries) in by_aa {
             let postings = postings_from_entries(&child_entries);
 
-            if postings.len() >= args.min_proteins {
+            if postings.len() >= child_min {
                 children.push(SplitChild {
                     position,
                     aa,
@@ -737,11 +778,9 @@ fn choose_best_splits(
             coverage_count,
             new_child_count,
             total_child_count,
-            center_score: center_score(k, position),
-            same_parent_count,
         };
 
-        let split = AcceptedSplit { children };
+        let split = AcceptedSplit { position, children };
 
         match &best_score {
             None => {
@@ -760,15 +799,8 @@ fn choose_best_splits(
         }
     }
 
+    best_splits.sort_by_key(|split| split.position);
     best_splits
-}
-
-fn center_score(k: usize, position: usize) -> usize {
-    let center2 = (k - 1) as isize;
-    let position2 = (2 * position) as isize;
-    let distance2 = (position2 - center2).unsigned_abs();
-
-    (2 * k).saturating_sub(distance2)
 }
 
 fn postings_from_entries(entries: &[WindowHit]) -> Vec<u32> {
@@ -929,9 +961,15 @@ fn write_build_info_tsv(
         "split_coverage_cutoff\t{}",
         required_split_coverage(args.specificity)
     )?;
-    writeln!(writer, "min_proteins_floor\t{}", args.min_proteins)?;
+    writeln!(writer, "child_support_policy\tdynamic_specificity_threshold")?;
+    writeln!(
+        writer,
+        "child_support_formula\tceil(parent_support * specificity * ((fixed_internal + 1) / internal_budget))"
+    )?;
     writeln!(writer, "branch_min_hits\t{}", args.branch_min_hits)?;
-    writeln!(writer, "split_tie_policy\tspawn_all_exact_best_splits")?;
+    writeln!(writer, "chunk_size\t{}", args.chunk_size)?;
+    writeln!(writer, "split_tie_policy\tspawn_all_exact_best_splits_with_canonical_order_blocking")?;
+    writeln!(writer, "position_tiebreak_policy\tnone")?;
     writeln!(writer, "dedup_policy\texact_motif_text_and_postings_only")?;
     writeln!(writer, "include_trembl\t{}", args.include_trembl)?;
     writeln!(writer, "include_other\t{}", args.include_other)?;
