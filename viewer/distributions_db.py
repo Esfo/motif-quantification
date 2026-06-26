@@ -110,3 +110,32 @@ class DistributionsDB:
             (distribution_id,),
         ).fetchone()
         return row["analyte_id"] if row else None
+
+    def charge_group(self, distribution_id):
+        """The analyte's distributions across charge states, with their member
+        features (isotope lines). This is the data source for the panel-3
+        charge-comparison grid: {charge: {distribution: {...}, features: [...]}}.
+
+        Falls back to just the given distribution when it has no analyte.
+        """
+        analyte_id = self.analyte_for_distribution(distribution_id)
+        if analyte_id is None:
+            dist = self.distribution(distribution_id)
+            if dist is None:
+                return {}
+            return {dist["charge"]: {"distribution": dist,
+                                     "features": self.distribution_members(distribution_id)}}
+
+        rows = self.connect().execute(
+            "SELECT distribution_id, charge FROM analyte_members WHERE analyte_id = ? ORDER BY charge",
+            (analyte_id,),
+        ).fetchall()
+
+        group = {}
+        for row in rows:
+            did = row["distribution_id"]
+            group[row["charge"]] = {
+                "distribution": self.distribution(did),
+                "features": self.distribution_members(did),
+            }
+        return group

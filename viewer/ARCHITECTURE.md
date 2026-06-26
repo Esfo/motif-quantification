@@ -65,11 +65,38 @@ count-prefixed, delta-encoded protein ids), `proteins.tsv`.
 
 ## Tab 1 — wired vs staged
 
-**Wired now:** dock layout (drag/float/resize) + persistence + reset; three
-cross-linked lists with All buttons; PSM→panels; Panel 1 2D (m/z×intensity) with
-fixed-size 2D/3D and centroid/profile toggles; Panel 2 RT×m/z map (threaded);
-Panel 1↔Panel 2 m/z sync (2D mode only); Panel 3 MS1 theoretical-vs-experimental
-isotope overlay (height-matched); Table 1 line metrics from the sqlite.
+**Wired now:** dock layout (drag/float/resize, 3-column default, versioned
+persistence + reset); single-file selector; three cross-linked lists with All
+buttons (All preserves selection+scroll; LFQ-only peptides labelled); evidence
+read off the UI thread (`EvidenceWorker`, latest-wins). Panels are **window-driven**
+(`self.window = [mz_min, mz_max, rt_start, rt_end]` is the source of truth):
+- Panel 1 2D shows **every datapoint** in the window (m/z vs intensity,
+  `extract_points`); only the m/z axis is interactive.
+- Panel 1 3D renders the raw points (coloured by intensity) + interpolated surface.
+- Panel 2 is **m/z (x) × RT (y)**, X-linked to panel 1; dragging/zooming either
+  m/z axis or panel 2's RT **reloads** the viewed region (debounced).
+- Panel 3 MS1 currently shows the theoretical-vs-experimental isotope overlay.
+- Table 1: line metrics from the sqlite distribution members.
+
+### Panel 3 MS1 — charge-comparison grid (staged, next major build)
+
+Replaces the single isotope overlay with the multi-distribution charge grid from
+the charge-state-determination code (columns = charge states of one analyte,
+rows = metrics). Data source: `DistributionsDB.charge_group(distribution_id)` →
+`{charge: {distribution, features}}` via `analyte_members`. Row → data mapping:
+- **retention time** — raw points per feature (needs `extract_points` per line)
+- **peak area** — `features.area` (log y)
+- **charge distances** — `diff(feature mz) * charge` (≈ 1.0)
+- **cross-charge** — intensity ratios of aligned isotopes across charges
+- **intensity sum %** — feature height / summed aligned intensities
+- **adjacency** — adjacent isotope intensity ratios (symlog)
+- **ppm to mean / ppm error** — base-mass alignment errors across charges
+
+Old terms → new schema: `chargedistgroups[analyte]` = `charge_group`;
+`distributionmasses/intensities` = member `features` (`mz_mean`/`height`);
+`linesofdistributions` = `distribution_members`; `trackedgroups`/`regions` raw
+points = `extract_points` over each feature's window. Alignment across charges
+reuses the base-mass (`mz*z - proton*z`) nearest-match logic from the original.
 
 **Staged (each has a home in the structure):**
 1. **Distribution/line selection + colouring** — click a distribution in panel
