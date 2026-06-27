@@ -20,6 +20,7 @@ pub struct Features {
     pub ms1_apex: Vec<i64>,
     pub ms1_end: Vec<i64>,
     pub height: Vec<f64>,
+    pub n_points: Vec<i64>,
     pub traces: Vec<FeatureTrace>,
     // m/z-sorted view
     pub order: Vec<usize>,
@@ -40,6 +41,7 @@ impl Features {
             ms1_apex: rows.iter().map(|f| f.ms1_apex).collect(),
             ms1_end: rows.iter().map(|f| f.ms1_end).collect(),
             height: rows.iter().map(|f| f.height).collect(),
+            n_points: rows.iter().map(|f| f.n_points).collect(),
             traces: traces.to_vec(),
             mz,
             order,
@@ -49,6 +51,29 @@ impl Features {
 
     pub fn from_rows(rows: &[FeatureRow]) -> Self {
         Features::build(rows, &[])
+    }
+
+    /// A new Features over just the given original indices (used by the recovery
+    /// pass to re-run the builder on the leftover, unclaimed features).
+    fn subset(&self, idxs: &[usize]) -> Features {
+        let mz: Vec<f64> = idxs.iter().map(|&i| self.mz[i]).collect();
+        let mut order: Vec<usize> = (0..idxs.len()).collect();
+        order.sort_by(|&a, &b| mz[a].partial_cmp(&mz[b]).unwrap());
+        let sorted_mz: Vec<f64> = order.iter().map(|&i| mz[i]).collect();
+        Features {
+            rt_start: idxs.iter().map(|&i| self.rt_start[i]).collect(),
+            rt_apex: idxs.iter().map(|&i| self.rt_apex[i]).collect(),
+            rt_end: idxs.iter().map(|&i| self.rt_end[i]).collect(),
+            ms1_start: idxs.iter().map(|&i| self.ms1_start[i]).collect(),
+            ms1_apex: idxs.iter().map(|&i| self.ms1_apex[i]).collect(),
+            ms1_end: idxs.iter().map(|&i| self.ms1_end[i]).collect(),
+            height: idxs.iter().map(|&i| self.height[i]).collect(),
+            n_points: idxs.iter().map(|&i| self.n_points[i]).collect(),
+            traces: idxs.iter().map(|&i| self.traces[i].clone()).collect(),
+            mz,
+            order,
+            sorted_mz,
+        }
     }
 
     fn mz_tol(&self, cfg: &Config, mz: f64) -> f64 {
@@ -78,6 +103,30 @@ impl Features {
 
     fn coelutes(&self, a: usize, b: usize) -> bool {
         self.rt_end[a].min(self.rt_end[b]) - self.rt_start[a].max(self.rt_start[b]) > 0.0
+    }
+
+    fn rt_overlap_ratio(&self, a: usize, b: usize) -> f64 {
+        let overlap = self.rt_end[a].min(self.rt_end[b]) - self.rt_start[a].max(self.rt_start[b]);
+        let union = self.rt_end[a].max(self.rt_end[b]) - self.rt_start[a].min(self.rt_start[b]);
+        if union > 0.0 { (overlap / union).max(0.0) } else { 0.0 }
+    }
+
+    /// Membership score for attaching b to a's lattice: the trace cosine, or (in
+    /// the recovery pass, for short traces) the better of cosine and apex-RT
+    /// proximity + window overlap.
+    fn coelution_score(&self, cfg: &Config, a: usize, b: usize) -> f64 {
+        let sim = self.trace_similarity(a, b);
+        if !cfg.short_trace_fallback {
+            return sim;
+        }
+        if self.n_points[a].min(self.n_points[b]) >= cfg.short_trace_len {
+            return sim;
+        }
+        let apex_gap = (self.rt_apex[a] - self.rt_apex[b]).abs();
+        let width = (self.rt_end[a] - self.rt_start[a]).max(self.rt_end[b] - self.rt_start[b]).max(1e-9);
+        let prox = (1.0 - apex_gap / width).max(0.0);
+        let proximity = 0.5 * prox + 0.5 * self.rt_overlap_ratio(a, b);
+        sim.max(proximity)
     }
 
     /// Cosine of two elution traces aligned on shared scans (0..1).
@@ -420,7 +469,7 @@ fn grow_lattice(f: &Features, cfg: &Config, seed: usize, z: i64) -> std::collect
                 if used.contains(&j) || !f.coelutes(seed, j) {
                     continue;
                 }
-                let sim = f.trace_similarity(seed, j);
+                let sim = f.coelution_score(cfg, seed, j);
                 if sim >= best_sim {
                     best_sim = sim;
                     best_j = Some(j);
@@ -541,7 +590,7 @@ fn score_envelope(f: &Features, cfg: &Config, occupied: &std::collections::BTree
             if fid_set.contains(&j) || !f.coelutes(fids[0], j) {
                 continue;
             }
-            if f.trace_similarity(fids[0], j) < cfg.min_trace_similarity {
+            if f.coelution_score(cfg, fids[0], j) < cfg.min_trace_similarity {
                 continue;
             }
             let jmz = f.mz[j];
@@ -605,7 +654,60 @@ fn score_envelope(f: &Features, cfg: &Config, occupied: &std::collections::BTree
     best
 }
 
+/// Single-pass envelope builder (no recovery): sorted + id-assigned.
 pub fn build_distributions(f: &Features, cfg: &Config) -> Vec<DistRow> {
+    finalize(build_rows(f, cfg))
+}
+
+/// Primary strict pass + a relaxed recovery pass on the leftover (unclaimed)
+/// features. Recovered rows are tagged status='recovered'; ids assigned after the
+/// merge. Mirrors envelope.build_distributions_two_pass.
+pub fn build_distributions_two_pass(f: &Features, cfg: &Config) -> Vec<DistRow> {
+    let mut primary = build_rows(f, cfg);
+    if !cfg.enable_recovery {
+        return finalize(primary);
+    }
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for r in &primary {
+        for m in &r.members {
+            claimed.insert(m.feature_id);
+        }
+    }
+    let leftover: Vec<usize> = (0..f.mz.len()).filter(|i| !claimed.contains(i)).collect();
+    if leftover.is_empty() {
+        return finalize(primary);
+    }
+    let sub = f.subset(&leftover);
+    let mut relaxed = cfg.clone();
+    relaxed.min_trace_similarity = cfg.recover_min_trace_similarity;
+    relaxed.min_envelope_score = cfg.recover_min_envelope_score;
+    relaxed.short_trace_fallback = true;
+    let mut rec = build_rows(&sub, &relaxed);
+    for r in rec.iter_mut() {
+        r.status = "recovered".to_string();
+        for m in r.members.iter_mut() {
+            m.feature_id = leftover[m.feature_id]; // sub-index -> original feature_id
+        }
+    }
+    primary.extend(rec);
+    finalize(primary)
+}
+
+fn finalize(mut rows: Vec<DistRow>) -> Vec<DistRow> {
+    rows.sort_by(|a, b| {
+        a.charge
+            .cmp(&b.charge)
+            .then(a.neutral_mass.partial_cmp(&b.neutral_mass).unwrap())
+            .then(a.rt_apex.partial_cmp(&b.rt_apex).unwrap())
+            .then(a.mono_mz.partial_cmp(&b.mono_mz).unwrap())
+    });
+    for (i, d) in rows.iter_mut().enumerate() {
+        d.distribution_id = i as i64;
+    }
+    rows
+}
+
+fn build_rows(f: &Features, cfg: &Config) -> Vec<DistRow> {
     let n = f.mz.len();
     let min_total = cfg.min_envelope_score;
 
@@ -721,17 +823,6 @@ fn compete(f: &Features, cfg: &Config, mut candidates: Vec<(Scored, i64)>) -> Ve
             status,
             members: s.members.clone(),
         });
-    }
-
-    rows.sort_by(|a, b| {
-        a.charge
-            .cmp(&b.charge)
-            .then(a.neutral_mass.partial_cmp(&b.neutral_mass).unwrap())
-            .then(a.rt_apex.partial_cmp(&b.rt_apex).unwrap())
-            .then(a.mono_mz.partial_cmp(&b.mono_mz).unwrap())
-    });
-    for (i, d) in rows.iter_mut().enumerate() {
-        d.distribution_id = i as i64;
     }
     rows
 }

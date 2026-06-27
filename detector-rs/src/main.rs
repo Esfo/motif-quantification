@@ -12,7 +12,7 @@ mod distributions;
 mod store;
 
 use config::Config;
-use distributions::{build_analytes, build_distributions, Features};
+use distributions::{build_analytes, build_distributions_two_pass, Features};
 use linemodel::LineModel;
 use store::{compress_f32, compress_i32, write_db, FeatureTraceRow, ScanPoints, ScanRow};
 
@@ -130,7 +130,7 @@ fn main() -> Result<()> {
         .collect();
 
     let t_dist = Instant::now();
-    let dists = build_distributions(&f, &cfg);
+    let dists = build_distributions_two_pass(&f, &cfg);
     let dist_secs = t_dist.elapsed().as_secs_f64();
 
     let t_charge = Instant::now();

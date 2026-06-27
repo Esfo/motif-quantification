@@ -50,6 +50,12 @@ pub struct Config {
     pub min_trace_similarity: f64,
     pub min_envelope_score: f64,
     pub ambiguity_margin: f64,
+    // recovery pass
+    pub enable_recovery: bool,
+    pub recover_min_trace_similarity: f64,
+    pub recover_min_envelope_score: f64,
+    pub short_trace_len: i64,
+    pub short_trace_fallback: bool,
 }
 
 impl Default for Config {
@@ -93,6 +99,11 @@ impl Default for Config {
             min_trace_similarity: 0.5,
             min_envelope_score: 0.45,
             ambiguity_margin: 0.05,
+            enable_recovery: true,
+            recover_min_trace_similarity: 0.3,
+            recover_min_envelope_score: 0.30,
+            short_trace_len: 5,
+            short_trace_fallback: false,
         }
     }
 }
