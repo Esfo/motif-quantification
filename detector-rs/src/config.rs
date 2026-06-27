@@ -4,6 +4,9 @@ pub const PROTON: f64 = 1.007276554940804;
 pub const C13_DELTA: f64 = 1.00335483507;
 
 #[derive(Clone, Debug)]
+// Some fields mirror the Python Config for parity but are not read by the Rust
+// path (valley merge disabled by default; step/new_inc replaced by the ratio gate).
+#[allow(dead_code)]
 pub struct Config {
     // line model
     pub line_mz_ppm: f64,

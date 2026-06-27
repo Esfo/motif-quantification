@@ -54,6 +54,7 @@ fn local_extrema(narray: &[f64]) -> (Vec<usize>, Vec<usize>) {
     (mins, maxes)
 }
 
+#[allow(unused_assignments)]
 pub fn minpoint_reduction(barray: &[f64], mindist: usize) -> Vec<usize> {
     let total = barray.len();
     let mut mask = vec![false; total];
