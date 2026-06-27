@@ -496,6 +496,18 @@ class MSViewerTab(QMainWindow):
         self.p2.getPlotItem().hideButtons()
         self.ms2_plot.getPlotItem().hideButtons()
 
+        # Remove the GraphicsView frames so the plot areas have NO border inset.
+        # Panel 2's plot sits behind two framed widgets (strip + p2) vs panel 1's
+        # one, so leftover 1px frames are exactly the kind of asymmetry that
+        # nudges the m/z axes out of alignment. Zero them everywhere.
+        for _w in (self.p1_2d, self.p2, self.ms2_plot):
+            _w.setFrameStyle(0)
+            _w.setContentsMargins(0, 0, 0, 0)
+            try:
+                _w.getPlotItem().getViewBox().setDefaultPadding(0.0)
+            except Exception:
+                pass
+
         # Star marker on panel 2 showing a hovered MS2 scan's (m/z, RT) location,
         # same colour as the MS2 strip. Re-added after each p2.clear (draw_panel2).
         self.p2_ms2_star = pg.ScatterPlotItem(size=16, symbol="star",

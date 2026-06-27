@@ -262,6 +262,30 @@ class MzmlStore:
 
     # ---- parallel scan reading -------------------------------------------
 
+    def _ensure_reader_pool(self, workers=4):
+        """Kick off building the reader pool in a background daemon thread (each
+        reader re-indexes the file). The first load reads serially meanwhile; by
+        the next load the pool is usually ready and reads run in parallel."""
+        if hasattr(self, "_reader_pool"):
+            return
+        import threading
+        self._reader_pool = queue.Queue()
+        self._reader_pool_size = 0
+        self._read_executor = None
+
+        def build():
+            for _ in range(max(1, workers)):
+                try:
+                    r = mzml.MzML(str(self.path), dtype=np.float64, use_index=True)
+                    self._reader_pool.put(r)
+                    self._reader_pool_size += 1
+                except Exception:
+                    break
+            if self._reader_pool_size:
+                self._read_executor = ThreadPoolExecutor(max_workers=self._reader_pool_size)
+
+        threading.Thread(target=build, daemon=True).start()
+
     def _read_scans(self, summaries, workers=4):
         """Read (rt, mz_array, intensity_array) for each summary CONCURRENTLY.
 
@@ -274,23 +298,13 @@ class MzmlStore:
         summaries = list(summaries)
         if not summaries:
             return []
-        n = min(workers, len(summaries))
 
-        # Lazy pool of independent readers (each its own file handle), reused
-        # across calls so the index is only built once per reader.
-        if not hasattr(self, "_reader_pool"):
-            self._reader_pool = queue.Queue()
-            self._reader_pool_size = 0
-            self._read_executor = None
-        while self._reader_pool_size < n:
-            try:
-                self._reader_pool.put(mzml.MzML(str(self.path), dtype=np.float64, use_index=True))
-                self._reader_pool_size += 1
-            except Exception:
-                break
-
-        if self._reader_pool_size == 0:
-            # Fall back to the single shared reader, serially.
+        # Build the pool of independent readers in the BACKGROUND (each one
+        # re-indexes the file, which is exactly the cost we don't want to pay on
+        # the first load). Until it's ready we read serially with the single
+        # shared reader; once ready, subsequent loads run in parallel.
+        self._ensure_reader_pool(workers)
+        if getattr(self, "_reader_pool_size", 0) == 0:
             reader = self.data_reader()
             out = []
             for s in summaries:
@@ -320,7 +334,19 @@ class MzmlStore:
 
         if self._read_executor is None:
             self._read_executor = ThreadPoolExecutor(max_workers=max(1, self._reader_pool_size))
-        return list(self._read_executor.map(work, summaries))
+        try:
+            return list(self._read_executor.map(work, summaries))
+        except Exception:
+            # any executor hiccup -> serial fallback on the main reader
+            reader = self.data_reader()
+            out = []
+            for s in summaries:
+                try:
+                    scan = reader.get_by_id(s.spectrum_id)
+                    out.append((s.rt, *scan_arrays(scan)) if scan is not None else (s.rt, None, None))
+                except Exception:
+                    out.append((s.rt, None, None))
+            return out
 
     def extract_region(
         self,

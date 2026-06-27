@@ -204,7 +204,7 @@ data the pipeline produces. The four founding goals:
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).
-- ✅ Reset zoom; ✅ charge ◀/▶ + history ⟲/⟳; ✅ theme toggle.
+- ✅ charge ◀/▶ + history ⟲/⟳; ✅ theme toggle. (Removed the top-bar **Reset zoom** and the **duplicate Align-3D** button — the 3D align button lives above the 3D plot.)
 - 🟡 **Color settings**: ✅ a **log/linear colour-scale switch** for the 3D intensity colouring (fixed-size toggle on the Panel 1 bar, same style as 2D/3D & profile/centroid); ⬜ full color-settings drop-down still to do (selected/other-distribution colours, 3D gradient min/max pickers).
 - ⬜ Manual **charge** entry field; ✅ **"align/reset 3D"** button (top bar + Panel 1 toolbar).
 - 🟡 **"loading… <context>"** label (rendered in **black**, not the old amber) now shown above **Panel 1, Panel 2, and Panel 3** while the evidence worker runs, cleared when drawn (`_set_loading`); ⬜ Panel 3 MS2 / charge-grid sub-loads not yet separately labelled.

@@ -130,14 +130,10 @@ class MainWindow(QMainWindow):
         hist_fwd.triggered.connect(lambda: self.ms_tab and self.ms_tab.nav_forward())
 
         bar.addSeparator()
-        reset_zoom = bar.addAction("Reset zoom")
-        reset_zoom.setShortcut("Ctrl+0")
-        reset_zoom.triggered.connect(self.on_reset_zoom)
+        # (Reset-zoom and the duplicate Align-3D button were removed from the top
+        # bar; the 3D align button lives above the 3D plot itself.)
         reset_layout = bar.addAction("Reset layout")
         reset_layout.triggered.connect(self.reset_layout)
-        align3d = bar.addAction("Align 3D")
-        align3d.setToolTip("reset the Panel 1 3D view to its default orientation")
-        align3d.triggered.connect(lambda: self.ms_tab and self.ms_tab.reset_3d_view())
         bar.addSeparator()
         self.theme_action_tb = bar.addAction("Light mode")
         self.theme_action_tb.triggered.connect(self.toggle_theme)
