@@ -92,6 +92,44 @@ class DistributionsDB:
         ).fetchone()
         return dict(row) if row else None
 
+    def all_lines(self):
+        """Every feature ("line") with the charge of the distribution it belongs
+        to (0 when it is in none). Used by the table-1 'lines' tab."""
+        rows = self.connect().execute(
+            """
+            SELECT f.feature_id, f.mz_mean, f.mz_min, f.mz_max, f.rt_apex,
+                   f.rt_start, f.rt_end, f.n_points, f.area, f.height,
+                   COALESCE(d.charge, 0) AS charge
+            FROM features f
+            LEFT JOIN distribution_members m ON m.feature_id = f.feature_id
+            LEFT JOIN distributions d ON d.distribution_id = m.distribution_id
+            ORDER BY f.feature_id
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_distributions(self):
+        rows = self.connect().execute("SELECT * FROM distributions").fetchall()
+        return [dict(r) for r in rows]
+
+    def all_analytes(self):
+        rows = self.connect().execute("SELECT * FROM analytes").fetchall()
+        return [dict(r) for r in rows]
+
+    def analyte_distributions(self, analyte_id):
+        """The member distributions of an analyte (charge region)."""
+        rows = self.connect().execute(
+            """
+            SELECT d.*
+            FROM analyte_members am
+            JOIN distributions d ON d.distribution_id = am.distribution_id
+            WHERE am.analyte_id = ?
+            ORDER BY d.charge
+            """,
+            (analyte_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def line(self, line_id):
         row = self.connect().execute(
             "SELECT * FROM lines WHERE line_id = ?", (line_id,)

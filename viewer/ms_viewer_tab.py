@@ -26,7 +26,16 @@ import re
 import traceback
 
 import numpy as np
-from PySide6.QtCore import QEvent, Qt, QThread, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QEvent,
+    QModelIndex,
+    QSortFilterProxyModel,
+    Qt,
+    QThread,
+    Signal,
+)
+from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -40,8 +49,11 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QStackedWidget,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -162,18 +174,109 @@ DIST_PALETTE = [
 ]
 
 
+# (field, header, kind) where kind: "f"=float 4g, "t"=time 2f, "i"=int, "s"=str.
 LINE_METRIC_COLUMNS = [
-    ("isotope_index", "iso"),
-    ("area", "AUC"),
-    ("height", "max I"),
-    ("n_points", "n pts"),
-    ("rt_start", "min t"),
-    ("rt_end", "max t"),
-    ("mz_min", "min m/z"),
-    ("mz_max", "max m/z"),
-    ("mz_mean", "mean m/z"),
-    ("rt_apex", "RT"),
+    ("isotope_index", "iso", "i"),
+    ("mz_mean", "mean m/z", "f"),
+    ("mz_min", "min m/z", "f"),
+    ("mz_max", "max m/z", "f"),
+    ("rt_apex", "RT", "t"),
+    ("rt_start", "min t", "t"),
+    ("rt_end", "max t", "t"),
+    ("n_points", "n pts", "i"),
 ]
+
+# 'lines' tab: every line (feature) + the charge of its distribution (0 if none).
+LINES_TAB_COLUMNS = [
+    ("mz_mean", "mean m/z", "f"),
+    ("mz_min", "min m/z", "f"),
+    ("mz_max", "max m/z", "f"),
+    ("rt_apex", "RT", "t"),
+    ("rt_start", "min t", "t"),
+    ("rt_end", "max t", "t"),
+    ("n_points", "n pts", "i"),
+    ("charge", "charge", "i"),
+]
+
+# 'distributions' tab (distributionregions): one row per distribution.
+DIST_TAB_COLUMNS = [
+    ("charge", "z", "i"),
+    ("neutral_mass", "neutral mass", "f"),
+    ("mono_mz", "mono m/z", "f"),
+    ("rt_apex", "RT", "t"),
+    ("rt_start", "min t", "t"),
+    ("rt_end", "max t", "t"),
+    ("n_members", "n iso", "i"),
+    ("quality", "quality", "f"),
+]
+
+# 'charge distributions' tab (chargeregions): one row per analyte (expandable).
+CHARGE_TAB_COLUMNS = [
+    ("neutral_mass", "neutral mass", "f"),
+    ("charge_min", "z min", "i"),
+    ("charge_max", "z max", "i"),
+    ("n_distributions", "n dist", "i"),
+    ("rt_apex", "RT", "t"),
+    ("rt_start", "min t", "t"),
+    ("rt_end", "max t", "t"),
+    ("score", "score", "f"),
+]
+
+
+def _fmt(value, kind):
+    if value is None:
+        return ""
+    if kind == "f":
+        return f"{value:.4f}"
+    if kind == "t":
+        return f"{value:.2f}"
+    if kind == "i":
+        return str(int(value))
+    return str(value)
+
+
+class SimpleTableModel(QAbstractTableModel):
+    """Read-only table over a list of dicts. DisplayRole is formatted text;
+    EditRole returns the raw value so a QSortFilterProxyModel sorts numerically."""
+
+    def __init__(self, columns, rows=None, parent=None):
+        super().__init__(parent)
+        self._columns = columns
+        self._rows = rows or []
+
+    def set_rows(self, rows):
+        self.beginResetModel()
+        self._rows = rows or []
+        self.endResetModel()
+
+    def row_dict(self, source_row):
+        if 0 <= source_row < len(self._rows):
+            return self._rows[source_row]
+        return None
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        field, _, kind = self._columns[index.column()]
+        value = self._rows[index.row()].get(field)
+        if role == Qt.DisplayRole:
+            return _fmt(value, kind)
+        if role == Qt.EditRole:
+            return value
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            return self._columns[section][1]
+        return None
 
 
 def fixed_toggle(off_text, on_text, width=70):
@@ -289,11 +392,6 @@ class MSViewerTab(QMainWindow):
         layout.addWidget(QLabel("file"))
         layout.addWidget(self.file_combo)
 
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("filter…")
-        self.search.textChanged.connect(self.repopulate_active_list)
-        layout.addWidget(self.search)
-
         self.protein_list = self._titled_list(layout, "proteins", self.on_protein_selected, self.show_all_proteins)
         self.peptide_list = self._titled_list(layout, "peptides", self.on_peptide_selected, self.show_all_peptides)
         self.psm_list = self._titled_list(layout, "PSMs", self.on_psm_selected, self.show_all_psms)
@@ -316,11 +414,12 @@ class MSViewerTab(QMainWindow):
                 pass
         db_path = self.session.distributions_db_for(self.current_file or "")
         self.db = DistributionsDB(db_path) if db_path is not None else None
+        if hasattr(self, "table1_tabs"):
+            self.reset_table1_tabs()
 
     def on_file_changed(self):
         self.current_file = self.file_combo.currentData()
         self._set_db_for_current_file()
-        self.search.clear()
         self.repopulate_active_list()
 
     def _titled_list(self, layout, title, on_select, on_all):
@@ -619,17 +718,60 @@ class MSViewerTab(QMainWindow):
         dock.setWidget(container)
         self.dock_panel3 = dock
 
+    def _make_table_view(self, columns, on_double_click):
+        """A sortable QTableView over a SimpleTableModel (via a sort proxy)."""
+        view = QTableView()
+        model = SimpleTableModel(columns, parent=view)
+        proxy = QSortFilterProxyModel(view)
+        proxy.setSortRole(Qt.EditRole)
+        proxy.setSourceModel(model)
+        view.setModel(proxy)
+        view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        view.verticalHeader().setVisible(False)
+        view.setSortingEnabled(True)
+        view.doubleClicked.connect(
+            lambda proxy_index, m=model, p=proxy, cb=on_double_click:
+            cb(m.row_dict(p.mapToSource(proxy_index).row()))
+        )
+        return view, model
+
     def build_table1_dock(self):
+        # 'current' tab: the existing per-distribution line table.
         self.table1 = QTableWidget()
         self.table1.setColumnCount(len(LINE_METRIC_COLUMNS))
-        self.table1.setHorizontalHeaderLabels([h for _, h in LINE_METRIC_COLUMNS])
+        self.table1.setHorizontalHeaderLabels([h for _, h, _ in LINE_METRIC_COLUMNS])
         self.table1.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table1.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table1.verticalHeader().setVisible(False)   # no 1,2,3 index column
+        self.table1.verticalHeader().setVisible(False)
+
+        # 'lines' + 'distributions' tabs: sortable, double-click to jump.
+        self.lines_view, self.lines_model = self._make_table_view(
+            LINES_TAB_COLUMNS, self._on_line_activated)
+        self.dists_view, self.dists_model = self._make_table_view(
+            DIST_TAB_COLUMNS, self._on_distribution_activated)
+
+        # 'charge distributions' tab: a tree (analyte -> its distributions),
+        # expandable; double-click a child distribution to jump.
+        self.charge_tree = QTreeView()
+        self.charge_model = QStandardItemModel()
+        self.charge_model.setHorizontalHeaderLabels([h for _, h, _ in CHARGE_TAB_COLUMNS])
+        self.charge_tree.setModel(self.charge_model)
+        self.charge_tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.charge_tree.setSortingEnabled(True)
+        self.charge_tree.doubleClicked.connect(self._on_charge_tree_activated)
+
+        self.table1_tabs = QTabWidget()
+        self.table1_tabs.addTab(self.table1, "current")
+        self.table1_tabs.addTab(self.lines_view, "lines")
+        self.table1_tabs.addTab(self.dists_view, "distributions")
+        self.table1_tabs.addTab(self.charge_tree, "charge distributions")
+        self.table1_tabs.currentChanged.connect(self._on_table1_tab_changed)
+        self._table1_loaded = set()  # which tabs have been populated for self.db
 
         dock = QDockWidget("Table 1 - distribution lines", self)
         dock.setObjectName("dock_table1")
-        dock.setWidget(self.table1)
+        dock.setWidget(self.table1_tabs)
         self.dock_table1 = dock
 
     def build_table2_dock(self):
@@ -719,8 +861,7 @@ class MSViewerTab(QMainWindow):
             listw.verticalScrollBar().setValue(scroll)
 
     def _filter(self, text):
-        t = self.search.text().strip().lower()
-        return (not t) or (t in text.lower())
+        return True  # filter box removed; lists show everything for the file
 
     # All list content is scoped to the selected file (single-file view).
     def file_psms(self):
@@ -1680,11 +1821,116 @@ class MSViewerTab(QMainWindow):
     def _fill_table1(self, rows):
         self.table1.setRowCount(len(rows))
         for i, row in enumerate(rows):
-            for j, (field, _) in enumerate(LINE_METRIC_COLUMNS):
-                value = row.get(field, "")
-                if isinstance(value, float):
-                    value = f"{value:.4g}"
-                self.table1.setItem(i, j, QTableWidgetItem(str(value)))
+            for j, (field, _, kind) in enumerate(LINE_METRIC_COLUMNS):
+                self.table1.setItem(i, j, QTableWidgetItem(_fmt(row.get(field), kind)))
+
+    # ---- table-1 tabs: lines / distributions / charge distributions -------
+
+    def reset_table1_tabs(self):
+        """Forget loaded tab data (call when the file/db changes)."""
+        self._table1_loaded = set()
+        if getattr(self, "lines_model", None) is not None:
+            self.lines_model.set_rows([])
+            self.dists_model.set_rows([])
+            self.charge_model.removeRows(0, self.charge_model.rowCount())
+        # Re-populate whatever tab is currently visible.
+        if getattr(self, "table1_tabs", None) is not None:
+            self._on_table1_tab_changed(self.table1_tabs.currentIndex())
+
+    def _on_table1_tab_changed(self, index):
+        if getattr(self, "table1_tabs", None) is None or self.db is None:
+            return
+        name = self.table1_tabs.tabText(index)
+        if name in self._table1_loaded:
+            return
+        if name == "lines":
+            self.lines_model.set_rows(self.db.all_lines())
+        elif name == "distributions":
+            self.dists_model.set_rows(self.db.all_distributions())
+        elif name == "charge distributions":
+            self._load_charge_tree()
+        else:
+            return
+        self._table1_loaded.add(name)
+
+    def _load_charge_tree(self):
+        self.charge_model.removeRows(0, self.charge_model.rowCount())
+        self.charge_model.setHorizontalHeaderLabels([h for _, h, _ in CHARGE_TAB_COLUMNS])
+        for analyte in self.db.all_analytes():
+            top = [QStandardItem(_fmt(analyte.get(f), k)) for f, _, k in CHARGE_TAB_COLUMNS]
+            for col, (f, _, k) in enumerate(CHARGE_TAB_COLUMNS):
+                top[col].setData(analyte.get(f), Qt.EditRole)
+            top[0].setData({"_analyte": True}, Qt.UserRole)
+            # children = member distributions mapped into the same columns
+            for d in self.db.analyte_distributions(analyte["analyte_id"]):
+                mapped = {
+                    "neutral_mass": d.get("neutral_mass"),
+                    "charge_min": d.get("charge"),
+                    "charge_max": d.get("charge"),
+                    "n_distributions": d.get("n_members"),
+                    "rt_apex": d.get("rt_apex"),
+                    "rt_start": d.get("rt_start"),
+                    "rt_end": d.get("rt_end"),
+                    "score": d.get("quality"),
+                }
+                child = [QStandardItem(_fmt(mapped.get(f), k)) for f, _, k in CHARGE_TAB_COLUMNS]
+                for col, (f, _, k) in enumerate(CHARGE_TAB_COLUMNS):
+                    child[col].setData(mapped.get(f), Qt.EditRole)
+                child[0].setData(d, Qt.UserRole)  # the distribution dict, for jump
+                top[0].appendRow(child)
+            self.charge_model.appendRow(top)
+
+    def _jump_to(self, mz_center, rt, distribution_id=None):
+        """Centre panels 1 & 2 on (m/z, RT) and optionally select a distribution."""
+        if not self.current_file or mz_center is None or rt is None:
+            return
+        filename = self.current_file
+        if not isinstance(self.current, dict) or self.current.get("filename") != filename:
+            self.current = {
+                "row": {}, "filename": filename, "scan": "",
+                "charge": None, "neutral_mass": None, "rt": rt,
+                "targets": [], "mz_center": mz_center,
+                "centroid": self.centroid_store(filename),
+                "profile": self.profile_store(filename),
+            }
+        self.current["mz_center"] = mz_center
+        self.current["rt"] = rt
+        self.current["distribution_id"] = distribution_id
+        self._panel3_mode = "ms1"
+        self._ms2_scan = None
+        rt_start = max(0.0, rt - self.rt_half)
+        rt_end = rt + self.rt_half
+        self.set_window([mz_center - self.mz_half, mz_center + self.mz_half, rt_start, rt_end],
+                        set_view=True)
+        if distribution_id is not None:
+            try:
+                self.table1_for_distribution(distribution_id)
+            except Exception:
+                pass
+            self.draw_panel3_ms1(self.current, getattr(self, "_last_scan_mz", None),
+                                 getattr(self, "_last_scan_int", None))
+
+    def _on_line_activated(self, row):
+        if row:
+            self._jump_to(row.get("mz_mean"), row.get("rt_apex"))
+
+    def _on_distribution_activated(self, row):
+        if not row:
+            return
+        # bring up its lines in the 'current' tab and jump there
+        self.table1_tabs.setCurrentIndex(0)
+        self._jump_to(row.get("mono_mz"), row.get("rt_apex"), row.get("distribution_id"))
+
+    def _on_charge_tree_activated(self, index):
+        item0 = self.charge_model.itemFromIndex(index.sibling(index.row(), 0))
+        if item0 is None:
+            return
+        data = item0.data(Qt.UserRole)
+        if isinstance(data, dict) and "distribution_id" in data:
+            self.table1_tabs.setCurrentIndex(0)
+            self._jump_to(data.get("mono_mz"), data.get("rt_apex"), data.get("distribution_id"))
+        else:
+            self.charge_tree.setExpanded(index, not self.charge_tree.isExpanded(index))
 
     # ---- panel 3 charge-comparison grid ----------------------------------
 
