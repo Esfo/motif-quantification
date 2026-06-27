@@ -73,6 +73,7 @@ try:
     from . import isotopes
     from .theming import palette, style_plot, style_gl
     from .distributions_db import DistributionsDB
+    from .points_store import PointsStore
 except ImportError:
     from mzml_store import MzmlStore, scan_arrays
     from plots import plot_points, plot_spectrum
@@ -81,6 +82,7 @@ except ImportError:
     import isotopes
     from theming import palette, style_plot, style_gl
     from distributions_db import DistributionsDB
+    from points_store import PointsStore
 
 
 def plain_seq(peptide):
@@ -128,10 +130,18 @@ class EvidenceWorker(QThread):
                 ms1 = self.centroid.preceding_ms1_for_scan(self.scan)
 
             scan_mz = scan_int = None
-            ms1_number = None
-            if ms1 is not None:
-                ms1_number = ms1.number
-                scan_mz, scan_int = self.store.scan_window_by_number(ms1.number, self.mz_min, self.mz_max)
+            ms1_number = ms1.number if ms1 is not None else None
+            if self.rt is not None:
+                # Overlay scan must come from the SAME store as the points (its
+                # scan numbering matches); the points store keys by ms1_index, not
+                # the centroid's scan numbers.
+                src_ms1 = self.store.nearest_ms1_by_rt(self.rt)
+                if src_ms1 is not None:
+                    scan_mz, scan_int = self.store.scan_window_by_number(
+                        src_ms1.number, self.mz_min, self.mz_max)
+            elif ms1 is not None:
+                scan_mz, scan_int = self.centroid.scan_window_by_number(
+                    ms1.number, self.mz_min, self.mz_max)
 
             points = None
             region = None
@@ -1006,6 +1016,21 @@ class MSViewerTab(QMainWindow):
             self._profile[key] = MzmlStore(path)
         return self._profile[key]
 
+    def points_store(self, filename):
+        """Option B: a store that serves raw centroids from the file's
+        distributions sqlite (scan_points), avoiding mzML re-decode on zoom.
+        Returns None when the sqlite has no scan_points (falls back to mzML)."""
+        sqlite_path = self.session.distributions_db_for(filename) if self.session else None
+        if sqlite_path is None:
+            return None
+        key = str(sqlite_path)
+        cache = getattr(self, "_points", None)
+        if cache is None:
+            cache = self._points = {}
+        if key not in cache:
+            cache[key] = PointsStore(key) if PointsStore.has_points(key) else None
+        return cache[key]
+
     # ---- the selected match -> panels ------------------------------------
 
     def update_evidence(self, row):
@@ -1021,6 +1046,7 @@ class MSViewerTab(QMainWindow):
             "charge": charge, "neutral_mass": neutral_mass, "rt": rt,
             "targets": targets, "mz_center": mz_center,
             "centroid": self.centroid_store(filename), "profile": self.profile_store(filename),
+            "points": self.points_store(filename),
         }
         self.center = (mz_center, rt)
         self.assumed_charge = charge or 1
@@ -1174,7 +1200,12 @@ class MSViewerTab(QMainWindow):
         load = self._padded(self.window)
         self._loaded_window = load
         mz_min, mz_max, rt_start, rt_end = load
-        store = cur["profile"] if (self.use_profile() and cur["profile"]) else centroid
+        if self.use_profile() and cur["profile"]:
+            store = cur["profile"]
+        else:
+            # Option B: read centroids from the sqlite points store when present,
+            # else fall back to decoding the centroid mzML.
+            store = cur.get("points") or centroid
         self._win = (mz_min, mz_max, rt_start, rt_end)
         self._pending = dict(
             centroid=centroid, store=store, scan=cur["scan"], rt=cur["rt"],
@@ -1386,7 +1417,7 @@ class MSViewerTab(QMainWindow):
         if not feats:
             return None
         store = (cur.get("profile") if (self.use_profile() and cur.get("profile"))
-                 else cur.get("centroid"))
+                 else (cur.get("points") or cur.get("centroid")))
         if store is None:
             return None
         mzlo = min(f["mz_min"] for f in feats); mzhi = max(f["mz_max"] for f in feats)
@@ -1900,6 +1931,7 @@ class MSViewerTab(QMainWindow):
                 "targets": [], "mz_center": mz_center,
                 "centroid": self.centroid_store(filename),
                 "profile": self.profile_store(filename),
+                "points": self.points_store(filename),
             }
         self.current["mz_center"] = mz_center
         self.current["rt"] = rt
@@ -1962,6 +1994,7 @@ class MSViewerTab(QMainWindow):
                 "targets": [], "mz_center": 500.0,
                 "centroid": self.centroid_store(self.current_file),
                 "profile": self.profile_store(self.current_file),
+                "points": self.points_store(self.current_file),
             }
         return True
 

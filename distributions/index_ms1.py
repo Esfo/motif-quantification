@@ -107,7 +107,7 @@ class Config:
     max_adjacent_intensity_ratio: float = 10.0
 
     charge_mass_ppm: float = 12.0
-    min_charge_group_rt_score: float = 0.10
+    min_charge_group_rt_score: float = 0.55
 
     # Reference (distributionassembly.py) isotope-edge acceptance, ported faithfully:
     # asymmetric acdiff tolerance around proton-spacing, plus intensity-step gating.
@@ -1825,7 +1825,7 @@ def parse_args():
     parser.add_argument("--max-adjacent-intensity-ratio", type=float, default=10.0)
 
     parser.add_argument("--charge-mass-ppm", type=float, default=12.0)
-    parser.add_argument("--min-charge-group-rt-score", type=float, default=0.10)
+    parser.add_argument("--min-charge-group-rt-score", type=float, default=0.55)
 
     # reference isotope-edge acceptance (acdiff + intensity-step gating)
     parser.add_argument("--charge-tolerance", type=float, default=0.1)

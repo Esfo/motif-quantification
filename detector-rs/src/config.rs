@@ -83,7 +83,7 @@ impl Default for Config {
             step_limit: 0.5,
             new_inc_limit: 0.1,
             charge_mass_ppm: 12.0,
-            min_charge_group_rt_score: 0.10,
+            min_charge_group_rt_score: 0.55,
         }
     }
 }
