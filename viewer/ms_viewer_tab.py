@@ -759,6 +759,8 @@ class MSViewerTab(QMainWindow):
         self.charge_tree.setSortingEnabled(True)
         self.charge_tree.doubleClicked.connect(self._on_charge_tree_activated)
         self.charge_tree.expanded.connect(self._on_charge_expanded)
+        self.charge_tree.clicked.connect(self._on_charge_clicked)
+        self.dists_view.clicked.connect(self._on_dist_clicked)
 
         self.table1_tabs = QTabWidget()
         self.table1_tabs.addTab(self.table1, "current")
@@ -1857,12 +1859,13 @@ class MSViewerTab(QMainWindow):
         self.charge_tree.setUpdatesEnabled(False)
         self.charge_model.removeRows(0, self.charge_model.rowCount())
         self.charge_model.setHorizontalHeaderLabels([h for _, h, _ in CHARGE_TAB_COLUMNS])
-        for analyte in self.db.all_analytes():
+        for analyte in self.db.all_analytes_multicharge():
             top = [QStandardItem(_fmt(analyte.get(f), k)) for f, _, k in CHARGE_TAB_COLUMNS]
             for col, (f, _, k) in enumerate(CHARGE_TAB_COLUMNS):
                 top[col].setData(analyte.get(f), Qt.EditRole)
             top[0].setData(analyte, Qt.UserRole)        # analyte dict (has analyte_id)
             top[0].setData(False, Qt.UserRole + 1)      # children-loaded flag
+            top[0].setData(analyte.get("rep_distribution_id"), Qt.UserRole + 2)
             top[0].appendRow(QStandardItem(""))          # single placeholder -> expand arrow
             self.charge_model.appendRow(top)
         self.charge_tree.setUpdatesEnabled(True)
@@ -1945,6 +1948,49 @@ class MSViewerTab(QMainWindow):
             self._jump_to(data.get("mono_mz"), data.get("rt_apex"), data.get("distribution_id"))
         else:
             self.charge_tree.setExpanded(index, not self.charge_tree.isExpanded(index))
+
+    # single click in either list -> load that distribution into panel 3 (no
+    # window move; double-click still jumps panels 1/2).
+    def _ensure_current_for_file(self):
+        if not self.current_file:
+            return False
+        if not isinstance(self.current, dict) or self.current.get("filename") != self.current_file:
+            self.current = {
+                "row": {}, "filename": self.current_file, "scan": "",
+                "charge": None, "neutral_mass": None, "rt": None,
+                "targets": [], "mz_center": 500.0,
+                "centroid": self.centroid_store(self.current_file),
+                "profile": self.profile_store(self.current_file),
+            }
+        return True
+
+    def _show_distribution_in_panel3(self, distribution_id):
+        if distribution_id is None or self.db is None or not self._ensure_current_for_file():
+            return
+        self.current["distribution_id"] = distribution_id
+        self._panel3_mode = "ms1"
+        self._ms2_scan = None
+        try:
+            self.table1_for_distribution(distribution_id)
+        except Exception:
+            pass
+        self.draw_panel3_ms1(self.current, getattr(self, "_last_scan_mz", None),
+                             getattr(self, "_last_scan_int", None))
+
+    def _on_dist_clicked(self, index):
+        row = self.dists_model.row_dict(self.dists_view.model().mapToSource(index).row())
+        if row:
+            self._show_distribution_in_panel3(row.get("distribution_id"))
+
+    def _on_charge_clicked(self, index):
+        item0 = self.charge_model.itemFromIndex(index.sibling(index.row(), 0))
+        if item0 is None:
+            return
+        data = item0.data(Qt.UserRole)
+        if isinstance(data, dict) and "distribution_id" in data:
+            self._show_distribution_in_panel3(data.get("distribution_id"))
+        else:
+            self._show_distribution_in_panel3(item0.data(Qt.UserRole + 2))
 
     # ---- panel 3 charge-comparison grid ----------------------------------
 

@@ -116,6 +116,21 @@ class DistributionsDB:
         rows = self.connect().execute("SELECT * FROM analytes").fetchall()
         return [dict(r) for r in rows]
 
+    def all_analytes_multicharge(self):
+        """Analytes that span more than one charge state, each with one
+        representative member distribution_id (for a one-click panel-3 load)."""
+        rows = self.connect().execute(
+            """
+            SELECT a.*,
+                   (SELECT am.distribution_id FROM analyte_members am
+                    WHERE am.analyte_id = a.analyte_id LIMIT 1) AS rep_distribution_id
+            FROM analytes a
+            WHERE a.charge_max > a.charge_min
+            ORDER BY a.analyte_id
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def analyte_distributions(self, analyte_id):
         """The member distributions of an analyte (charge region)."""
         rows = self.connect().execute(
