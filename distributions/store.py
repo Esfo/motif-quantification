@@ -67,6 +67,15 @@ def init_schema(conn, store_edges=False):
             quality REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS feature_traces (
+            feature_id INTEGER PRIMARY KEY,
+            n INTEGER NOT NULL,
+            scans BLOB NOT NULL,
+            rts BLOB NOT NULL,
+            mzs BLOB NOT NULL,
+            intensities BLOB NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS distributions (
             distribution_id INTEGER PRIMARY KEY,
             charge INTEGER NOT NULL,

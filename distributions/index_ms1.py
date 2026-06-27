@@ -6,6 +6,7 @@ import math
 import multiprocessing as mp
 import os
 import sys
+import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -235,6 +236,22 @@ class LineModel:
         self.next_feature_id = 0
         self.lines = []
         self.features = []
+        # Per-feature chromatographic traces, indexed by feature_id (dense,
+        # zero-based). Each entry is a dict of float arrays {scans, rts, mzs,
+        # intensities}. The envelope-first distribution builder needs the real
+        # elution shape of every isotope member, not just rt_start/apex/end, so
+        # the trace is retained here instead of being discarded at emit time.
+        self.feature_traces = []
+
+    def _record_trace(self, scans, rts, mzs, intensities):
+        self.feature_traces.append(
+            {
+                "scans": np.asarray(scans, dtype=np.int64),
+                "rts": np.asarray(rts, dtype=np.float64),
+                "mzs": np.asarray(mzs, dtype=np.float64),
+                "intensities": np.asarray(intensities, dtype=np.float64),
+            }
+        )
 
     def mz_tolerance(self, mz_value):
         return max(
@@ -577,6 +594,7 @@ class LineModel:
                 quality=quality,
             )
         )
+        self._record_trace(scans, rts, mzs, intensities)
 
         self.next_feature_id += 1
 
@@ -716,6 +734,7 @@ class LineModel:
                     quality=quality,
                 )
             )
+            self._record_trace(sub_scans, sub_rts, sub_mzs, sub_intensities)
 
             self.next_feature_id += 1
 
@@ -793,6 +812,26 @@ def feature_rows(features):
             "area": feature.area,
             "n_points": feature.n_points,
             "quality": feature.quality,
+        }
+
+
+def feature_trace_rows(traces):
+    # Persist each feature's chromatographic trace as zlib-compressed
+    # little-endian arrays (scans int32, rts/mzs/intensities f32) — same on-disk
+    # convention as scan_points — so the GUI and the Rust engine can read elution
+    # shapes without re-decoding the mzML.
+    for feature_id, trace in enumerate(traces):
+        scans = np.asarray(trace["scans"], dtype="<i4")
+        rts = np.asarray(trace["rts"], dtype="<f4")
+        mzs = np.asarray(trace["mzs"], dtype="<f4")
+        intensities = np.asarray(trace["intensities"], dtype="<f4")
+        yield {
+            "feature_id": int(feature_id),
+            "n": int(scans.size),
+            "scans": zlib.compress(scans.tobytes()),
+            "rts": zlib.compress(rts.tobytes()),
+            "mzs": zlib.compress(mzs.tobytes()),
+            "intensities": zlib.compress(intensities.tobytes()),
         }
 
 
@@ -1738,6 +1777,7 @@ def run(args):
         write_rows(conn, "scans", scans)
         write_rows(conn, "lines", model.lines)
         write_rows(conn, "features", feature_rows(model.features))
+        write_rows(conn, "feature_traces", feature_trace_rows(model.feature_traces))
 
         if store_edges:
             write_rows(conn, "isotope_edges", edge_rows(stored_edges))
