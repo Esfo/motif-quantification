@@ -102,6 +102,7 @@ data the pipeline produces. The four founding goals:
   - ✅ Shows **every datapoint** (not averages). Both centroid and **profile draw as dots** (m/z vs intensity) — profile is just denser. (Earlier profile-as-per-scan-curves was a regression the user rejected; reverted to dots.)
   - ✅ **Points no longer disappear when zooming into the 2D plot** — `clipToView` + 'peak' auto-downsampling were culling the scatter on zoom-in; both disabled (the window is bounded so the point count stays manageable).
   - ✅ **2D datapoints are coloured by their panel-2 distribution** (one scatter per distribution, grey for points in no distribution shown only when noise is on) — matching panel 2.
+  - ✅ **Panel 1 is now filtered to panel 2's visible window** (m/z AND RT). Panel 1 collapses RT, so when panel 2 was zoomed to a narrow RT band, panel 1 still showed points from the whole loaded RT range (lots of colours) while panel 2 showed one — that mismatch is fixed; panel 1 (and the 3D) re-filter on every zoom/pan (debounced).
   - ⬜ Profile dots/curves should **scale dynamically on zoom** so they stay visible (currently can get sparse/laggy).
   - ✅ Only the **m/z (x) axis** is interactive when 2D — **no vertical drag**; y auto-scales.
   - ✅ Wheel **over the y-axis label strip** (left of the axis) scrolls **intensity (y)**; ✅ pinned so the **baseline stays at 0** (data is always > 0; the baseline never lifts).
@@ -121,7 +122,8 @@ data the pipeline produces. The four founding goals:
 - ✅ **Data no longer disappears on zoom** (was the BIGGEST bug). Root cause: every zoom re-extracted only the *visible* window, and an RT view narrower than the MS1 scan spacing returned **zero scans** → blank. Fix: extract a **padded region** (`_padded`, m/z ×2, RT ×2.2) and **cache its extent** (`_loaded_window`); zoom/pan **within** the cache is now a pure view operation (no re-extraction, never empty), reloading only when the view leaves the cached region.
 - ✅ Zooming in **inverse-scales the datapoint size** (`_rescale_points`, √ of the cached-vs-view span, clamped 1–4×) so dots stay visible as you zoom in, in both Panel 1 (2D) and Panel 2.
 - ✅ Clicking a **distribution's dots in Panel 2 selects it** and brings up the matching **MS1 Panel 3** (charge grid / isotope overlay) for that distribution.
-- ✅ **Noise on/off toggle** (fixed-size switch on the Panel 1 bar, like 2D/3D & profile/centroid): "noise off" drops all points **not in any distribution** from Panel 1 and Panel 2 (redrawn from cache, no re-extraction).
+- ✅ **Noise on/off toggle** (fixed-size switch on the Panel 1 bar, like 2D/3D & profile/centroid): "noise off" drops all points **not in any distribution** from Panel 1 and Panel 2 (redrawn from cache, no re-extraction). **Default is noise OFF.**
+- ✅ **Distribution colours use `distinctipy`** (a pool of 48 visually-distinct colours, black/white excluded since white is the 3D peak-tip colour), shared across Panel 1, Panel 2 and the Panel 3 MS1 grid; falls back to the fixed palette if `distinctipy` isn't installed (`pip install distinctipy`).
 - ✅ **Dot/line sizing** follows the user's matplotlib reference (tiny dots `s≈0.02`, line width `≈0.2`): Panel 2 distribution dots base **3 px** / connecting line **0.5 px**, gray noise dots **1.5 px**, Panel 1 dots **3 px** — all still inverse-scaled on zoom-in.
 - ✅ Removed pyqtgraph's in-plot **auto-range "A" button** from every panel (Panel 1/2/3, MS2 strip, charge-grid cells) — fit-to-data made no sense for the window-driven panels and the buttons overlapped the data.
 

@@ -49,6 +49,13 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 try:
+    import distinctipy
+    HAVE_DISTINCTIPY = True
+except Exception:
+    distinctipy = None
+    HAVE_DISTINCTIPY = False
+
+try:
     from .mzml_store import MzmlStore, scan_arrays
     from .plots import plot_points, plot_spectrum
     from .region_view import HAVE_GL, gl
@@ -202,6 +209,17 @@ class MSViewerTab(QMainWindow):
         self.center = None        # (mz_center, rt_center) for the ± controls
         self._guard = False       # suppress range-change handling during programmatic set
         self._dist_colors = {}    # distribution_id -> stable RGB colour
+        # A pool of visually-distinct colours (distinctipy) assigned per
+        # distribution in first-seen order; excludes black/white (white is the
+        # 3D peak-tip colour). Falls back to the fixed palette if unavailable.
+        if HAVE_DISTINCTIPY:
+            try:
+                pool = distinctipy.get_colors(48, exclude_colors=[(0, 0, 0), (1, 1, 1)], rng=0)
+                self._color_pool = [(int(r * 255), int(g * 255), int(b * 255)) for r, g, b in pool]
+            except Exception:
+                self._color_pool = list(DIST_PALETTE)
+        else:
+            self._color_pool = list(DIST_PALETTE)
         self.assumed_charge = None
         self._panel3_mode = "ms1"  # "ms1" (envelope/charge grid) or "ms2" (spectrum)
         self._ms2_scan = None      # the MS2 scan currently shown in panel 3
@@ -218,6 +236,14 @@ class MSViewerTab(QMainWindow):
         self._reload_timer.setSingleShot(True)
         self._reload_timer.setInterval(140)
         self._reload_timer.timeout.connect(self.do_extract)
+
+        # Debounced panel-1 redraw: panel 1 (and the 3D) must be re-filtered to
+        # panel 2's visible window as it's zoomed/panned, even when no reload is
+        # needed (zoom within the cached region).
+        self._p1_view_timer = QTimer(self)
+        self._p1_view_timer.setSingleShot(True)
+        self._p1_view_timer.setInterval(60)
+        self._p1_view_timer.timeout.connect(self._redraw_panel1_view)
 
         self.setDockNestingEnabled(True)
         self.build_lists_dock()
@@ -368,6 +394,9 @@ class MSViewerTab(QMainWindow):
         # Noise = points not in any distribution. Default shows noise; pressing
         # hides it (label flips to what the next press does, like the others).
         self.noise_toggle = fixed_toggle("noise off", "noise on", width=80)
+        # Default: noise OFF (checked == hide noise; label shows what a press does).
+        self.noise_toggle.setChecked(True)
+        self.noise_toggle.setText("noise on")
         self.noise_toggle.clicked.connect(self._toggle_noise)
         # Log/linear colour scale for the 3D intensity colouring.
         self.logcolor_toggle = fixed_toggle("log color", "lin color", width=80)
@@ -862,11 +891,8 @@ class MSViewerTab(QMainWindow):
         self._rescale_points()
         # Keep the MS2 strip in sync with what's visible in panel 2.
         self._refresh_ms2_visible()
-        # Keep the 3D view's mass/time extent matched to panel 2 as it's moved
-        # (the 3D is normalised to self.window, so re-render from the cached pts).
-        if (HAVE_GL and self.dim_toggle.isChecked()
-                and getattr(self, "_p1_3d_inputs", None) is not None):
-            self.draw_panel1_3d(*self._p1_3d_inputs)
+        # Re-filter panel 1 (and the 3D) to the new visible window (debounced).
+        self._p1_view_timer.start()
         # The big "data disappears on zoom" fix: we extract a PADDED region and
         # cache it. Zooming/panning *within* that cached region is a pure view
         # operation -- no re-extraction (which is what used to come back empty
@@ -921,6 +947,12 @@ class MSViewerTab(QMainWindow):
                 scatter.setSize(base * fmz)
             except Exception:
                 pass
+
+    def _redraw_panel1_view(self):
+        """Re-draw panel 1 (filtered to panel 2's visible window) from cached
+        points -- keeps panel 1 + the 3D matched to panel 2 on zoom/pan."""
+        if isinstance(getattr(self, "_last_points", None), dict) and self._win is not None:
+            self.draw_panel1(self._last_points, self._last_region, *self._win)
 
     def refresh(self):
         self._reload_timer.start()
@@ -1011,7 +1043,16 @@ class MSViewerTab(QMainWindow):
         self._p1_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
         title_color = palette(self.theme)["fg"]
         if isinstance(points, dict) and points["mz"].size:
-            mz = points["mz"]; inten = points["intensity"]
+            mz = points["mz"]; rt = points["rt"]; inten = points["intensity"]
+            # Panel 1 collapses RT onto m/z-vs-intensity, so it MUST be filtered to
+            # panel 2's currently-visible window -- otherwise it shows points from
+            # the whole loaded RT range (lots of distributions/colours) while panel
+            # 2 is zoomed to one. This is what caused the mismatch.
+            if self.window is not None:
+                vmz0, vmz1, vrt0, vrt1 = self.window
+                vm = (mz >= vmz0) & (mz <= vmz1) & (rt >= vrt0) & (rt <= vrt1)
+            else:
+                vm = np.ones(mz.size, dtype=bool)
             self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
             # Colour each datapoint by the panel-2 distribution it belongs to
             # (one scatter per distribution); points in no distribution are grey
@@ -1021,6 +1062,7 @@ class MSViewerTab(QMainWindow):
                 idx = np.zeros(mz.size, dtype=bool)
                 for fm in feat_masks:
                     idx |= fm
+                idx &= vm
                 if idx.any():
                     sc = pg.ScatterPlotItem(x=mz[idx], y=inten[idx], size=3, pen=None,
                                             brush=pg.mkBrush(*color))
@@ -1028,7 +1070,7 @@ class MSViewerTab(QMainWindow):
                     self._p1_scatters.append((sc, 3))
                     shown_max = max(shown_max, float(inten[idx].max()))
             if self.use_noise():
-                un = ~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)
+                un = (~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)) & vm
                 if un.any():
                     sc = pg.ScatterPlotItem(x=mz[un], y=inten[un], size=2, pen=None,
                                             brush=pg.mkBrush(150, 150, 150, 150))
@@ -1145,9 +1187,12 @@ class MSViewerTab(QMainWindow):
         return pts
 
     def distribution_color(self, distribution_id):
-        """Stable colour per distribution (assigned in first-seen order)."""
+        """Stable colour per distribution (assigned in first-seen order) from the
+        distinctipy pool."""
         if distribution_id not in self._dist_colors:
-            self._dist_colors[distribution_id] = DIST_PALETTE[len(self._dist_colors) % len(DIST_PALETTE)]
+            i = len(self._dist_colors)
+            pool = self._color_pool or DIST_PALETTE
+            self._dist_colors[distribution_id] = pool[i % len(pool)]
         return self._dist_colors[distribution_id]
 
     def _assignment(self, points, window):

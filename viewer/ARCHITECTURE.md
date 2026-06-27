@@ -7,7 +7,7 @@ It also records the proposed repo reorganization so the rebuild stays coherent.
 ## Running it
 
 ```bash
-pip install PySide6 pyqtgraph numpy pyteomics lxml psims PyOpenGL
+pip install PySide6 pyqtgraph numpy pyteomics lxml psims PyOpenGL distinctipy
 python viewer/app.py                  # then double-click / Ctrl+O to open a folder
 python viewer/app.py --reorganized /path/to/searches/reorganized
 ```
