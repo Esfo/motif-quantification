@@ -21,6 +21,20 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 INDEXER = HERE / "distributions" / "index_ms1.py"
+RUST_CRATE = HERE / "detector-rs"
+RUST_BIN = RUST_CRATE / "target" / "release" / "ms1-detector"
+
+
+def ensure_rust_binary():
+    """Build the Rust detector if needed and return the binary path. The Rust
+    engine is a validated drop-in for index_ms1.py (same sqlite output) and is
+    much faster; the line + edge stages dominate runtime and are native there."""
+    if not RUST_BIN.exists():
+        print("building rust detector (cargo build --release)...", file=sys.stderr)
+        result = subprocess.run(["cargo", "build", "--release"], cwd=str(RUST_CRATE))
+        if result.returncode != 0:
+            raise SystemExit("cargo build failed")
+    return RUST_BIN
 
 
 def find_centroid_mzmls(mzml_dir):
@@ -44,8 +58,11 @@ def parse_args():
     parser.add_argument("--mzml-dir", type=Path, help="override: directory of centroid mzML files")
     parser.add_argument("--out-dir", type=Path, help="override: directory to write the sqlite files")
     parser.add_argument("--overwrite", action="store_true", help="rebuild existing sqlite files")
+    parser.add_argument("--engine", choices=("python", "rust"), default="python",
+                        help="detector engine: python (index_ms1.py) or rust "
+                             "(detector-rs/ms1-detector, faster, same sqlite)")
     parser.add_argument("forward", nargs="*",
-                        help="args forwarded to index_ms1.py (place after --)")
+                        help="args forwarded to the detector (place after --)")
     return parser.parse_args()
 
 
@@ -66,7 +83,8 @@ def main():
     else:
         raise SystemExit("provide --project or --out-dir")
 
-    if not INDEXER.exists():
+    rust_bin = ensure_rust_binary() if args.engine == "rust" else None
+    if args.engine == "python" and not INDEXER.exists():
         raise SystemExit(f"missing indexer: {INDEXER}")
     if not mzml_dir.is_dir():
         raise SystemExit(f"missing mzML dir: {mzml_dir}")
@@ -85,7 +103,10 @@ def main():
             print(f"[{i}/{len(mzmls)}] skip (exists): {out.name}")
             continue
 
-        cmd = [sys.executable, str(INDEXER), str(mzml), "--out", str(out)]
+        if args.engine == "rust":
+            cmd = [str(rust_bin), str(mzml), "--out", str(out)]
+        else:
+            cmd = [sys.executable, str(INDEXER), str(mzml), "--out", str(out)]
         if args.overwrite:
             cmd.append("--overwrite")
         cmd.extend(args.forward)
