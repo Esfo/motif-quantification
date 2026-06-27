@@ -145,8 +145,12 @@ class EvidenceWorker(QThread):
 # (PLOT_LEFT) so a given m/z sits at the same screen x in all of them. Using a
 # real (fixed-width) axis on BOTH panels is what makes it deterministic.
 MS2_STRIP_W = 34       # MS2 strip: pure bands, no axis
-P2_AXIS_W = 46         # panel 2's RT (y) axis width
+P2_AXIS_W = 60         # panel 2's RT axis width (and panel 1's intensity axis)
 PLOT_LEFT = MS2_STRIP_W + P2_AXIS_W   # = where every plot's m/z axis begins
+# Panel 1's 2D plot gets the SAME left structure as panel 2 -- a strip-width
+# spacer + an axis of P2_AXIS_W -- so the two plot areas are pixel-identical and
+# their m/z axes line up exactly (a single 80px axis on panel 1 rendered a hair
+# wider than strip+axis on panel 2, shifting panel 1 right).
 
 
 DIST_PALETTE = [
@@ -370,8 +374,19 @@ class MSViewerTab(QMainWindow):
             self.p1_3d.setAlignment(Qt.AlignCenter)
             self.p1_3d_widget = self.p1_3d
 
+        # Wrap the 2D plot with a strip-width spacer so its left structure matches
+        # panel 2's (spacer + axis), making the m/z axes pixel-identical.
+        p1_2d_row = QWidget()
+        _hb = QHBoxLayout(p1_2d_row)
+        _hb.setContentsMargins(0, 0, 0, 0)
+        _hb.setSpacing(0)
+        _p1_spacer = QWidget()
+        _p1_spacer.setFixedWidth(MS2_STRIP_W)
+        _hb.addWidget(_p1_spacer)
+        _hb.addWidget(self.p1_2d, stretch=1)
+
         self.p1_stack = QStackedWidget()
-        self.p1_stack.addWidget(self.p1_2d)          # index 0 = 2D
+        self.p1_stack.addWidget(p1_2d_row)           # index 0 = 2D
         self.p1_stack.addWidget(self.p1_3d_widget)   # index 1 = 3D
 
         self.dim_toggle = fixed_toggle("3D", "2D")     # shows what it will switch TO
@@ -486,11 +501,11 @@ class MSViewerTab(QMainWindow):
             self.p2_image.setColorMap(self._cmap)
         self.p2.addItem(self.p2_image)
 
-        # The m/z (x) axes align because panel 2's plot starts at PLOT_LEFT
-        # (strip + its RT axis) and panel 1's left axis is the SAME width -- so a
-        # given m/z sits at the same screen x in both. Both use real fixed-width
-        # axes, which makes the alignment deterministic.
-        self.p1_2d.getAxis("left").setWidth(PLOT_LEFT)
+        # Panel 1's 2D plot is wrapped with a strip-width spacer (see
+        # build_panel1_dock) and its left axis is P2_AXIS_W -- IDENTICAL to panel
+        # 2's strip(spacer) + RT axis -- so both plot areas start and span exactly
+        # the same screen x and the m/z axes line up to the pixel.
+        self.p1_2d.getAxis("left").setWidth(P2_AXIS_W)
 
         # No in-plot auto-range "A" buttons (they overlapped the data).
         self.p2.getPlotItem().hideButtons()
