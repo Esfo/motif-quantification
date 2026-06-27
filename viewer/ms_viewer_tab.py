@@ -139,6 +139,12 @@ class EvidenceWorker(QThread):
             self.done.emit({"error": f"{exc}\n{traceback.format_exc()}"})
 
 
+# Left margin (px) before panel 2's plot (the MS2 strip width). Panel 1's 2D
+# left axis and the 3D's left spacer use the SAME value so all three plots'
+# m/z (x) axes start at the same screen x and line up.
+MS2_STRIP_W = 70
+
+
 DIST_PALETTE = [
     (76, 114, 176), (221, 132, 82), (85, 168, 104), (196, 78, 82),
     (129, 114, 179), (147, 120, 96), (218, 139, 195), (140, 140, 140),
@@ -322,6 +328,8 @@ class MSViewerTab(QMainWindow):
         self.p1_2d.setMouseEnabled(x=True, y=False)
         # Wheel over the y-axis label strip (left of the plot) scrolls intensity.
         self.p1_2d.viewport().installEventFilter(self)
+        # Double-click re-fits the intensity (y) axis to the data.
+        self.p1_2d.scene().sigMouseClicked.connect(self._on_p1_clicked)
 
         # Spawn / "align 3D" view: a FRONT-ON, near-orthographic view that looks
         # exactly like the 2D plot -- m/z on the horizontal axis (aligned with
@@ -331,8 +339,13 @@ class MSViewerTab(QMainWindow):
         # screen-up is +intensity. A small FOV makes it near-orthographic so the
         # m/z axis is linear and lines up with panel 2. From here the user can
         # orbit to reveal time; "align 3D" returns to exactly this.
-        self._p1_3d_fov = 4.0
-        self._p1_3d_cam = dict(distance=30.0, elevation=0.0, azimuth=-90.0)
+        self._p1_3d_fov = 2.0
+        # distance so the data half-height (1.0) exactly fills the view vertically
+        # (intensity 0 at the very bottom, max at the very top); with the data x
+        # half-width set to the pane aspect, m/z then fills the width edge-to-edge
+        # and aligns with panel 2.
+        self._p1_3d_dist = 1.02 / float(np.tan(np.radians(self._p1_3d_fov / 2.0)))
+        self._p1_3d_cam = dict(distance=self._p1_3d_dist, elevation=0.0, azimuth=-90.0)
         if HAVE_GL:
             self.p1_3d = gl.GLViewWidget()
             self.p1_3d.opts["fov"] = self._p1_3d_fov
@@ -353,7 +366,18 @@ class MSViewerTab(QMainWindow):
                 self.p1_3d.addItem(self.p1_time_text)
             except Exception:
                 pass
-            self.p1_3d_widget = self.p1_3d
+            # Left spacer = the strip width, so the 3D content starts at the same
+            # screen x as panel 2's plot (and panel 1's 2D plot), keeping m/z
+            # aligned across all three.
+            gl_row = QWidget()
+            hb = QHBoxLayout(gl_row)
+            hb.setContentsMargins(0, 0, 0, 0)
+            hb.setSpacing(0)
+            spacer = QWidget()
+            spacer.setFixedWidth(MS2_STRIP_W)
+            hb.addWidget(spacer)
+            hb.addWidget(self.p1_3d, stretch=1)
+            self.p1_3d_widget = gl_row
         else:
             self.p1_3d = QLabel("3D needs pyqtgraph OpenGL (pip install PyOpenGL)")
             self.p1_3d.setAlignment(Qt.AlignCenter)
@@ -430,10 +454,12 @@ class MSViewerTab(QMainWindow):
         # RT-aligned with panel 2 (shared y). It fits in the space panel 1's wide
         # y-axis labels leave between panels 1 and 2.
         self.ms2_plot = pg.PlotWidget()
-        # The strip carries the RT (y) ruler for the whole row; panel 2's own
-        # left axis is value-less (below) so the two RT axes can never overlap and
-        # this left strip is always visible. Wide enough to fit the RT numbers.
-        self.ms2_plot.setFixedWidth(58)
+        # The strip is the RT (y) ruler for the whole row and is the ONLY left
+        # margin before panel 2's plot (panel 2 has no left axis), so panel 2's
+        # plot starts exactly at the strip's right edge. Panel 1's left axis is
+        # set to this same width below, which is what keeps the m/z (x) axes of
+        # panel 1 and panel 2 aligned.
+        self.ms2_plot.setFixedWidth(MS2_STRIP_W)
         self.ms2_plot.setMouseEnabled(x=False, y=True)
         self.ms2_plot.getPlotItem().hideAxis("bottom")
         self.ms2_plot.setLabel("left", "MS2 RT", units="min")
@@ -455,25 +481,21 @@ class MSViewerTab(QMainWindow):
         self.ms2_plot.scene().sigMouseClicked.connect(self._on_ms2_strip_clicked)
         self._ms2_all = []      # all loaded MS2 scans; filtered to the view below
 
-        # Panel 2: m/z on x (aligned with panel 1), RT on y.
+        # Panel 2: m/z on x (aligned with panel 1), RT on y. It has NO left axis
+        # at all -- the MS2 strip to its left is the RT ruler -- so its plot area
+        # begins exactly at the strip's right edge (MS2_STRIP_W).
         self.p2 = pg.PlotWidget()
         self.p2.setLabel("bottom", "m/z")
-        # No value labels on panel 2's own left axis -- the MS2 strip to its left
-        # is the RT ruler (shared y). This removes the duplicate/overlapping RT
-        # axis the user reported while keeping the width for m/z alignment.
-        self.p2.setLabel("left", "")
-        self.p2.getAxis("left").setStyle(showValues=False)
+        self.p2.getPlotItem().hideAxis("left")
         self.p2_image = pg.ImageItem()
         if self._cmap is not None:
             self.p2_image.setColorMap(self._cmap)
         self.p2.addItem(self.p2_image)
 
-        # Align panel 1 and panel 2 m/z (x) axes: their plot areas must start at
-        # the same screen x. Panel 2 is offset by the MS2 strip (58) + its own
-        # value-less left axis (42); give panel 1's left axis the same total so
-        # the m/z axes line up even though the y-axes intentionally differ.
-        self.p2.getAxis("left").setWidth(42)
-        self.p1_2d.getAxis("left").setWidth(100)
+        # The m/z (x) axes align because panel 2's plot starts at MS2_STRIP_W
+        # (the strip width, panel 2 having no left axis) and panel 1's left axis
+        # is the SAME width -- so a given m/z sits at the same screen x in both.
+        self.p1_2d.getAxis("left").setWidth(MS2_STRIP_W)
 
         # No in-plot auto-range "A" buttons (they overlapped the data).
         self.p2.getPlotItem().hideButtons()
@@ -1136,12 +1158,14 @@ class MSViewerTab(QMainWindow):
         y = ((rt - rt_start) / rt_span * 2 - 1).astype(np.float32)
         z = (tnorm * 2 - 1).astype(np.float32)
         pos = np.column_stack([x, y, z]).astype(np.float32)
-        # Pin the axis labels to the ends of their axes (baseline plane z=-1).
+        # Labels at the MIDDLE of each axis on the baseline plane (z=-1): m/z runs
+        # along x so its label is centred at x=0; time runs along y so its label
+        # is centred at y=0 on the left edge.
         try:
             if self.p1_mz_text is not None:
-                self.p1_mz_text.setData(pos=np.array([aspect * 1.04, -1.0, -1.0]), text="m/z")
+                self.p1_mz_text.setData(pos=np.array([0.0, -1.0, -1.0]), text="m/z")
             if self.p1_time_text is not None:
-                self.p1_time_text.setData(pos=np.array([-aspect * 1.04, 1.06, -1.0]), text="time")
+                self.p1_time_text.setData(pos=np.array([-aspect, 0.0, -1.0]), text="time")
         except Exception:
             pass
         try:
@@ -1450,6 +1474,22 @@ class MSViewerTab(QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
+    def _on_p1_clicked(self, event):
+        # Double-click re-fits panel 1's intensity (y) axis to the visible data,
+        # grounded at 0.
+        if not event.double():
+            return
+        ymax = 0.0
+        for scatter, _base in getattr(self, "_p1_scatters", []):
+            try:
+                ys = scatter.getData()[1]
+                if ys is not None and len(ys):
+                    ymax = max(ymax, float(np.nanmax(ys)))
+            except Exception:
+                pass
+        if ymax > 0:
+            self.p1_2d.getViewBox().setYRange(0.0, ymax * 1.05, padding=0)
+
     def _on_p3_clicked(self, event):
         # Double-click resets panel 3's zoom: auto-range m/z, ground intensity at 0.
         if not event.double():
@@ -1644,7 +1684,9 @@ class MSViewerTab(QMainWindow):
             left.setWidth(54)
             # Every cell shows exactly 3 y ticks (bottom / middle / top of its
             # current range), updated live as the range changes.
-            def _ticks(_=None, ax=left, vb=vb):
+            def _ticks(*_args, ax=left, vb=vb):
+                # NB: sigYRangeChanged passes (viewbox, range) positionally, so
+                # swallow all positional args and keep ax/vb as keyword defaults.
                 (y0, y1) = vb.viewRange()[1]
                 mid = (y0 + y1) / 2.0
                 ax.setTicks([[(y0, f"{y0:.3g}"), (mid, f"{mid:.3g}"), (y1, f"{y1:.3g}")]])
