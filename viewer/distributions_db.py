@@ -36,11 +36,31 @@ class DistributionsDB:
         rows = self.connect().execute("SELECT key, value FROM parameters").fetchall()
         return {r["key"]: r["value"] for r in rows}
 
+    def has_status(self):
+        """Whether the distributions table carries the status column (older
+        sqlites, written before the evidence/recovery work, do not)."""
+        cached = getattr(self, "_has_status_cache", None)
+        if cached is None:
+            cols = self.connect().execute("PRAGMA table_info(distributions)").fetchall()
+            cached = any(c["name"] == "status" for c in cols)
+            self._has_status_cache = cached
+        return cached
+
     def distributions_in_window(self, mz_min=None, mz_max=None, rt_start=None,
-                                rt_end=None, charge=None, limit=2000):
-        """Distributions whose mono m/z and RT apex fall in the window."""
+                                rt_end=None, charge=None, limit=2000, status=None):
+        """Distributions whose mono m/z and RT apex fall in the window.
+
+        status: None = all; 'primary' = validated/ambiguous (status != recovered);
+        'recovered' = only the recovery-pass tier. On older sqlites without a
+        status column, 'primary' returns all and 'recovered' returns nothing.
+        """
         clauses = []
         params = []
+
+        if status == "recovered":
+            clauses.append("status = 'recovered'" if self.has_status() else "0")
+        elif status == "primary" and self.has_status():
+            clauses.append("status != 'recovered'")
 
         if mz_min is not None:
             clauses.append("mono_mz >= ?")

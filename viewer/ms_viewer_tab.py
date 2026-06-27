@@ -382,8 +382,10 @@ class MSViewerTab(QMainWindow):
         self._loaded_window = None # the padded region actually extracted/cached
         self._p2_scatters = []    # (ScatterPlotItem, base_size) for zoom rescaling
         self._p1_scatter_item = None  # panel-1 2D centroid scatter (for rescaling)
-        self._assigned = None     # bool mask: which raw points are in a distribution
+        self._assigned = None     # bool mask: raw points in a validated/ambiguous distribution
         self._groups = []         # [(distribution_id, colour, point_mask)]
+        self._rec_assigned = None # bool mask: raw points in a recovered (less-confident) distribution
+        self._rec_groups = []     # recovered distribution groups (shown at noise mode >= 1)
         self._noise_class = None  # int8 per point: 0 assigned, 1 line, 2 small, 3 single
         self._last_region = None
         self.center = None        # (mz_center, rt_center) for the ± controls
@@ -593,9 +595,12 @@ class MSViewerTab(QMainWindow):
         self.source_toggle = FlipButton([("centroid", "centroid"), ("profile", "profile")],
                                         on_change=self.refresh)
         # Noise levels: none -> noise lines -> + small lines -> + single points.
+        # Levels: none -> recovered (less confident) distributions -> noise lines
+        # -> + small lines -> + single points. Each level is cumulative.
         self.noise_toggle = FlipButton(
-            [("none", "no noise"), ("line", "line noise"),
-             ("small", "small line noise"), ("single", "single point noise")],
+            [("none", "no noise"), ("recovered", "less confident distributions"),
+             ("line", "line noise"), ("small", "small line noise"),
+             ("single", "single point noise")],
             on_change=self._on_noise_changed)
         self.logcolor_toggle = FlipButton([("lin", "lin color"), ("log", "log color")],
                                           on_change=self._on_logcolor)
@@ -1180,17 +1185,23 @@ class MSViewerTab(QMainWindow):
         return self.source_toggle.key() == "profile"
 
     def noise_mode(self):
-        """Current noise level: 0 none, 1 lines, 2 +small lines, 3 +single points."""
+        """Current level: 0 none, 1 recovered distributions, 2 lines, 3 +small
+        lines, 4 +single points (cumulative)."""
         return self.noise_toggle.index()
 
+    def recovered_visible(self):
+        """Recovered (less-confident) distributions show from level 1 onward."""
+        return self.noise_mode() >= 1
+
     def noise_visible_mask(self, n):
-        """Boolean over the loaded points: which noise points the current level
-        reveals. A point is shown if its class is between 1 and the active mode."""
+        """Boolean over the loaded points: which raw noise points the current
+        level reveals. Noise classes start at level 2 (level 1 is recovered
+        distributions), so class c (1 line, 2 small, 3 single) shows at mode>=c+1."""
         mode = self.noise_mode()
         cls = getattr(self, "_noise_class", None)
-        if mode <= 0 or cls is None or cls.size != n:
+        if mode <= 1 or cls is None or cls.size != n:
             return np.zeros(n, dtype=bool)
-        return (cls >= 1) & (cls <= mode)
+        return (cls >= 1) & (cls <= mode - 1)
 
     def _on_noise_changed(self):
         # Pure redraw from cached data -- no re-extraction needed.
@@ -1385,10 +1396,19 @@ class MSViewerTab(QMainWindow):
         # centroid points directly.
         win = (mz_min, mz_max, rt_start, rt_end)
         if self.use_profile() and cur.get("profile"):
-            self._assigned, self._groups = self._assignment_profile(points, win)
+            self._assigned, self._groups = self._assignment_profile(points, win, status="primary")
+            self._rec_assigned, self._rec_groups = self._assignment_profile(points, win, status="recovered")
         else:
-            self._assigned, self._groups = self._assignment(points, win)
-        self._noise_class = self._compute_noise_class(points, win, self._assigned)
+            self._assigned, self._groups = self._assignment(points, win, status="primary")
+            self._rec_assigned, self._rec_groups = self._assignment(points, win, status="recovered")
+        # Noise = points in NO distribution (validated OR recovered): pass the
+        # combined assignment so recovered members are not double-counted as noise.
+        combined = self._assigned
+        if combined is not None and self._rec_assigned is not None:
+            combined = combined | self._rec_assigned
+        elif self._rec_assigned is not None:
+            combined = self._rec_assigned
+        self._noise_class = self._compute_noise_class(points, win, combined)
 
         self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end)
         self.draw_panel2(points, (mz_min, mz_max, rt_start, rt_end))
@@ -1435,6 +1455,22 @@ class MSViewerTab(QMainWindow):
                     self.p1_2d.addItem(sc)
                     self._p1_scatters.append((sc, 3))
                     shown_max = max(shown_max, float(inten[idx].max()))
+            # Recovered (less-confident) distributions: same colours, fainter, only
+            # from noise level 1 onward.
+            if self.recovered_visible():
+                for _did, color, feat_masks in (self._rec_groups or []):
+                    idx = np.zeros(mz.size, dtype=bool)
+                    for fm in feat_masks:
+                        idx |= fm
+                    idx &= vm
+                    if idx.any():
+                        sc = pg.ScatterPlotItem(x=mz[idx], y=inten[idx], size=3, pen=None,
+                                                brush=pg.mkBrush(*color, 140),
+                                                data=[_did] * int(idx.sum()))
+                        sc.sigClicked.connect(self.on_panel2_dist_clicked)
+                        self.p1_2d.addItem(sc)
+                        self._p1_scatters.append((sc, 3))
+                        shown_max = max(shown_max, float(inten[idx].max()))
             noise_vis = self.noise_visible_mask(mz.size) & vm
             if noise_vis.any():
                 # One scatter per noise class so the levels are visually distinct.
@@ -1474,6 +1510,11 @@ class MSViewerTab(QMainWindow):
             c = np.array(color, dtype=np.float32) / 255.0
             for fm in feat_masks:
                 base[fm] = c
+        if self.recovered_visible():
+            for _did, color, feat_masks in (self._rec_groups or []):
+                c = np.array(color, dtype=np.float32) / 255.0
+                for fm in feat_masks:
+                    base[fm] = c
 
         # Show EXACTLY panel 2's visible window (not the padded load region), so
         # the 3D mass/time extent matches panel 2 instead of being "way off".
@@ -1483,7 +1524,10 @@ class MSViewerTab(QMainWindow):
         # Honour the noise level: keep assigned points plus only the noise classes
         # the current mode reveals.
         if self._assigned is not None:
-            view &= self._assigned | self.noise_visible_mask(mz.size)
+            keep = self._assigned | self.noise_visible_mask(mz.size)
+            if self.recovered_visible() and self._rec_assigned is not None:
+                keep = keep | self._rec_assigned
+            view &= keep
         mz, rt, inten, base = mz[view], rt[view], inten[view], base[view]
         if mz.size == 0:
             self.p1_scatter.setVisible(False)
@@ -1574,12 +1618,13 @@ class MSViewerTab(QMainWindow):
             self._dist_colors[distribution_id] = pool[i % len(pool)]
         return self._dist_colors[distribution_id]
 
-    def _assignment(self, points, window):
+    def _assignment(self, points, window, status=None):
         """Membership of each raw point in a sqlite distribution. Returns
         ``(assigned_mask, groups)`` where groups is a list of
         ``(distribution_id, colour, [feature_point_masks])`` -- one mask per
         *line* (feature), since a connect-the-dots line must follow a single
-        line's trace, not jump across a whole distribution. Computed once per
+        line's trace, not jump across a whole distribution. ``status`` selects the
+        confidence tier ('primary', 'recovered', or None=all). Computed once per
         reload and shared by panels 1 and 2 + the noise toggle."""
         if not isinstance(points, dict) or points["mz"].size == 0 or self.db is None:
             return None, []
@@ -1587,7 +1632,7 @@ class MSViewerTab(QMainWindow):
         mz_min, mz_max, rt_start, rt_end = window
         assigned = np.zeros(mz.size, dtype=bool)
         groups = []
-        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
+        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end, status=status):
             did = dist["distribution_id"]
             feat_masks = []
             for feat in self.db.distribution_members(did):
@@ -1633,7 +1678,7 @@ class MSViewerTab(QMainWindow):
                 cls[m] = np.minimum(cls[m], np.int8(c))
         return cls
 
-    def _assignment_profile(self, points, window):
+    def _assignment_profile(self, points, window, status=None):
         """Profile-mode membership via peak finding (roadmap 1.9): run the same
         centroiding peak-detection (``axis_peaks``) per scan, take each peak's
         apex as the centroid, match THAT centroid to a sqlite feature, and assign
@@ -1651,7 +1696,7 @@ class MSViewerTab(QMainWindow):
         mz_min, mz_max, rt_start, rt_end = window
         # Flatten the features into arrays for vectorised apex->feature matching.
         flist = []
-        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
+        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end, status=status):
             did = dist["distribution_id"]
             color = self.distribution_color(did)
             for feat in self.db.distribution_members(did):
@@ -1722,6 +1767,26 @@ class MSViewerTab(QMainWindow):
             scatter.sigClicked.connect(self.on_panel2_dist_clicked)
             self.p2.addItem(scatter)
             self._p2_scatters.append((scatter, 3))
+
+        # Recovered (less-confident) distributions: same colours, fainter dots +
+        # dashed connectors, only from noise level 1 onward.
+        if self.recovered_visible():
+            for did, color, feat_masks in (self._rec_groups or []):
+                xs, ys, smz, srt = [], [], [], []
+                for fm in feat_masks:
+                    o = np.argsort(rt[fm])
+                    xs.append(mz[fm][o]); xs.append(nan)
+                    ys.append(rt[fm][o]); ys.append(nan)
+                    smz.append(mz[fm]); srt.append(rt[fm])
+                self.p2.addItem(pg.PlotCurveItem(
+                    np.concatenate(xs), np.concatenate(ys), connect="finite",
+                    pen=pg.mkPen(color=(*color, 130), width=0.5, style=Qt.DashLine)))
+                cmz = np.concatenate(smz); crt = np.concatenate(srt)
+                sc = pg.ScatterPlotItem(x=cmz, y=crt, size=2.5, pen=None,
+                                        brush=pg.mkBrush(*color, 150), data=[did] * cmz.size)
+                sc.sigClicked.connect(self.on_panel2_dist_clicked)
+                self.p2.addItem(sc)
+                self._p2_scatters.append((sc, 2.5))
 
         # Noise points -> one scatter per visible noise class (level-dependent).
         noise_vis = self.noise_visible_mask(mz.size)
