@@ -160,18 +160,6 @@ LINE_METRIC_COLUMNS = [
 ]
 
 
-class ThreeTickAxis(pg.AxisItem):
-    """Y axis that always shows exactly three ticks (bottom, middle, top) of the
-    current range, so the charge-grid rows stay legible instead of cluttered.
-    Updates dynamically because pyqtgraph calls tickValues with the live range."""
-
-    def tickValues(self, minVal, maxVal, size):
-        if not np.isfinite(minVal) or not np.isfinite(maxVal) or maxVal <= minVal:
-            return [(1.0, [minVal])]
-        mid = (minVal + maxVal) / 2.0
-        return [((maxVal - minVal) / 2.0, [minVal, mid, maxVal])]
-
-
 def fixed_toggle(off_text, on_text, width=70):
     """A two-state button whose label flips but whose size never changes."""
     button = QPushButton(off_text)
@@ -352,7 +340,19 @@ class MSViewerTab(QMainWindow):
             self.p1_scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3), dtype=np.float32), size=4.0)
             self.p1_scatter.setVisible(False)
             self.p1_3d.addItem(self.p1_scatter)
-            # No drawn axes and no text labels at all (per the user).
+            # m/z and time labels attached to the ends of their data axes (they
+            # move/rotate WITH the scene, so they always mark the right axis).
+            # Intensity is deliberately not labelled. Positions updated per draw.
+            self.p1_mz_text = self.p1_time_text = None
+            try:
+                self.p1_mz_text = gl.GLTextItem(pos=np.array([1.0, -1.0, -1.0]),
+                                                text="m/z", color=(255, 255, 255, 255))
+                self.p1_time_text = gl.GLTextItem(pos=np.array([-1.0, 1.0, -1.0]),
+                                                  text="time", color=(255, 255, 255, 255))
+                self.p1_3d.addItem(self.p1_mz_text)
+                self.p1_3d.addItem(self.p1_time_text)
+            except Exception:
+                pass
             self.p1_3d_widget = self.p1_3d
         else:
             self.p1_3d = QLabel("3D needs pyqtgraph OpenGL (pip install PyOpenGL)")
@@ -533,6 +533,9 @@ class MSViewerTab(QMainWindow):
         self.p3.getPlotItem().hideButtons()
         self.p3_grid = pg.GraphicsLayoutWidget()
         self.p3_grid.scene().sigMouseClicked.connect(self._on_grid_clicked)
+        # Wheel over a grid cell's y-axis zooms that cell's intensity (handled in
+        # eventFilter); wheel over the plot area zooms m/z (cells are x-only).
+        self.p3_grid.viewport().installEventFilter(self)
         self.p3_stack = QStackedWidget()
         self.p3_stack.addWidget(self.p3)        # 0 = single plot
         self.p3_stack.addWidget(self.p3_grid)   # 1 = charge grid
@@ -722,6 +725,10 @@ class MSViewerTab(QMainWindow):
         matched = [r for r in self.identified_peptides()
                    if r.get("peptide") in peptides or plain_seq(r.get("peptide", "")) in plains]
         self._fill(self.peptide_list, [(r.get("peptide", ""), r) for r in matched])
+        # If the protein resolves to a single peptide, auto-select it (which in
+        # turn may auto-load its single PSM).
+        if len(matched) == 1:
+            self.peptide_list.setCurrentRow(0)
 
     def on_peptide_selected(self):
         items = self.peptide_list.selectedItems()
@@ -737,6 +744,9 @@ class MSViewerTab(QMainWindow):
         # the (potentially huge) mzML until a PSM is explicitly chosen.
         self.psm_rows = [r for r in self.file_psms() if plain_seq(r.get("peptide", "")) == plain]
         self._fill(self.psm_list, [(f"{r.get('scan','')}  {r.get('peptide','')}", r) for r in self.psm_rows])
+        # If there's exactly one PSM, auto-load it instead of making the user pick.
+        if len(self.psm_rows) == 1:
+            self.psm_list.setCurrentRow(0)
 
     def on_psm_selected(self):
         items = self.psm_list.selectedItems()
@@ -1086,6 +1096,9 @@ class MSViewerTab(QMainWindow):
         if self.window is not None:
             mz_min, mz_max, rt_start, rt_end = self.window
         view = (mz >= mz_min) & (mz <= mz_max) & (rt >= rt_start) & (rt <= rt_end)
+        # Honour the noise toggle: drop points not in any distribution when off.
+        if not self.use_noise() and self._assigned is not None and self._assigned.any():
+            view &= self._assigned
         mz, rt, inten, base = mz[view], rt[view], inten[view], base[view]
         if mz.size == 0:
             self.p1_scatter.setVisible(False)
@@ -1123,6 +1136,14 @@ class MSViewerTab(QMainWindow):
         y = ((rt - rt_start) / rt_span * 2 - 1).astype(np.float32)
         z = (tnorm * 2 - 1).astype(np.float32)
         pos = np.column_stack([x, y, z]).astype(np.float32)
+        # Pin the axis labels to the ends of their axes (baseline plane z=-1).
+        try:
+            if self.p1_mz_text is not None:
+                self.p1_mz_text.setData(pos=np.array([aspect * 1.04, -1.0, -1.0]), text="m/z")
+            if self.p1_time_text is not None:
+                self.p1_time_text.setData(pos=np.array([-aspect * 1.04, 1.06, -1.0]), text="time")
+        except Exception:
+            pass
         try:
             self.p1_scatter.setData(pos=pos, color=colors, size=4.0)
             self.p1_scatter.setVisible(True)
@@ -1403,6 +1424,10 @@ class MSViewerTab(QMainWindow):
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
     # by both panel 1 (2D) and panel 3.
     def eventFilter(self, obj, event):
+        if obj is self.p3_grid.viewport() and event.type() == QEvent.Wheel:
+            if self._grid_axis_wheel(event):
+                return True
+            return super().eventFilter(obj, event)
         target = None
         if obj is self.p1_2d.viewport():
             target = self.p1_2d
@@ -1594,10 +1619,15 @@ class MSViewerTab(QMainWindow):
         fg = palette(self.theme)["fg"]
 
         def cell(ri, ci):
-            p = self.p3_grid.addPlot(row=ri, col=ci,
-                                     axisItems={"left": ThreeTickAxis(orientation="left")})
+            p = self.p3_grid.addPlot(row=ri, col=ci)
             p.showGrid(x=True, y=True, alpha=0.2)
             p.hideButtons()
+            vb = p.getViewBox()
+            # In-plot drag/scroll zooms the m/z (x) axis only; intensity (y) is
+            # zoomed by scrolling over the y-axis (handled in eventFilter).
+            vb.setMouseEnabled(x=True, y=False)
+            if ri in self.GRID_ZERO_ROWS:
+                vb.setLimits(yMin=0)   # baseline can never separate from 0
             left = p.getAxis("left"); bottom = p.getAxis("bottom")
             for ax in (left, bottom):
                 ax.setPen(pg.mkPen(fg)); ax.setTextPen(pg.mkPen(fg))
@@ -1605,13 +1635,16 @@ class MSViewerTab(QMainWindow):
             if ri == 0:
                 p.setTitle(f"z={charges[ci]}", color=fg)
             if ci == 0:
-                # Only the left-most column carries the row-name label + y values;
-                # give it room so the numbers don't overlap the label.
                 p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
-                left.setWidth(64)
-            else:
-                left.setStyle(showValues=False)   # declutter inner columns
-                left.setWidth(8)
+            left.setWidth(54)
+            # Every cell shows exactly 3 y ticks (bottom / middle / top of its
+            # current range), updated live as the range changes.
+            def _ticks(_=None, ax=left, vb=vb):
+                (y0, y1) = vb.viewRange()[1]
+                mid = (y0 + y1) / 2.0
+                ax.setTicks([[(y0, f"{y0:.3g}"), (mid, f"{mid:.3g}"), (y1, f"{y1:.3g}")]])
+            vb.sigYRangeChanged.connect(_ticks)
+            p._tick_updater = _ticks
             self._grid_cells[(ri, ci)] = p
             return p
 
@@ -1747,6 +1780,9 @@ class MSViewerTab(QMainWindow):
         # one-frame flicker through the wrong auto-fit.
         self._fit_grid_cols()
         self._fit_grid_rows()
+        for p in self._grid_cells.values():
+            if hasattr(p, "_tick_updater"):
+                p._tick_updater()
 
     # Non-negative bar rows glued to a 0 baseline (peak area, cross-charge,
     # intensity sum %): y starts at 0 at the bottom, like the MS2 spectrum.
@@ -1837,6 +1873,30 @@ class MSViewerTab(QMainWindow):
                     lo -= 1.0; hi += 1.0
                 pad = (hi - lo) * 0.08
                 master.getViewBox().setYRange(lo - pad, hi + pad, padding=0)
+
+    def _grid_axis_wheel(self, event):
+        """Wheel over a grid cell's left (y) axis zooms that cell's intensity.
+        For the 0-baseline rows the bottom stays pinned at 0 (only the top moves,
+        so it 'goes down' rather than zooming symmetrically)."""
+        try:
+            scene_pos = self.p3_grid.mapToScene(event.position().toPoint())
+        except Exception:
+            return False
+        factor = 0.85 if event.angleDelta().y() > 0 else 1.0 / 0.85
+        for (ri, ci), p in getattr(self, "_grid_cells", {}).items():
+            ax = p.getAxis("left")
+            if not ax.isVisible() or not ax.sceneBoundingRect().contains(scene_pos):
+                continue
+            vb = p.getViewBox()
+            (y0, y1) = vb.viewRange()[1]
+            if ri in self.GRID_ZERO_ROWS:
+                vb.setYRange(0.0, max(y1 * factor, 1e-12), padding=0)
+            else:
+                c = (y0 + y1) / 2.0
+                h = (y1 - y0) / 2.0 * factor
+                vb.setYRange(c - h, c + h, padding=0)
+            return True
+        return False
 
     def reset_charge_grid_zoom(self):
         # Deterministic reset (same as the initial fit): no flicker/oscillation.
