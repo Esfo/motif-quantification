@@ -1529,6 +1529,15 @@ class MSViewerTab(QMainWindow):
 
         proton = isotopes.proton
         cols = {c: i for i, c in enumerate(charges)}
+        # One opaque base colour per charge (its distribution colour). Rows that
+        # compare against other charges (cross-charge, ppm error) colour their
+        # bars by the OTHER charge's colour, like the reference `cols[nc]`.
+        charge_color = {
+            c: (self.distribution_color(group[c]["distribution"]["distribution_id"])
+                if group[c].get("distribution") else DIST_PALETTE[cols[c] % len(DIST_PALETTE)])
+            for c in charges
+        }
+        BAR_W = 0.03   # uniform bar width (m/z units) for the single-series rows
 
         # Per-charge arrays (sorted by isotope index).
         masses, intens, areas, bases = {}, {}, {}, {}
@@ -1589,8 +1598,7 @@ class MSViewerTab(QMainWindow):
             cint = intens[c]
             carea = areas[c]
             cbase = bases[c]
-            color = self.distribution_color(group[c]["distribution"]["distribution_id"]) \
-                if group[c].get("distribution") else DIST_PALETTE[ci % len(DIST_PALETTE)]
+            color = charge_color[c]
 
             try:
                 # Row 0: retention time -- raw points (m/z vs rt) per line. Other
@@ -1606,25 +1614,31 @@ class MSViewerTab(QMainWindow):
                         if m.any():
                             o = np.argsort(cpoints["rt"][m])
                             p0.plot(cpoints["mz"][m][o], cpoints["rt"][m][o],
-                                    pen=pg.mkPen(*color, width=1))
+                                    pen=pg.mkPen(*color, width=1.5))
                             p0.addItem(pg.ScatterPlotItem(x=cpoints["mz"][m], y=cpoints["rt"][m],
-                                                          size=3, pen=None, brush=pg.mkBrush(*color)))
+                                                          size=4, pen=None, brush=pg.mkBrush(*color)))
 
                 # Row 1: peak area (log).
                 p1 = cell(1, ci)
                 p1.setLogMode(y=True)
                 if cmz.size:
-                    p1.addItem(pg.BarGraphItem(x=cmz, height=np.maximum(carea, 1e-9), width=0.02, brush=color))
+                    p1.addItem(pg.BarGraphItem(x=cmz, height=np.maximum(carea, 1e-9),
+                                               width=BAR_W, brush=pg.mkBrush(*color)))
 
                 # Row 2: charge distances = diff(mz) * charge.
                 p2 = cell(2, ci)
                 if cmz.size > 1:
                     mids = cmz[:-1] + np.diff(cmz) / 2
-                    p2.addItem(pg.BarGraphItem(x=mids, height=np.diff(cmz) * c, width=0.02, brush=color))
+                    p2.addItem(pg.BarGraphItem(x=mids, height=np.diff(cmz) * c,
+                                               width=BAR_W, brush=pg.mkBrush(*color)))
 
                 # Row 3: cross-charge intensity ratios vs every other charge (log).
+                # Each bar is coloured by the OTHER charge it compares to (ref
+                # cols[nc]); bars are sub-divided so they sit side-by-side.
                 p3 = cell(3, ci)
                 p3.setLogMode(y=True)
+                nch = len(charges)
+                subw = BAR_W / max(nch, 1)
                 for nc in charges:
                     ai, bi, size = self._align(cbase, bases[nc])
                     if size <= 0:
@@ -1632,11 +1646,9 @@ class MSViewerTab(QMainWindow):
                     denom = cint[ai:ai + size]
                     ratio = np.divide(intens[nc][bi:bi + size], denom,
                                       out=np.ones(size), where=denom > 0)
-                    bx = cmz[ai:ai + size] + 0.004 * cols[nc]
-                    # Use THIS charge's colour for all its bars (full opacity), so
-                    # the column reads as one colour matching its row-0 plot.
+                    bx = cmz[ai:ai + size] + (cols[nc] - (nch - 1) / 2.0) * subw
                     p3.addItem(pg.BarGraphItem(x=bx, height=np.maximum(ratio, 1e-9),
-                                               width=0.004, brush=pg.mkBrush(*color)))
+                                               width=subw, brush=pg.mkBrush(*charge_color[nc])))
 
                 # Row 4: intensity sum % (log).
                 p4 = cell(4, ci)
@@ -1645,7 +1657,7 @@ class MSViewerTab(QMainWindow):
                 if n:
                     denom = np.where(intsums[:n] > 0, intsums[:n], 1.0)
                     p4.addItem(pg.BarGraphItem(x=cmz[:n], height=np.maximum(cint[:n] / denom, 1e-9),
-                                               width=0.02, brush=color))
+                                               width=BAR_W, brush=pg.mkBrush(*color)))
 
                 # Row 5: adjacency = signed adjacent intensity ratios (symlog-ish).
                 p5 = cell(5, ci)
@@ -1655,32 +1667,33 @@ class MSViewerTab(QMainWindow):
                     cr[~np.isfinite(cr)] = 0
                     cr[cr < 1] = -1.0 / np.where(cr[cr < 1] == 0, 1, cr[cr < 1])
                     mids = cmz[:-1] + np.diff(cmz) / 2
-                    p5.addItem(pg.BarGraphItem(x=mids, height=cr, width=0.02, brush=color))
+                    p5.addItem(pg.BarGraphItem(x=mids, height=cr, width=BAR_W, brush=pg.mkBrush(*color)))
 
-                # Row 6: ppm of base mass to cross-charge mean.
+                # Row 6: ppm of base mass to cross-charge mean (own colour).
                 p6 = cell(6, ci)
                 ai, bi, size = self._align(cbase, arraymeans)
                 if size > 0:
                     base = cbase[ai:ai + size]
                     mean = arraymeans[bi:bi + size]
                     ppm = (mean - base) / np.where(base == 0, 1, base) * 1e6
-                    p6.addItem(pg.BarGraphItem(x=cmz[ai:ai + size], height=ppm, width=0.02, brush=color))
+                    p6.addItem(pg.BarGraphItem(x=cmz[ai:ai + size], height=ppm,
+                                               width=BAR_W, brush=pg.mkBrush(*color)))
 
-                # Row 7: ppm error of base mass vs each other charge's base mass.
+                # Row 7: ppm error vs each other charge's base mass, coloured by
+                # the OTHER charge (ref cols[nc]); bars sub-divided side-by-side.
                 p7 = cell(7, ci)
-                bn = 0.0
-                for nc in charges:
-                    if nc == c:
-                        continue
+                others = [nc for nc in charges if nc != c]
+                subw7 = BAR_W / max(len(others), 1)
+                for k, nc in enumerate(others):
                     ai, bi, size = self._align(cbase, bases[nc])
                     if size <= 0:
                         continue
                     base = cbase[ai:ai + size]
                     other = bases[nc][bi:bi + size]
                     ppm = (other - base) / np.where(other == 0, 1, other) * 1e6
-                    p7.addItem(pg.BarGraphItem(x=cmz[ai:ai + size] + bn, height=ppm, width=0.003,
-                                               brush=pg.mkBrush(*color)))
-                    bn += 0.004
+                    bx = cmz[ai:ai + size] + (k - (len(others) - 1) / 2.0) * subw7
+                    p7.addItem(pg.BarGraphItem(x=bx, height=ppm,
+                                               width=subw7, brush=pg.mkBrush(*charge_color[nc])))
             except Exception as exc:
                 # one bad column shouldn't blank the whole grid
                 import traceback
@@ -1791,7 +1804,12 @@ class MSViewerTab(QMainWindow):
             if allv.size == 0:
                 continue
             if ri in self.GRID_LOG_ROWS:
-                pos = allv[allv > 0]
+                # Ignore the tiny 1e-9 padding used for empty/zero bars, which
+                # otherwise stretched the log axis down to 1e-9 and squashed the
+                # real data into a sliver at the top.
+                pos = allv[allv > 1e-7]
+                if pos.size == 0:
+                    pos = allv[allv > 0]
                 if pos.size == 0:
                     continue
                 lo, hi = np.log10(pos.min()), np.log10(pos.max())
