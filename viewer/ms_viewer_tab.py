@@ -556,6 +556,16 @@ class MSViewerTab(QMainWindow):
         self.p1_loading = QLabel("")
         self.p1_loading.setStyleSheet("color: black;")
 
+        # Charge-search arrows: right-aligned, to the right of "align 3D".
+        self.charge_prev_btn = QPushButton("◀")
+        self.charge_prev_btn.setFixedWidth(28)
+        self.charge_prev_btn.setToolTip("charge search: one charge lower at the same RT")
+        self.charge_prev_btn.clicked.connect(lambda: self.charge_step(-1))
+        self.charge_next_btn = QPushButton("▶")
+        self.charge_next_btn.setFixedWidth(28)
+        self.charge_next_btn.setToolTip("charge search: one charge higher at the same RT")
+        self.charge_next_btn.clicked.connect(lambda: self.charge_step(1))
+
         bar = QHBoxLayout()
         bar.addWidget(self.dim_toggle)
         bar.addWidget(self.source_toggle)
@@ -565,6 +575,9 @@ class MSViewerTab(QMainWindow):
         bar.addSpacing(8)
         bar.addWidget(self.p1_loading)
         bar.addStretch(1)
+        bar.addWidget(QLabel("charge"))
+        bar.addWidget(self.charge_prev_btn)
+        bar.addWidget(self.charge_next_btn)
 
         # Hide pyqtgraph's in-plot auto-range "A" button: fit-to-data makes no
         # sense for the window-driven panels and it kept overlapping the data.
@@ -2125,26 +2138,33 @@ class MSViewerTab(QMainWindow):
             if ri == 0:
                 p.setTitle(f"z={charges[ci]}", color=fg)
 
-            # Y axis: only the leftmost column shows values (always >= 2), every
-            # other column links its y-range to it and hides its own labels.
+            # Y axis: EVERY column reserves the same axis width so all columns
+            # (and their plots) are exactly equal; only the leftmost shows values.
+            left.setWidth(60)
             if ci == 0:
                 row_first[ri] = p
-                left.setWidth(66)
                 p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
+                # Ticks are inset from the view edges (pyqtgraph clips edge labels,
+                # which is why only one value showed). 2 values (top, middle) for a
+                # zero-baseline bar row; 3 (top, middle, bottom) otherwise.
+                zero = ri in self.GRID_ZERO_ROWS
 
-                def _ticks(*_args, ax=left, vb=vb):
+                def _ticks(*_args, ax=left, vb=vb, zero=zero):
                     (y0, y1) = vb.viewRange()[1]
-                    mid = (y0 + y1) / 2.0
-                    ticks = [(y1, _gtick(y1)), (y0, _gtick(y0))]   # >= 2 values
-                    if abs(mid - y0) > 1e-9 and abs(mid - y1) > 1e-9:
-                        ticks.append((mid, _gtick(mid)))
+                    span = y1 - y0
+                    if span <= 0:
+                        return
+                    top = y0 + 0.92 * span
+                    mid = y0 + 0.50 * span
+                    ticks = [(top, _gtick(top)), (mid, _gtick(mid))]
+                    if not zero:
+                        ticks.append((y0 + 0.08 * span, _gtick(y0 + 0.08 * span)))
                     ax.setTicks([ticks])
 
                 vb.sigYRangeChanged.connect(_ticks)
                 p._tick_updater = _ticks
             else:
-                left.setStyle(showValues=False)
-                left.setWidth(8)            # reclaim horizontal space
+                left.setStyle(showValues=False)   # width kept = 60 for equal columns
                 if ri in row_first:
                     p.setYLink(row_first[ri])
 
