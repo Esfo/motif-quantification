@@ -41,6 +41,26 @@ class Config:
     line_mz_ppm: float = 8.0
     line_mz_abs: float = 0.002
     max_gap_scans: int = 2
+    # History-weighted death counter (ported from the reference line model's
+    # `linedeletioncounter`/`deadsignal`): a line's miss counter halves on every
+    # match and the line is closed only after it exceeds `deadsignal`, so an
+    # established trace survives brief dropouts instead of dying on a fixed gap.
+    deadsignal: int = 3
+
+    # Fragment merge — restores the reference line model's line-correction stage
+    # (examples/linemodel.py:358-500). After streaming, closed traces that agree
+    # in m/z and have NON-OVERLAPPING (time-non-redundant) scan ranges within
+    # `line_merge_gap_scans` are stitched back into one continuous line. The
+    # non-redundancy guard is what prevents merging two genuinely coeluting
+    # neighbours (which would share scan indices).
+    line_merge_mz_ppm: float = 10.0
+    line_merge_mz_abs: float = 0.004
+    line_merge_gap_scans: int = 6
+
+    # split_trace only splits a continuous line into multiple features when a
+    # genuine valley separates two apices (valley < fraction * smaller apex);
+    # shallow dips on a single elution peak are kept as one feature.
+    min_split_valley_fraction: float = 0.5
 
     min_trace_points: int = 4
     peak_mindist: int = 2
@@ -180,6 +200,8 @@ class LineModel:
     def __init__(self, config):
         self.config = config
         self.active = {}
+        self.misses = {}
+        self.closed_traces = []
         self.next_line_id = 0
         self.next_feature_id = 0
         self.lines = []
@@ -196,6 +218,8 @@ class LineModel:
         intensities = np.asarray(intensities, dtype=np.float64).reshape(-1)
 
         if mzs.size == 0:
+            for line_id in self.active:
+                self.misses[line_id] = self.misses.get(line_id, 0) + 1
             self.close_dead_lines(ms1_index)
             return
 
@@ -216,6 +240,8 @@ class LineModel:
         else:
             active_mz = np.empty(0, dtype=np.float64)
 
+        active_at_start = set(int(line_id) for line_id in active_ids.tolist())
+        matched_existing = set()
         used_lines = set()
 
         for mz_value, intensity in zip(mzs, intensities):
@@ -239,7 +265,7 @@ class LineModel:
                     trace = self.active[line_id]
                     gap = ms1_index - trace.last_scan
 
-                    if gap < 1 or gap > self.config.max_gap_scans + 1:
+                    if gap < 1 or gap > self.config.deadsignal + 1:
                         continue
 
                     score = abs(trace.mean_mz - mz_value) / tolerance + gap * 0.03
@@ -252,42 +278,148 @@ class LineModel:
                 line_id = self.next_line_id
                 self.next_line_id += 1
                 self.active[line_id] = Trace.create(line_id, ms1_index, rt, mz_value, intensity)
+                self.misses[line_id] = 0
                 used_lines.add(line_id)
             else:
                 self.active[best_line_id].append(ms1_index, rt, mz_value, intensity)
+                matched_existing.add(best_line_id)
                 used_lines.add(best_line_id)
+
+        # History-weighted death: halve the miss counter on a match, increment it
+        # on a miss. Lines created this scan are excluded (not in active_at_start).
+        for line_id in active_at_start:
+            if line_id in matched_existing:
+                self.misses[line_id] //= 2
+            else:
+                self.misses[line_id] = self.misses.get(line_id, 0) + 1
 
         self.close_dead_lines(ms1_index)
 
     def close_dead_lines(self, ms1_index):
-        dead = []
-
-        for line_id, trace in self.active.items():
-            if ms1_index - trace.last_scan > self.config.max_gap_scans:
-                dead.append(line_id)
+        # Close on the history-weighted miss counter rather than a fixed gap.
+        # Closed traces are buffered (not emitted) so the fragment-merge pass can
+        # see them all together.
+        dead = [
+            line_id
+            for line_id, trace in self.active.items()
+            if self.misses.get(line_id, 0) > self.config.deadsignal
+        ]
 
         for line_id in dead:
             trace = self.active.pop(line_id)
-            self.finalize_trace(trace)
+            self.misses.pop(line_id, None)
+            self.closed_traces.append(trace)
 
     def close_all(self):
         for line_id in sorted(self.active):
-            self.finalize_trace(self.active[line_id])
+            self.closed_traces.append(self.active[line_id])
 
         self.active.clear()
+        self.misses.clear()
+        self.merge_and_emit()
 
-    def finalize_trace(self, trace):
-        if len(trace.scans) < self.config.min_trace_points:
+    def merge_and_emit(self):
+        # Restores the reference line model's line-correction stage: stitch
+        # fragments of the same line back together, then emit continuous lines.
+        fragments = []
+
+        for trace in self.closed_traces:
+            scans = np.asarray(trace.scans, dtype=np.int64)
+
+            if scans.size == 0:
+                continue
+
+            order = np.argsort(scans)
+            scans = scans[order]
+
+            fragments.append(
+                {
+                    "scans": scans,
+                    "rts": np.asarray(trace.rts, dtype=np.float64)[order],
+                    "mzs": np.asarray(trace.mzs, dtype=np.float64)[order],
+                    "intensities": np.asarray(trace.intensities, dtype=np.float64)[order],
+                    "mean_mz": float(trace.mean_mz),
+                    "start": int(scans[0]),
+                    "end": int(scans[-1]),
+                    "scanset": set(int(s) for s in scans.tolist()),
+                }
+            )
+
+        fragments.sort(key=lambda f: (f["start"], f["mean_mz"]))
+
+        for line_id, chain in enumerate(self.chain_fragments(fragments)):
+            scans = np.concatenate([f["scans"] for f in chain])
+            rts = np.concatenate([f["rts"] for f in chain])
+            mzs = np.concatenate([f["mzs"] for f in chain])
+            intensities = np.concatenate([f["intensities"] for f in chain])
+
+            order = np.argsort(scans)
+            self.emit_line(line_id, scans[order], rts[order], mzs[order], intensities[order])
+
+    def chain_fragments(self, fragments):
+        # A second nearest-neighbour pass, but over whole fragments: link a
+        # fragment to an open chain when their m/z agree within tolerance, their
+        # scan ranges do not overlap (time-non-redundant), and the gap between
+        # them is within line_merge_gap_scans. Fragments sorted by start scan, so
+        # a chain that falls too far behind can never be extended again.
+        gap = self.config.line_merge_gap_scans
+        chains = []
+        active = []
+
+        for fragment in fragments:
+            tolerance = max(
+                self.config.line_merge_mz_abs,
+                fragment["mean_mz"] * self.config.line_merge_mz_ppm / 1_000_000.0,
+            )
+
+            best_chain = None
+            best_distance = math.inf
+
+            for chain in active:
+                if fragment["start"] - chain["end"] > gap:
+                    continue
+
+                if fragment["start"] <= chain["end"] and not chain["scanset"].isdisjoint(
+                    fragment["scanset"]
+                ):
+                    continue
+
+                distance = abs(chain["mean_mz"] - fragment["mean_mz"])
+
+                if distance <= tolerance and distance < best_distance:
+                    best_distance = distance
+                    best_chain = chain
+
+            if best_chain is None:
+                chain = {
+                    "mean_mz": fragment["mean_mz"],
+                    "end": fragment["end"],
+                    "n": int(fragment["scans"].size),
+                    "scanset": set(fragment["scanset"]),
+                    "fragments": [fragment],
+                }
+                chains.append(chain)
+                active.append(chain)
+            else:
+                n0 = best_chain["n"]
+                n1 = int(fragment["scans"].size)
+                best_chain["mean_mz"] = (best_chain["mean_mz"] * n0 + fragment["mean_mz"] * n1) / (n0 + n1)
+                best_chain["n"] = n0 + n1
+                best_chain["end"] = max(best_chain["end"], fragment["end"])
+                best_chain["scanset"].update(fragment["scanset"])
+                best_chain["fragments"].append(fragment)
+
+            active = [c for c in active if fragment["start"] - c["end"] <= gap]
+
+        return [chain["fragments"] for chain in chains]
+
+    def emit_line(self, line_id, scans, rts, mzs, intensities):
+        if scans.size < self.config.min_trace_points:
             return
-
-        scans = np.asarray(trace.scans, dtype=np.int32)
-        rts = np.asarray(trace.rts, dtype=np.float64)
-        mzs = np.asarray(trace.mzs, dtype=np.float64)
-        intensities = np.asarray(trace.intensities, dtype=np.float64)
 
         self.lines.append(
             {
-                "line_id": trace.line_id,
+                "line_id": int(line_id),
                 "mz_mean": float(mzs.mean()),
                 "mz_min": float(mzs.min()),
                 "mz_max": float(mzs.max()),
@@ -299,7 +431,7 @@ class LineModel:
             }
         )
 
-        self.split_trace(trace.line_id, scans, rts, mzs, intensities)
+        self.split_trace(int(line_id), scans, rts, mzs, intensities)
 
     def split_trace(self, line_id, scans, rts, mzs, intensities):
         if intensities.size < self.config.min_trace_points:
@@ -352,6 +484,31 @@ class LineModel:
             candidate_peaks = candidate_peaks[: self.config.max_trace_peaks]
 
         candidate_peaks.sort(key=lambda x: x[1])
+
+        # Merge adjacent candidate peaks that are not separated by a real valley.
+        # Two apices stay split only if the lowest point between them drops below
+        # min_split_valley_fraction * the smaller apex; otherwise the dip is noise
+        # on one continuous elution peak and they become a single feature.
+        if self.config.min_split_valley_fraction > 0 and len(candidate_peaks) > 1:
+            merged_peaks = [list(candidate_peaks[0])]
+
+            for apex_height, left, apex, right in candidate_peaks[1:]:
+                prev_height, prev_left, prev_apex, prev_right = merged_peaks[-1]
+                lo = min(prev_apex, apex)
+                hi = max(prev_apex, apex)
+                valley = float(intensities[lo:hi + 1].min()) if hi > lo else min(prev_height, apex_height)
+                threshold = self.config.min_split_valley_fraction * min(prev_height, apex_height)
+
+                if valley >= threshold:
+                    if apex_height >= prev_height:
+                        keep_height, keep_apex = apex_height, apex
+                    else:
+                        keep_height, keep_apex = prev_height, prev_apex
+                    merged_peaks[-1] = [keep_height, prev_left, keep_apex, max(prev_right, right)]
+                else:
+                    merged_peaks.append([apex_height, left, apex, right])
+
+            candidate_peaks = [tuple(peak) for peak in merged_peaks]
 
         for _, left, apex, right in candidate_peaks:
             sub_scans = scans[left:right]
@@ -1162,6 +1319,11 @@ def make_config(args):
         line_mz_ppm=args.line_mz_ppm,
         line_mz_abs=args.line_mz_abs,
         max_gap_scans=args.max_gap_scans,
+        deadsignal=args.deadsignal,
+        line_merge_mz_ppm=args.line_merge_mz_ppm,
+        line_merge_mz_abs=args.line_merge_mz_abs,
+        line_merge_gap_scans=args.line_merge_gap_scans,
+        min_split_valley_fraction=args.min_split_valley_fraction,
         min_trace_points=args.min_trace_points,
         peak_mindist=args.peak_mindist,
         smooth_points=args.smooth_points,
@@ -1384,6 +1546,11 @@ def parse_args():
     parser.add_argument("--line-mz-ppm", type=float, default=8.0)
     parser.add_argument("--line-mz-abs", type=float, default=0.002)
     parser.add_argument("--max-gap-scans", type=int, default=2)
+    parser.add_argument("--deadsignal", type=int, default=3)
+    parser.add_argument("--line-merge-mz-ppm", type=float, default=10.0)
+    parser.add_argument("--line-merge-mz-abs", type=float, default=0.004)
+    parser.add_argument("--line-merge-gap-scans", type=int, default=6)
+    parser.add_argument("--min-split-valley-fraction", type=float, default=0.5)
 
     parser.add_argument("--min-trace-points", type=int, default=4)
     parser.add_argument("--peak-mindist", type=int, default=2)
