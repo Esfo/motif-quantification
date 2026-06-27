@@ -215,6 +215,12 @@ class MSViewerTab(QMainWindow):
         self.build_table1_dock()
         self.build_table2_dock()
         self.arrange_default()
+        # Panes are resize-only: not movable, floatable, or closable. The user
+        # can still drag the splitter edges between them to resize, but can't
+        # rearrange/float them out of the layout.
+        for dock in (self.dock_lists, self.dock_panel1, self.dock_panel2,
+                     self.dock_panel3, self.dock_table1, self.dock_table2):
+            dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self._default_state = self.saveState()
         self.apply_theme(theme)
         # Table 2 is MS2-only: hidden until the user clicks an MS2 point, so the
@@ -421,6 +427,7 @@ class MSViewerTab(QMainWindow):
                                           pen=pg.mkPen(255, 170, 50, 255, width=3))
         self.ms2_plot.addItem(self.ms2_curve)
         self.ms2_plot.scene().sigMouseClicked.connect(self._on_ms2_strip_clicked)
+        self._ms2_all = []      # all loaded MS2 scans; filtered to the view below
 
         # Panel 2: m/z on x (aligned with panel 1), RT on y.
         self.p2 = pg.PlotWidget()
@@ -445,6 +452,16 @@ class MSViewerTab(QMainWindow):
         # No in-plot auto-range "A" buttons (they overlapped the data).
         self.p2.getPlotItem().hideButtons()
         self.ms2_plot.getPlotItem().hideButtons()
+
+        # Star marker on panel 2 showing a hovered MS2 scan's (m/z, RT) location,
+        # same colour as the MS2 strip. Re-added after each p2.clear (draw_panel2).
+        self.p2_ms2_star = pg.ScatterPlotItem(size=16, symbol="star",
+                                              brush=pg.mkBrush(255, 170, 50, 255),
+                                              pen=pg.mkPen(255, 170, 50, 255))
+        self.p2_ms2_star.setZValue(30)
+        self.p2.addItem(self.p2_ms2_star)
+        # Hover over the MS2 strip -> show that scan's star on panel 2.
+        self.ms2_plot.scene().sigMouseMoved.connect(self._on_ms2_hover)
 
         # MS2 strip shares panel 2's RT (y) axis.
         self.ms2_plot.setYLink(self.p2)
@@ -799,6 +816,8 @@ class MSViewerTab(QMainWindow):
         self.window = [mz0, mz1, max(0.0, rt0), rt1]
         # Inverse-scale the point sizes so dots stay visible as you zoom in.
         self._rescale_points()
+        # Keep the MS2 strip in sync with what's visible in panel 2.
+        self._refresh_ms2_visible()
         # The big "data disappears on zoom" fix: we extract a PADDED region and
         # cache it. Zooming/panning *within* that cached region is a pure view
         # operation -- no re-extraction (which is what used to come back empty
@@ -1101,6 +1120,7 @@ class MSViewerTab(QMainWindow):
         # distribution and opens its MS1 panel 3.
         self.p2.clear()
         self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
+        self.p2.addItem(self.p2_ms2_star)   # survives clear; empty until hover
         if not isinstance(points, dict) or points["mz"].size == 0:
             return
         mz = points["mz"]
@@ -1162,10 +1182,32 @@ class MSViewerTab(QMainWindow):
                              getattr(self, "_last_scan_int", None))
 
     def draw_ms2_strip(self, ms2):
-        # MS2 scans as fixed-width horizontal lines (one NaN-separated curve),
-        # spanning the strip's x (0..1) at each RT. RT (y) is shared with panel 2.
-        scans = sorted(((m["rt"], m) for m in ms2 if m.get("rt") is not None),
-                       key=lambda t: t[0])
+        # Keep every loaded MS2 scan; the strip only shows the ones whose RT *and*
+        # precursor m/z fall inside panel 2's current view (so it tracks zoom and
+        # doesn't show "tons" of scans whose precursor isn't even on screen).
+        self._ms2_all = [m for m in ms2 if m.get("rt") is not None]
+        self._refresh_ms2_visible()
+
+    def _refresh_ms2_visible(self):
+        """Filter the loaded MS2 scans to panel 2's current m/z x RT view and
+        redraw the strip lines."""
+        if not hasattr(self, "ms2_curve"):
+            return
+        try:
+            (mz0, mz1) = self.p2.getViewBox().viewRange()[0]
+            (rt0, rt1) = self.p2.getViewBox().viewRange()[1]
+        except Exception:
+            mz0, mz1, rt0, rt1 = -np.inf, np.inf, -np.inf, np.inf
+        visible = []
+        for m in self._ms2_all:
+            rt = m.get("rt"); pmz = m.get("mz")
+            if rt is None or not (rt0 <= rt <= rt1):
+                continue
+            # If we know the precursor m/z, require it inside the view too.
+            if pmz is not None and not (mz0 <= pmz <= mz1):
+                continue
+            visible.append(m)
+        scans = sorted(((m["rt"], m) for m in visible), key=lambda t: t[0])
         self._ms2_scans = scans
         xs, ys = [], []
         for rt, _ in scans:
@@ -1173,6 +1215,29 @@ class MSViewerTab(QMainWindow):
             ys += [rt, rt, np.nan]
         self.ms2_curve.setData(np.array(xs, dtype=float), np.array(ys, dtype=float))
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
+
+    def _on_ms2_hover(self, scene_pos):
+        """Hovering an MS2 line on the strip puts a star at its (m/z, RT) on
+        panel 2 (same colour as the strip)."""
+        if not self._ms2_scans:
+            self.p2_ms2_star.setData([])
+            return
+        try:
+            vb = self.ms2_plot.getViewBox()
+            if not vb.sceneBoundingRect().contains(scene_pos):
+                self.p2_ms2_star.setData([])
+                return
+            y = vb.mapSceneToView(scene_pos).y()
+            (y0, y1) = vb.viewRange()[1]
+        except Exception:
+            return
+        rt_arr = np.array([rt for rt, _ in self._ms2_scans])
+        i = int(np.argmin(np.abs(rt_arr - y)))
+        scan = self._ms2_scans[i][1]
+        if abs(rt_arr[i] - y) <= max(abs(y1 - y0) * 0.03, 1e-4) and scan.get("mz") is not None:
+            self.p2_ms2_star.setData([{"pos": (scan["mz"], scan["rt"])}])
+        else:
+            self.p2_ms2_star.setData([])
 
     def _on_ms2_strip_clicked(self, event):
         """Click anywhere on the MS2 strip -> select the nearest MS2 line by RT."""
@@ -1212,6 +1277,9 @@ class MSViewerTab(QMainWindow):
             self.p3_stack.setCurrentIndex(0)
             plot_spectrum(self.p3, mz, inten,
                           title=f"MS2  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
+            # Ground the baseline at 0 (no gap below the sticks).
+            top = float(np.max(inten)) * 1.05 if len(inten) else 1.0
+            self.p3.getViewBox().setYRange(0.0, top, padding=0)
             self.p3_title.setText(
                 f"MS2 scan {scan.get('number','')}  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
             self.populate_table2(scan)
@@ -1552,9 +1620,9 @@ class MSViewerTab(QMainWindow):
                 c = self._grid_cells.get((ri, ci))
                 if c is not None:
                     c.setXLink(top)
-        # Each ROW shares one y (intensity/metric) axis -> link every column to
-        # the left-most cell so the single left y-axis represents the whole row,
-        # aligned and synchronised across charges. Double-click resets all.
+        # Each ROW shares one y axis (matplotlib sharey='row'): link every column
+        # to the left-most cell, which is the only one showing values, so the left
+        # y-axis represents the whole row.
         for ri in range(len(self.CHARGE_ROW_LABELS)):
             left = self._grid_cells.get((ri, 0))
             if left is None:
@@ -1563,10 +1631,68 @@ class MSViewerTab(QMainWindow):
                 c = self._grid_cells.get((ri, ci))
                 if c is not None:
                     c.setYLink(left)
+        self._grid_ncols = len(charges)
+        self._fit_grid_rows()
+
+    # Rows drawn on a log y-scale (peak area, cross-charge, intensity sum %).
+    GRID_LOG_ROWS = {1, 3, 4}
+
+    @staticmethod
+    def _grid_item_yvals(plotitem):
+        vals = []
+        for it in plotitem.items:
+            if isinstance(it, pg.BarGraphItem):
+                h = it.opts.get("height")
+                if h is not None:
+                    vals.append(np.asarray(h, dtype=float).ravel())
+            else:
+                yd = getattr(it, "yData", None)
+                if yd is not None and len(yd):
+                    vals.append(np.asarray(yd, dtype=float).ravel())
+        return vals
+
+    def _fit_grid_rows(self):
+        """Fit each row's y-axis to the UNION of all its columns' data, applied to
+        the left (master) cell that the others are y-linked to. This is why both
+        ppm rows (positive AND negative values) now fit on screen, and it's
+        deterministic so double-click doesn't oscillate between two auto-fits."""
+        for ri in range(len(self.CHARGE_ROW_LABELS)):
+            master = self._grid_cells.get((ri, 0))
+            if master is None:
+                continue
+            vals = []
+            for ci in range(getattr(self, "_grid_ncols", 0)):
+                p = self._grid_cells.get((ri, ci))
+                if p is not None:
+                    vals += self._grid_item_yvals(p)
+            if not vals:
+                continue
+            allv = np.concatenate(vals)
+            allv = allv[np.isfinite(allv)]
+            if allv.size == 0:
+                continue
+            if ri in self.GRID_LOG_ROWS:
+                pos = allv[allv > 0]
+                if pos.size == 0:
+                    continue
+                lo, hi = np.log10(pos.min()), np.log10(pos.max())
+                if hi - lo < 1e-6:
+                    lo -= 0.5; hi += 0.5
+                pad = (hi - lo) * 0.05
+            else:
+                lo, hi = float(allv.min()), float(allv.max())
+                if hi - lo < 1e-9:
+                    lo -= 1.0; hi += 1.0
+                pad = (hi - lo) * 0.08
+            master.getViewBox().setYRange(lo - pad, hi + pad, padding=0)
 
     def reset_charge_grid_zoom(self):
-        for cellplot in getattr(self, "_grid_cells", {}).values():
-            cellplot.enableAutoRange()
+        # Deterministic reset: autorange x on each column master, re-fit y rows.
+        for ci in range(getattr(self, "_grid_ncols", 0)):
+            top = self._grid_cells.get((0, ci))
+            if top is not None:
+                top.getViewBox().enableAutoRange(axis=top.getViewBox().XAxis)
+        self._fit_grid_rows()
 
     def _on_grid_clicked(self, event):
         if event.double():

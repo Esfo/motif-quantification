@@ -81,7 +81,7 @@ data the pipeline produces. The four founding goals:
 
 ## 1.1 Dock layout & panes
 - ⬜ A **default pane setup**; provide a **"reset to default" pane** option that returns to this default.
-- ✅ Panes are **completely movable and resizable**: Ctrl+click+drag to move, drag edges/corners to resize.
+- ✅ Panes are **resize-only** (per the user): drag the splitter edges to resize, but they can **no longer be moved, floated, re-docked, or closed** (all docks set to `NoDockWidgetFeatures`), so the layout can't be accidentally torn apart.
 - ✅ Layout **auto-saves** and **remembers the user's prior personalization** for next launch (geometry + dock state).
 - ✅ Window geometry persists; opening a file no longer resets the layout. **Bug fixed:** `app.py` was calling `window.resize(1600×950)` *after* the saved geometry was restored, clobbering it every launch — it now only applies the default size when nothing was restored, and the dock layout is re-applied once on first `showEvent` (a restore before the first show was being discarded as the nested tab settled).
 - Default arrangement: left = the 3 lists; middle column = Panel 1 (top) / Panel 2 (mid) / Table 1 (below Panel 2); right column = Panel 3 (with Table 2 below it when MS2). ✅ structure, ⬜ "reset to default" exactly matching this.
@@ -125,7 +125,9 @@ data the pipeline produces. The four founding goals:
 
 ## 1.5 MS2 strip (left of Panel 2)
 - ✅ A **tall thin plot just to the left of Panel 2**. It shares Panel 2's **time (y) axis** and is **the sole RT ruler** for the row: Panel 2's own left axis is value-less, so the two RT axes **can never overlap** and this left strip is always visible.
-- ✅ MS2 scans shown as **horizontal lines/bands that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.**
+- ✅ MS2 scans shown as **horizontal lines that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.**
+- ✅ The strip **only shows MS2 scans visible within Panel 2's current view** — RT *and* precursor-m/z both inside the view (`_refresh_ms2_visible`, updated on every zoom/pan). This fixes the "tons of MS2 lines" (it was showing every scan in the padded RT range regardless of precursor m/z).
+- ✅ **Hovering** an MS2 line places a **star at its (m/z, RT) location on Panel 2**, in the same orange as the strip, so you can see where that scan's precursor sits in the map.
 - ✅ **Bug fixed:** the MS2 RT lines are now **solid horizontal lines** (one NaN-separated `PlotCurveItem`, fixed **3 px** width) spanning the strip at each RT. Fixed-pixel width keeps them **always visible and a consistent size at any zoom** (they never collapse to dots or vanish); zooming in just **spreads them apart** so individual scans become distinguishable. (The earlier data-space `LinearRegionItem` bands resized inconsistently across reloads — replaced.) Selection = **click anywhere on the strip → nearest line by RT**.
 
 ## 1.6 Distribution & line selection + coloring
@@ -161,6 +163,8 @@ data the pipeline produces. The four founding goals:
 - 🟡 When an **MS1 distribution** is clicked, Panel 3 shows the plot from `examples/panel-3-plot.py`: the **charge-state-determination grid** that **links multiple distributions (charge states of one analyte) into one plot of many comparisons** — columns = charge states, **8 rows**: retention time / peak area / charge distances / cross-charge / intensity sum % / adjacency / ppm-to-mean / ppm-error.
   - ✅ Each **row shares one y-axis across all charge columns** (y-linked + aligned to the left-most cell, which is the only one showing values), so the single left y-axis represents the whole row; columns stay x-linked per charge.
   - ✅ The **retention-time row now plots for every charge** (incl. the left-most): each charge's raw points are read from the store over that charge's own m/z×RT span (`_features_points`, cached) instead of relying on the panel-1 window, which only covered the selected charge.
+  - ✅ Each row's y-axis now **fits the UNION of all its columns' data** (applied to the left/master cell the others are y-linked to), so the **ppm-to-mean and ppm-error rows show their full positive+negative range** instead of running off-screen. **Double-click reset is deterministic** now (re-fits to those union ranges + autoranges x per column) — no more oscillating between two auto-fits.
+  - Faithful check (`panel-3-plot.py`): `sharey='row'` + `sharex='col'` confirmed; the **cross-charge row's offset/overlapping bars are faithful** — the reference plots a bar per other-charge ratio offset by `diffgen*nc`, so the columns intentionally sit side-by-side. (Inner-column y values are hidden to reduce the clutter.)
   - 🟡 grid renders; ⬜ make it **faithful to `panel-3-plot.py`** (per-row scales — peak-area log, charge-distance ylim, cross-charge log, intensity-sum% log, adjacency symlog; the white-on-gray styling adapted to theme; spine hiding; per-column titles `z(distid)`); ⬜ fix colors/readability.
 - ⬜ Use **`descending_partial_products` (`libraryadditions.py` / `isotopes.py`)** to compute the **expected isotopic distribution of the peptide** if a peptide is being viewed and found via the search, and **twin-plot** it with the experimental on **different x-axes**, scaled so the **theoretically-most-abundant isotope and the max experimentally-measured datapoint are at the same height**.
 - ✅ All MS1 Panel 3 plots that **share the mass x-axis are synchronized** when moved; ✅ **double-click resets** them all.
@@ -171,7 +175,7 @@ data the pipeline produces. The four founding goals:
 
 ## 1.11 Panel 3 — MS2 view
 - ✅ **Bug fixed:** clicking an MS2 point now reliably switches Panel 3 to the MS2 spectrum and a `_panel3_mode` flag **keeps it on MS2** across background reloads (was snapping back to MS1).
-- ✅ Panel 3 MS2 is triggered by the user **clicking a sampled MS2 point** on the **left MS2 RT strip** (1.5).
+- ✅ Panel 3 MS2 is triggered by the user **clicking a sampled MS2 point** on the **left MS2 RT strip** (1.5). The MS2 spectrum is **grounded at y=0** (baseline pinned to the bottom of the axis, no gap).
 - ⬜ **MS2 trigger markers live on the left MS2 RT strip only** — per the user, they must **not** sit inside the Panel 2 plot (an earlier Panel-2 red-triangle overlay was wrong and has been removed). Overlaying clickable MS2 points on the 2D/3D Panel 1 is still open but, if added, must follow this same "distinct start-point" rule without cluttering the data plots.
 - ⬜ When an **identified peptide is assigned to that MS2 spectrum OR to the distribution sampled during that MS2 scan** (link the two via the search info if not already linked), **visualize the theoretical distribution of that specific MS1 progenitor**.
 - ⬜ Label the **MS1 progenitor isotopic distribution** and its **fragment isotopic compositions**, labeling the **ions by both type and number** (use `examples/peptidefragmentscoring.py`).
