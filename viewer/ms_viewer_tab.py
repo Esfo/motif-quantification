@@ -340,11 +340,12 @@ class MSViewerTab(QMainWindow):
         # m/z axis is linear and lines up with panel 2. From here the user can
         # orbit to reveal time; "align 3D" returns to exactly this.
         self._p1_3d_fov = 2.0
-        # distance so the data half-height (1.0) exactly fills the view vertically
-        # (intensity 0 at the very bottom, max at the very top); with the data x
-        # half-width set to the pane aspect, m/z then fills the width edge-to-edge
-        # and aligns with panel 2.
-        self._p1_3d_dist = 1.02 / float(np.tan(np.radians(self._p1_3d_fov / 2.0)))
+        # pyqtgraph's fov is the HORIZONTAL field of view, so with the m/z data
+        # mapped to x in [-1, 1] this distance makes m/z fill the pane width
+        # edge-to-edge (aligned with panel 2). Intensity is scaled per-draw to the
+        # pane's height/width so it fills vertically with the baseline at the
+        # bottom. elevation 0 + azimuth -90 = front-on (looks like the 2D plot).
+        self._p1_3d_dist = 1.0 / float(np.tan(np.radians(self._p1_3d_fov / 2.0)))
         self._p1_3d_cam = dict(distance=self._p1_3d_dist, elevation=0.0, azimuth=-90.0)
         if HAVE_GL:
             self.p1_3d = gl.GLViewWidget()
@@ -353,19 +354,6 @@ class MSViewerTab(QMainWindow):
             self.p1_scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3), dtype=np.float32), size=4.0)
             self.p1_scatter.setVisible(False)
             self.p1_3d.addItem(self.p1_scatter)
-            # m/z and time labels attached to the ends of their data axes (they
-            # move/rotate WITH the scene, so they always mark the right axis).
-            # Intensity is deliberately not labelled. Positions updated per draw.
-            self.p1_mz_text = self.p1_time_text = None
-            try:
-                self.p1_mz_text = gl.GLTextItem(pos=np.array([1.0, -1.0, -1.0]),
-                                                text="m/z", color=(255, 255, 255, 255))
-                self.p1_time_text = gl.GLTextItem(pos=np.array([-1.0, 1.0, -1.0]),
-                                                  text="time", color=(255, 255, 255, 255))
-                self.p1_3d.addItem(self.p1_mz_text)
-                self.p1_3d.addItem(self.p1_time_text)
-            except Exception:
-                pass
             # Left spacer = the strip width, so the 3D content starts at the same
             # screen x as panel 2's plot (and panel 1's 2D plot), keeping m/z
             # aligned across all three.
@@ -1145,29 +1133,22 @@ class MSViewerTab(QMainWindow):
         rgb = base * (1.0 - t) + np.float32(1.0) * t
         colors = np.column_stack([rgb, np.ones(rgb.shape[0], dtype=np.float32)]).astype(np.float32)
 
-        # m/z -> GL-x (aspect-scaled to fill the pane width, aligned with panel 2),
-        # time -> GL-y, intensity -> GL-z mapped to [-1, +1] so intensity 0 sits at
-        # the BOTTOM (z=-1) like the 2D plot's baseline and the max at the top.
+        # m/z -> GL-x in [-1, 1] (fills the pane width, aligned with panel 2),
+        # time -> GL-y (depth), intensity -> GL-z. With fov being horizontal, the
+        # visible vertical half-extent is (height/width), so scale intensity to
+        # that so it fills the pane height with the 0 baseline at the bottom.
         mz_span = max(mz_max - mz_min, 1e-6)
         rt_span = max(rt_end - rt_start, 1e-6)
         try:
-            aspect = max(self.p1_3d.width() / max(self.p1_3d.height(), 1), 0.2)
+            vh = max(self.p1_3d.height(), 1) / max(self.p1_3d.width(), 1)
         except Exception:
-            aspect = 1.0
-        x = (((mz - mz_min) / mz_span * 2 - 1) * aspect).astype(np.float32)
+            vh = 1.0
+        x = ((mz - mz_min) / mz_span * 2 - 1).astype(np.float32)
         y = ((rt - rt_start) / rt_span * 2 - 1).astype(np.float32)
-        z = (tnorm * 2 - 1).astype(np.float32)
+        # baseline (tnorm=0) -> -vh (bottom), peak (tnorm=1) -> ~+vh (top), with a
+        # little headroom so the tallest peak isn't clipped at the very top.
+        z = ((tnorm * 1.9 - 1.0) * vh).astype(np.float32)
         pos = np.column_stack([x, y, z]).astype(np.float32)
-        # Labels at the MIDDLE of each axis on the baseline plane (z=-1): m/z runs
-        # along x so its label is centred at x=0; time runs along y so its label
-        # is centred at y=0 on the left edge.
-        try:
-            if self.p1_mz_text is not None:
-                self.p1_mz_text.setData(pos=np.array([0.0, -1.0, -1.0]), text="m/z")
-            if self.p1_time_text is not None:
-                self.p1_time_text.setData(pos=np.array([-aspect, 0.0, -1.0]), text="time")
-        except Exception:
-            pass
         try:
             self.p1_scatter.setData(pos=pos, color=colors, size=4.0)
             self.p1_scatter.setVisible(True)
@@ -1822,6 +1803,15 @@ class MSViewerTab(QMainWindow):
                 if c is not None:
                     c.setYLink(left)
         self._grid_ncols = len(charges)
+        # Force every charge column to the SAME width (equal stretch), so no
+        # column's plots are wider than another's.
+        try:
+            glayout = self.p3_grid.ci.layout
+            for ci in range(len(charges)):
+                glayout.setColumnStretchFactor(ci, 1)
+                glayout.setColumnPreferredWidth(ci, 0)
+        except Exception:
+            pass
         # Fit synchronously from the items' data (no deferred pass), so the grid
         # opens directly in the right state -- the deferred reset was causing a
         # one-frame flicker through the wrong auto-fit.

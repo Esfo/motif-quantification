@@ -1,4 +1,6 @@
+import queue
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -258,6 +260,68 @@ class MzmlStore:
             "traces": [np.asarray(trace, dtype=np.float64) for trace in traces],
         }
 
+    # ---- parallel scan reading -------------------------------------------
+
+    def _read_scans(self, summaries, workers=4):
+        """Read (rt, mz_array, intensity_array) for each summary CONCURRENTLY.
+
+        The per-scan cost is dominated by base64+zlib decoding, which releases
+        the GIL, so a thread pool with independent readers (one open file handle
+        each) genuinely parallelises it. Returns a list aligned to ``summaries``;
+        entries are (rt, None, None) for scans that couldn't be read. Falls back
+        to a single serial reader if the pool can't be built.
+        """
+        summaries = list(summaries)
+        if not summaries:
+            return []
+        n = min(workers, len(summaries))
+
+        # Lazy pool of independent readers (each its own file handle), reused
+        # across calls so the index is only built once per reader.
+        if not hasattr(self, "_reader_pool"):
+            self._reader_pool = queue.Queue()
+            self._reader_pool_size = 0
+            self._read_executor = None
+        while self._reader_pool_size < n:
+            try:
+                self._reader_pool.put(mzml.MzML(str(self.path), dtype=np.float64, use_index=True))
+                self._reader_pool_size += 1
+            except Exception:
+                break
+
+        if self._reader_pool_size == 0:
+            # Fall back to the single shared reader, serially.
+            reader = self.data_reader()
+            out = []
+            for s in summaries:
+                try:
+                    scan = reader.get_by_id(s.spectrum_id)
+                    if scan is None:
+                        out.append((s.rt, None, None))
+                    else:
+                        mza, inten = scan_arrays(scan)
+                        out.append((s.rt, mza, inten))
+                except Exception:
+                    out.append((s.rt, None, None))
+            return out
+
+        def work(summary):
+            reader = self._reader_pool.get()
+            try:
+                scan = reader.get_by_id(summary.spectrum_id)
+                if scan is None:
+                    return (summary.rt, None, None)
+                mza, inten = scan_arrays(scan)
+                return (summary.rt, mza, inten)
+            except Exception:
+                return (summary.rt, None, None)
+            finally:
+                self._reader_pool.put(reader)
+
+        if self._read_executor is None:
+            self._read_executor = ThreadPoolExecutor(max_workers=max(1, self._reader_pool_size))
+        return list(self._read_executor.map(work, summaries))
+
     def extract_region(
         self,
         mz_min,
@@ -287,15 +351,9 @@ class MzmlStore:
         rts = []
         rows = []
 
-        reader = self.data_reader()
-
-        for summary in self.ms1_in_rt(rt_start, rt_end):
-            scan = reader.get_by_id(summary.spectrum_id)
-
-            if scan is None:
+        for rt, mza, inten in self._read_scans(self.ms1_in_rt(rt_start, rt_end)):
+            if mza is None:
                 continue
-
-            mza, inten = scan_arrays(scan)
 
             if mza.size:
                 keep = (mza >= mz_min) & (mza <= mz_max)
@@ -315,7 +373,7 @@ class MzmlStore:
                     idx = np.clip(np.searchsorted(edges, mza, side="right") - 1, 0, mz_bins - 1)
                     np.maximum.at(row, idx, inten)
 
-            rts.append(summary.rt)
+            rts.append(rt)
             rows.append(row)
 
         if rows:
@@ -336,15 +394,10 @@ class MzmlStore:
         binned or averaged -- so panel 1 can show every point of a line in 2D
         (m/z vs intensity) and 3D (m/z, rt, intensity).
         """
-        reader = self.data_reader()
         mzs, rts, intens = [], [], []
 
-        for summary in self.ms1_in_rt(rt_start, rt_end):
-            scan = reader.get_by_id(summary.spectrum_id)
-            if scan is None:
-                continue
-            mza, inten = scan_arrays(scan)
-            if mza.size == 0:
+        for rt, mza, inten in self._read_scans(self.ms1_in_rt(rt_start, rt_end)):
+            if mza is None or mza.size == 0:
                 continue
             keep = (mza >= mz_min) & (mza <= mz_max)
             if not keep.any():
@@ -352,7 +405,7 @@ class MzmlStore:
             kept_mz = mza[keep]
             mzs.append(kept_mz)
             intens.append(inten[keep])
-            rts.append(np.full(kept_mz.size, summary.rt, dtype=np.float64))
+            rts.append(np.full(kept_mz.size, rt, dtype=np.float64))
 
         if mzs:
             return {
