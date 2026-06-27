@@ -15,9 +15,33 @@ pub struct ScanRow {
     pub n_points: i64,
 }
 
+/// One scan's centroids, zlib-compressed little-endian f32 arrays, so the GUI
+/// can pull a window's raw points straight from sqlite instead of re-decoding
+/// the mzML (Option B).
+pub struct ScanPoints {
+    pub ms1_index: i64,
+    pub n: i64,
+    pub mz_blob: Vec<u8>,
+    pub intensity_blob: Vec<u8>,
+}
+
+pub fn compress_f32(values: &[f32]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(&bytes).expect("zlib write");
+    enc.finish().expect("zlib finish")
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS parameters (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS scans (ms1_index INTEGER PRIMARY KEY, spectrum_index INTEGER NOT NULL, scan_id TEXT NOT NULL, rt REAL NOT NULL, tic REAL NOT NULL, n_points INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS scan_points (ms1_index INTEGER PRIMARY KEY, n INTEGER NOT NULL, mz BLOB NOT NULL, intensity BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS lines (line_id INTEGER PRIMARY KEY, mz_mean REAL NOT NULL, mz_min REAL NOT NULL, mz_max REAL NOT NULL, rt_start REAL NOT NULL, rt_end REAL NOT NULL, ms1_start INTEGER NOT NULL, ms1_end INTEGER NOT NULL, n_points INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS features (feature_id INTEGER PRIMARY KEY, line_id INTEGER NOT NULL, mz_mean REAL NOT NULL, mz_min REAL NOT NULL, mz_max REAL NOT NULL, rt_start REAL NOT NULL, rt_apex REAL NOT NULL, rt_end REAL NOT NULL, ms1_start INTEGER NOT NULL, ms1_apex INTEGER NOT NULL, ms1_end INTEGER NOT NULL, height REAL NOT NULL, area REAL NOT NULL, n_points INTEGER NOT NULL, quality REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS distributions (distribution_id INTEGER PRIMARY KEY, charge INTEGER NOT NULL, neutral_mass REAL NOT NULL, mono_mz REAL NOT NULL, rt_start REAL NOT NULL, rt_apex REAL NOT NULL, rt_end REAL NOT NULL, ms1_start INTEGER NOT NULL, ms1_apex INTEGER NOT NULL, ms1_end INTEGER NOT NULL, n_members INTEGER NOT NULL, score REAL NOT NULL, quality REAL NOT NULL);
@@ -59,6 +83,7 @@ pub fn write_db(
     features: &[FeatureRow],
     dists: &[DistRow],
     analytes: &[AnalyteRow],
+    points: &[ScanPoints],
 ) -> Result<()> {
     if overwrite && std::path::Path::new(path).exists() {
         std::fs::remove_file(path)?;
@@ -78,6 +103,10 @@ pub fn write_db(
         let mut s = tx.prepare("INSERT INTO scans(ms1_index,spectrum_index,scan_id,rt,tic,n_points) VALUES (?,?,?,?,?,?)")?;
         for r in scans {
             s.execute(params![r.ms1_index, r.spectrum_index, r.scan_id, r.rt, r.tic, r.n_points])?;
+        }
+        let mut s = tx.prepare("INSERT INTO scan_points(ms1_index,n,mz,intensity) VALUES (?,?,?,?)")?;
+        for p in points {
+            s.execute(params![p.ms1_index, p.n, p.mz_blob, p.intensity_blob])?;
         }
         let mut s = tx.prepare("INSERT INTO lines(line_id,mz_mean,mz_min,mz_max,rt_start,rt_end,ms1_start,ms1_end,n_points) VALUES (?,?,?,?,?,?,?,?,?)")?;
         for r in lines {

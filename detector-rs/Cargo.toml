@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 mzdata = "0.65"
+flate2 = "1"
 
 [profile.release]
 opt-level = 3

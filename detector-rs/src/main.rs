@@ -14,7 +14,7 @@ mod store;
 use config::Config;
 use distributions::{build_analytes, build_distributions, build_edges, Features};
 use linemodel::LineModel;
-use store::{write_db, ScanRow};
+use store::{compress_f32, write_db, ScanPoints, ScanRow};
 
 #[derive(Parser, Debug)]
 #[command(about = "MS1 distribution detector (Rust port of distributions/index_ms1.py)")]
@@ -30,6 +30,11 @@ struct Args {
     threads: usize,
     #[arg(long, default_value_t = 500)]
     progress: i64,
+    /// Store per-scan centroids in the sqlite (scan_points) so the GUI reads raw
+    /// points from the db instead of re-decoding the mzML. --store-points=false
+    /// keeps the sqlite small.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    store_points: bool,
 }
 
 fn main() -> Result<()> {
@@ -45,6 +50,7 @@ fn main() -> Result<()> {
     let cfg = Config::default();
     let mut model = LineModel::new(cfg.clone());
     let mut scans: Vec<ScanRow> = Vec::new();
+    let mut points: Vec<ScanPoints> = Vec::new();
 
     let t_line = Instant::now();
     let reader = MzMLReader::open_path(&args.mzml)?;
@@ -79,6 +85,16 @@ fn main() -> Result<()> {
             tic,
             n_points: mzs.len() as i64,
         });
+        if args.store_points {
+            let mz_f32: Vec<f32> = mzs.iter().map(|v| *v as f32).collect();
+            let int_f32: Vec<f32> = ints.iter().map(|v| *v as f32).collect();
+            points.push(ScanPoints {
+                ms1_index,
+                n: mzs.len() as i64,
+                mz_blob: compress_f32(&mz_f32),
+                intensity_blob: compress_f32(&int_f32),
+            });
+        }
         model.process_scan(ms1_index, rt, &mzs, &ints);
         if args.progress > 0 && ms1_index > 0 && ms1_index % args.progress == 0 {
             eprintln!("scans={ms1_index} active+closed (streaming)");
@@ -114,7 +130,7 @@ fn main() -> Result<()> {
             ),
         ),
     ];
-    write_db(&args.out, args.overwrite, &params, &scans, &model.lines, &model.features, &dists, &analytes)?;
+    write_db(&args.out, args.overwrite, &params, &scans, &model.lines, &model.features, &dists, &analytes, &points)?;
     let write_secs = t_write.elapsed().as_secs_f64();
 
     let total = started.elapsed().as_secs_f64();
