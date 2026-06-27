@@ -83,6 +83,10 @@ class Config:
     max_apex_shift_width_fraction: float = 0.50
     min_edge_score: float = 0.30
     min_distribution_members: int = 2
+    # A 1+ distribution is weak evidence: two coeluting traces ~1.0033 m/z apart
+    # are extremely common in a dense MS1 map. Require more isotope peaks for 1+
+    # than for higher charges so random pairs do not become fake 1+ envelopes.
+    min_members_charge_one: int = 3
 
     charge_mass_ppm: float = 12.0
     min_charge_group_rt_score: float = 0.10
@@ -1049,7 +1053,13 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
             path = tentative
             current = next_feature_id
 
-        if len(path) < config_dict["min_distribution_members"]:
+        min_members = (
+            config_dict["min_members_charge_one"]
+            if charge == 1
+            else config_dict["min_distribution_members"]
+        )
+
+        if len(path) < min_members:
             continue
 
         key = (charge, tuple(path))
@@ -1390,6 +1400,7 @@ def make_config(args):
         max_apex_shift_width_fraction=args.max_apex_shift_width_fraction,
         min_edge_score=args.min_edge_score,
         min_distribution_members=args.min_distribution_members,
+        min_members_charge_one=args.min_members_charge_one,
         charge_mass_ppm=args.charge_mass_ppm,
         min_charge_group_rt_score=args.min_charge_group_rt_score,
         charge_tolerance=args.charge_tolerance,
@@ -1624,6 +1635,7 @@ def parse_args():
     parser.add_argument("--max-apex-shift-width-fraction", type=float, default=0.50)
     parser.add_argument("--min-edge-score", type=float, default=0.30)
     parser.add_argument("--min-distribution-members", type=int, default=2)
+    parser.add_argument("--min-members-charge-one", type=int, default=3)
 
     parser.add_argument("--charge-mass-ppm", type=float, default=12.0)
     parser.add_argument("--min-charge-group-rt-score", type=float, default=0.10)
