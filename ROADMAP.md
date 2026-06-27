@@ -17,6 +17,7 @@ Status legend: ✅ done · 🟡 partial · ⬜ todo.
 | `examples/chargehandling.py` | Distribution generation — **stage 3**, charge-state grouping into analytes |
 | `examples/peptidefragmentscoring.py` | **MS2** fragment isotopic distributions (b/y ion compositions, fragment descending-products, ion scoring) |
 | `examples/libraryadditions.py` | **MS1** peptide isotopic distributions (`descending_partial_products`) |
+| `examples/sequencecoverageconcept.py` | **Panel 3 MS2 sequence coverage** + **Table 2** coverage concept (which residues each matched ion covers, the coverage/divider-string logic). **NOT Tab 2's protein coverage — that is a different concept.** ⬜ *file to be added by the user* |
 
 The faithful reference algorithm is the authority for the pipeline; the active
 `distributions/index_ms1.py` must be made to reproduce it (keeping the sqlite output).
@@ -191,15 +192,15 @@ data the pipeline produces. The four founding goals:
 - ⬜ When an **identified peptide is assigned to that MS2 spectrum OR to the distribution sampled during that MS2 scan** (link the two via the search info if not already linked), **visualize the theoretical distribution of that specific MS1 progenitor**.
 - ⬜ Label the **MS1 progenitor isotopic distribution** and its **fragment isotopic compositions**, labeling the **ions by both type and number** (use `examples/peptidefragmentscoring.py`).
 - ⬜ Below the MS2 plot: **sequence coverage** of the peptide (the coverage/divider-string logic —
-  `coverage_print`-style). **DEFERRED**: the sequence-coverage reference is not yet in `examples/`;
-  on hold until the user adds it.
+  `coverage_print`-style), per **`examples/sequencecoverageconcept.py`** (reference to be added by the
+  user). This is the **MS2 fragment coverage**, distinct from Tab 2's protein coverage.
 - ⬜ **Table 2** (only appears below Panel 3 when MS2): the **other peptides this MS1 distribution
   could have matched to** (the other candidate PSMs) **with their relevant sequence coverage**, so
   the user can judge whether one peptide is distinguishable from another. Optional panel. 🟡 dock +
   candidate listing exists, and **Table 2 now only appears when Panel 3 is in MS2 mode** (hidden for
-  MS1 so the MS1 view takes the full space); ⬜ "could-have-matched" candidate logic. **Sequence
-  coverage is deferred** — the user has not yet added the sequence-coverage reference to `examples/`,
-  so the coverage column/string (here and in 1.11) is on hold until that reference lands.
+  MS1 so the MS1 view takes the full space); ⬜ "could-have-matched" candidate logic; ⬜ the **coverage
+  column** per **`examples/sequencecoverageconcept.py`** (reference to be added by the user) — the MS2
+  fragment coverage concept, **distinct from Tab 2's protein coverage**.
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).

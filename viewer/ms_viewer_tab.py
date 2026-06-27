@@ -581,6 +581,7 @@ class MSViewerTab(QMainWindow):
         self.table1.setHorizontalHeaderLabels([h for _, h in LINE_METRIC_COLUMNS])
         self.table1.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table1.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table1.verticalHeader().setVisible(False)   # no 1,2,3 index column
 
         dock = QDockWidget("Table 1 - distribution lines", self)
         dock.setObjectName("dock_table1")
@@ -595,6 +596,7 @@ class MSViewerTab(QMainWindow):
         self.table2.setColumnCount(len(cols))
         self.table2.setHorizontalHeaderLabels(cols)
         self.table2.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table2.verticalHeader().setVisible(False)   # no 1,2,3 index column
         dock = QDockWidget("Table 2 - MS2 candidates", self)
         dock.setObjectName("dock_table2")
         dock.setWidget(self.table2)
