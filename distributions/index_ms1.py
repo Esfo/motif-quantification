@@ -57,10 +57,14 @@ class Config:
     line_merge_mz_abs: float = 0.004
     line_merge_gap_scans: int = 6
 
-    # Optional post-merge of peaks that axis_peaks resolved: combine two apices
-    # only when no real valley separates them. DEFAULT 0.0 = disabled, so the
-    # existing peak picker (peaks.axis_peaks) is authoritative and we never merge
-    # two peaks it deliberately kept separate. Set > 0 to re-enable.
+    # Lines are emitted whole by default; only a line whose RT span exceeds
+    # mean + line_split_sigma * sigma (over all line spans) is run through the
+    # peak finder and split into separate features. This splits the occasional
+    # too-long line (really two distributions) without chopping up normal lines.
+    line_split_sigma: float = 3.0
+    # Optional post-merge of peaks that axis_peaks resolved (only used when a line
+    # IS split): combine two apices when no real valley separates them. DEFAULT
+    # 0.0 = disabled, so axis_peaks is authoritative.
     min_split_valley_fraction: float = 0.0
 
     min_trace_points: int = 4
@@ -379,18 +383,48 @@ class LineModel:
                 flush=True,
             )
 
-        for line_id, chain in enumerate(chains):
+        # Materialise the merged lines, then emit each WHOLE (one line -> one
+        # feature) -- the peak finder is NOT run on every line. Only an
+        # abnormally long line (RT span beyond mean + line_split_sigma * sigma of
+        # all line spans) is run through axis_peaks and split into separate
+        # features, which is how a single too-long line that is really two
+        # distributions gets separated before distributions are built.
+        materialised = []
+
+        for chain in chains:
             scans = np.concatenate([f["scans"] for f in chain])
             rts = np.concatenate([f["rts"] for f in chain])
             mzs = np.concatenate([f["mzs"] for f in chain])
             intensities = np.concatenate([f["intensities"] for f in chain])
 
             order = np.argsort(scans)
-            self.emit_line(line_id, scans[order], rts[order], mzs[order], intensities[order])
+            scans, rts, mzs, intensities = scans[order], rts[order], mzs[order], intensities[order]
+
+            if scans.size < self.config.min_trace_points:
+                continue
+
+            materialised.append((scans, rts, mzs, intensities))
+
+        if materialised:
+            spans = np.array([rts[-1] - rts[0] for (_, rts, _, _) in materialised])
+            split_threshold = float(spans.mean() + self.config.line_split_sigma * spans.std())
+        else:
+            split_threshold = math.inf
+
+        if self.progress:
+            print(
+                f"merge_stage lines={len(materialised)} split_threshold_rt={split_threshold:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        for line_id, (scans, rts, mzs, intensities) in enumerate(materialised):
+            span = float(rts[-1] - rts[0])
+            self.emit_line(line_id, scans, rts, mzs, intensities, do_split=span > split_threshold)
 
             if self.progress and line_id > 0 and line_id % 20000 == 0:
                 print(
-                    f"emit lines={line_id}/{len(chains)} features={len(self.features)}",
+                    f"emit lines={line_id}/{len(materialised)} features={len(self.features)}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -478,10 +512,7 @@ class LineModel:
 
         return [chain["fragments"] for chain in chains]
 
-    def emit_line(self, line_id, scans, rts, mzs, intensities):
-        if scans.size < self.config.min_trace_points:
-            return
-
+    def emit_line(self, line_id, scans, rts, mzs, intensities, do_split=False):
         self.lines.append(
             {
                 "line_id": int(line_id),
@@ -496,7 +527,51 @@ class LineModel:
             }
         )
 
-        self.split_trace(int(line_id), scans, rts, mzs, intensities)
+        if do_split:
+            # Abnormally long line: let the peak finder break it into pieces.
+            self.split_trace(int(line_id), scans, rts, mzs, intensities)
+        else:
+            # Normal line: emit it whole as a single feature.
+            self.emit_whole_feature(int(line_id), scans, rts, mzs, intensities)
+
+    def emit_whole_feature(self, line_id, scans, rts, mzs, intensities):
+        if rts.size > 1:
+            area = float(np.trapezoid(intensities, rts))
+        else:
+            area = float(intensities[0])
+
+        height = float(intensities.max())
+        local_apex = int(intensities.argmax())
+        total_intensity = float(intensities.sum())
+
+        if total_intensity > 0:
+            mz_mean = float((mzs * intensities).sum() / total_intensity)
+        else:
+            mz_mean = float(mzs.mean())
+
+        quality = float(np.log1p(max(area, 0.0)) * math.sqrt(scans.size))
+
+        self.features.append(
+            Feature(
+                feature_id=self.next_feature_id,
+                line_id=int(line_id),
+                mz_mean=mz_mean,
+                mz_min=float(mzs.min()),
+                mz_max=float(mzs.max()),
+                rt_start=float(rts.min()),
+                rt_apex=float(rts[local_apex]),
+                rt_end=float(rts.max()),
+                ms1_start=int(scans.min()),
+                ms1_apex=int(scans[local_apex]),
+                ms1_end=int(scans.max()),
+                height=height,
+                area=area,
+                n_points=int(scans.size),
+                quality=quality,
+            )
+        )
+
+        self.next_feature_id += 1
 
     def split_trace(self, line_id, scans, rts, mzs, intensities):
         if intensities.size < self.config.min_trace_points:
@@ -1470,6 +1545,7 @@ def make_config(args):
         line_merge_mz_ppm=args.line_merge_mz_ppm,
         line_merge_mz_abs=args.line_merge_mz_abs,
         line_merge_gap_scans=args.line_merge_gap_scans,
+        line_split_sigma=args.line_split_sigma,
         min_split_valley_fraction=args.min_split_valley_fraction,
         min_trace_points=args.min_trace_points,
         peak_mindist=args.peak_mindist,
@@ -1702,6 +1778,7 @@ def parse_args():
     parser.add_argument("--line-merge-mz-ppm", type=float, default=10.0)
     parser.add_argument("--line-merge-mz-abs", type=float, default=0.004)
     parser.add_argument("--line-merge-gap-scans", type=int, default=6)
+    parser.add_argument("--line-split-sigma", type=float, default=3.0)
     parser.add_argument("--min-split-valley-fraction", type=float, default=0.0)
 
     parser.add_argument("--min-trace-points", type=int, default=4)
