@@ -51,6 +51,12 @@ def build(seed, n_scans):
         plant.append((float(m), 4, 90 + i * 70, 5.0e5, 8, 1.8))
     plant.append((900.0, 1, 120, 4.0e5, 3, 2.0))
 
+    # Faint, short envelopes near the detection floor: real distributions whose
+    # member lines are weak/short, meant to be missed by the strict primary pass
+    # and picked up by the relaxed recovery pass.
+    for i, m in enumerate([1380, 1700, 2050]):
+        plant.append((float(m), 2, 70 + i * 55, 2.2e4, 4, 1.1))
+
     manifest = []
     # scan_index -> list of (mz, intensity)
     peaks_per_scan = [[] for _ in range(n_scans)]

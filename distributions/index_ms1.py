@@ -123,6 +123,15 @@ class Config:
     # (m/z lattice + averagine + trace shape + missing-peak).
     min_trace_similarity: float = 0.5
     min_envelope_score: float = 0.45
+    # Recovery pass: after the strict primary pass, re-run the builder on the
+    # features no distribution claimed, with relaxed gates + a short-trace
+    # coelution fallback, to catch weaker/shorter envelopes. Recovered rows are
+    # tagged status='recovered' (a separate, opt-in confidence tier).
+    enable_recovery: bool = True
+    recover_min_trace_similarity: float = 0.3
+    recover_min_envelope_score: float = 0.30
+    short_trace_len: int = 5
+    short_trace_fallback: bool = False
 
     # Reference (distributionassembly.py) isotope-edge acceptance, ported faithfully:
     # asymmetric acdiff tolerance around proton-spacing, plus intensity-step gating.
@@ -1331,12 +1340,12 @@ def build_distributions(features, traces, config, progress=False):
     upstream but only as a diagnostic table, not as the charge authority.
     """
     try:
-        from .envelope import build_distributions_envelope
+        from .envelope import build_distributions_two_pass
     except ImportError:
-        from envelope import build_distributions_envelope
+        from envelope import build_distributions_two_pass
 
     config_dict = asdict(config)
-    rows = build_distributions_envelope(features, traces, config_dict, progress=progress)
+    rows = build_distributions_two_pass(features, traces, config_dict, progress=progress)
 
     rows.sort(key=lambda row: (row["charge"], row["neutral_mass"], row["rt_apex"], row["mono_mz"]))
 

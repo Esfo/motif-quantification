@@ -68,6 +68,7 @@ class EnvelopeContext:
         self.ms1_end = np.asarray([f.ms1_end for f in features], dtype=np.int64)
         self.height = np.asarray([f.height for f in features], dtype=np.float64)
         self.area = np.asarray([f.area for f in features], dtype=np.float64)
+        self.n_points = np.asarray([f.n_points for f in features], dtype=np.int64)
         self.traces = traces  # list indexed by feature_id: {scans,rts,mzs,intensities}
         self.order = np.argsort(self.mz)
         self.sorted_mz = self.mz[self.order]
@@ -110,6 +111,31 @@ class EnvelopeContext:
         """RT-window overlap gate (cheap pre-filter before trace cosine)."""
         overlap = min(self.rt_end[a], self.rt_end[b]) - max(self.rt_start[a], self.rt_start[b])
         return overlap > 0
+
+    def rt_overlap_ratio(self, a, b):
+        overlap = min(self.rt_end[a], self.rt_end[b]) - max(self.rt_start[a], self.rt_start[b])
+        union = max(self.rt_end[a], self.rt_end[b]) - min(self.rt_start[a], self.rt_start[b])
+        return max(0.0, float(overlap / union)) if union > 0 else 0.0
+
+    def coelution_score(self, a, b):
+        """Membership score for attaching feature b to a's lattice.
+
+        Normally the trace-shape cosine. When short_trace_fallback is on (the
+        recovery pass) and either feature is too short for a reliable cosine, fall
+        back to apex-RT proximity + window overlap and take the better of the two —
+        so a weak/short isotope line that genuinely coelutes is not discarded just
+        because a handful of noisy scans gave it a low cosine.
+        """
+        sim = self.trace_similarity(a, b)
+        if not self.cfg.get("short_trace_fallback", False):
+            return sim
+        if min(int(self.n_points[a]), int(self.n_points[b])) >= self.cfg.get("short_trace_len", 5):
+            return sim
+        apex_gap = abs(self.rt_apex[a] - self.rt_apex[b])
+        width = max(self.rt_end[a] - self.rt_start[a], self.rt_end[b] - self.rt_start[b], 1e-9)
+        prox = max(0.0, 1.0 - apex_gap / width)
+        proximity = 0.5 * prox + 0.5 * self.rt_overlap_ratio(a, b)
+        return max(sim, proximity)
 
     def trace_similarity(self, a, b):
         """Cosine of the two elution traces aligned on shared scans (0..1).
@@ -228,7 +254,7 @@ def grow_lattice(ctx, seed, z):
                     continue
                 if not ctx.coelutes(seed, j):
                     continue
-                sim = ctx.trace_similarity(seed, j)
+                sim = ctx.coelution_score(seed, j)
                 if sim >= best_sim:
                     best_sim = sim
                     best_j = j
@@ -323,7 +349,7 @@ def score_envelope(ctx, occupied, z):
                 continue
             if not ctx.coelutes(fids[0], j):
                 continue
-            if ctx.trace_similarity(fids[0], j) < ctx.cfg.get("min_trace_similarity", 0.5):
+            if ctx.coelution_score(fids[0], j) < ctx.cfg.get("min_trace_similarity", 0.5):
                 continue
             jmz = ctx.mz[j]
             on_lattice = bool(np.any(np.abs(lattice_mzs - jmz) <= ctx.mz_tol(jmz)))
@@ -378,6 +404,47 @@ def min_members_for_charge(charge, cfg):
     if charge == 1:
         return cfg["min_members_charge_one"]
     return cfg["min_distribution_members"]
+
+
+def build_distributions_two_pass(features, traces, config_dict, progress=False):
+    """Primary envelope pass + a relaxed recovery pass on the leftovers.
+
+    The primary pass is unchanged (the clean, high-confidence set). The features
+    no distribution claimed are then re-run through the same builder with relaxed
+    gates (lower trace-similarity and envelope-score floors) and the short-trace
+    coelution fallback, recovering weaker/shorter envelopes that are visually
+    obvious in m/z-vs-RT but too faint for the strict pass. Recovered rows carry
+    status='recovered' so they stay a separate, opt-in confidence tier.
+    """
+    primary = build_distributions_envelope(features, traces, config_dict, progress=progress)
+
+    if not config_dict.get("enable_recovery", True):
+        return primary
+
+    claimed = {m["feature_id"] for row in primary for m in row["members"]}
+    leftover = [i for i in range(len(features)) if i not in claimed]
+    if not leftover:
+        return primary
+
+    sub_features = [features[i] for i in leftover]
+    sub_traces = [traces[i] for i in leftover]
+
+    relaxed = dict(config_dict)
+    relaxed["min_trace_similarity"] = config_dict.get("recover_min_trace_similarity", 0.3)
+    relaxed["min_envelope_score"] = config_dict.get("recover_min_envelope_score", 0.30)
+    relaxed["short_trace_fallback"] = True
+
+    rec_rows = build_distributions_envelope(sub_features, sub_traces, relaxed, progress=progress)
+    for row in rec_rows:
+        row["status"] = "recovered"
+        for m in row["members"]:
+            m["feature_id"] = leftover[m["feature_id"]]  # sub-index -> original feature_id
+
+    if progress:
+        print(f"recovery leftover_features={len(leftover)} recovered={len(rec_rows)}",
+              file=__import__("sys").stderr, flush=True)
+
+    return primary + rec_rows
 
 
 def build_distributions_envelope(features, traces, config_dict, progress=False):
