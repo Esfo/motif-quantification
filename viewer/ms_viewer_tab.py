@@ -287,29 +287,34 @@ class MSViewerTab(QMainWindow):
         self.p1_2d = pg.PlotWidget()
         self.p1_2d.setLabel("bottom", "m/z")
         self.p1_2d.setLabel("left", "intensity")
-        self.p1_2d.setClipToView(True)
-        self.p1_2d.setDownsampling(auto=True, mode="peak")
+        # NOTE: clip-to-view + 'peak' auto-downsampling was culling scatter points
+        # as you zoomed in (they "disappeared"). Disabled so every datapoint stays
+        # drawn at any zoom; the window is bounded so the point count stays sane.
+        self.p1_2d.setClipToView(False)
+        self.p1_2d.setDownsampling(auto=False)
         # 2D panel 1: only the m/z (x) axis is interactive; y stays auto-scaled.
         self.p1_2d.setMouseEnabled(x=True, y=False)
         # Wheel over the y-axis label strip (left of the plot) scrolls intensity.
         self.p1_2d.viewport().installEventFilter(self)
 
-        # "align 3D" = a top-down view that reads like a 2D m/z x time plot, with
-        # m/z running the same direction as panel 2's x axis. Elevation ~90 looks
-        # straight down; the azimuth keeps m/z horizontal/aligned.
-        self._p1_3d_aligned_cam = dict(distance=3.4, elevation=90, azimuth=-90)
+        # Initial 3D orientation: a sensible perspective with m/z running the same
+        # direction as panel 2's x axis (azimuth -90). "align 3D" tips it to a
+        # near-top-down 2D-like view. We deliberately avoid elevation == 90 (a
+        # camera singularity in pyqtgraph that can crash when orbited through it).
+        self._p1_3d_default_cam = dict(distance=3.4, elevation=28, azimuth=-90)
+        self._p1_3d_aligned_cam = dict(distance=3.4, elevation=89.0, azimuth=-90)
         self.p1_3d_mz_label = QLabel("m/z")
         self.p1_3d_time_label = QLabel("time (min)")
         for lbl in (self.p1_3d_mz_label, self.p1_3d_time_label):
             lbl.setAlignment(Qt.AlignCenter)
         if HAVE_GL:
             self.p1_3d = gl.GLViewWidget()
-            self.p1_3d.setCameraPosition(**self._p1_3d_aligned_cam)
+            self.p1_3d.setCameraPosition(**self._p1_3d_default_cam)
             self.p1_surface = gl.GLSurfacePlotItem(
                 x=np.array([0.0, 1.0], dtype=np.float32),
                 y=np.array([0.0, 1.0], dtype=np.float32),
                 z=np.zeros((2, 2), dtype=np.float32),
-                shader="shaded", smooth=True,
+                shader="shaded", smooth=False,   # smooth normals are expensive
             )
             self.p1_surface.setVisible(False)
             self.p1_scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3), dtype=np.float32), size=4.0)
@@ -1026,8 +1031,9 @@ class MSViewerTab(QMainWindow):
 
         if isinstance(points, dict) and points["mz"].size:
             mz = points["mz"]; rt = points["rt"]; inten = points["intensity"]
-            # Cap the scatter so a dense window doesn't make rotation/zoom lag.
-            MAX_3D_POINTS = 12000
+            # Cap the scatter hard so rotating the 3D view stays smooth (a dense
+            # window was lagging the GL view badly on orbit).
+            MAX_3D_POINTS = 5000
             if mz.size > MAX_3D_POINTS:
                 keep = np.argpartition(inten, -MAX_3D_POINTS)[-MAX_3D_POINTS:]
                 mz, rt, inten = mz[keep], rt[keep], inten[keep]
@@ -1632,7 +1638,12 @@ class MSViewerTab(QMainWindow):
                 if c is not None:
                     c.setYLink(left)
         self._grid_ncols = len(charges)
+        # Apply the SAME fit the double-click reset produces, so the grid opens in
+        # the right state instead of needing a manual double-click. Deferred so the
+        # cells have a real geometry/auto-range to start from.
         self._fit_grid_rows()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self.reset_charge_grid_zoom)
 
     # Rows drawn on a log y-scale (peak area, cross-charge, intensity sum %).
     GRID_LOG_ROWS = {1, 3, 4}
