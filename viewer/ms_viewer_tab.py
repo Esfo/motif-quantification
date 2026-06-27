@@ -593,6 +593,7 @@ class MSViewerTab(QMainWindow):
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_panel1")
+        dock.setTitleBarWidget(QWidget())   # drop the empty title bar (dead space)
         dock.setWidget(container)
         self.dock_panel1 = dock
 
@@ -715,6 +716,7 @@ class MSViewerTab(QMainWindow):
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_panel2")
+        dock.setTitleBarWidget(QWidget())   # drop the empty title bar (dead space)
         dock.setWidget(container)
         self.dock_panel2 = dock
 
@@ -756,6 +758,7 @@ class MSViewerTab(QMainWindow):
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_panel3")
+        dock.setTitleBarWidget(QWidget())   # drop the empty title bar (dead space)
         dock.setWidget(container)
         self.dock_panel3 = dock
 
@@ -862,6 +865,9 @@ class MSViewerTab(QMainWindow):
         self.splitDockWidget(self.dock_panel3, self.dock_table2, Qt.Vertical)
         self.resizeDocks([self.dock_lists], [320], Qt.Horizontal)
         self.resizeDocks([self.dock_panel1, self.dock_panel3], [600, 460], Qt.Horizontal)
+        # Give panel 2 the most vertical space (it was leaving dead space).
+        self.resizeDocks([self.dock_panel1, self.dock_panel2, self.dock_table1],
+                         [300, 460, 240], Qt.Vertical)
 
     def reset_layout(self):
         self.restoreState(self._default_state)
@@ -2140,10 +2146,12 @@ class MSViewerTab(QMainWindow):
             if ri == 0:
                 p.setTitle(f"z={charges[ci]}", color=fg)
 
-            # Y axis: EVERY column reserves the same axis width so all columns
-            # (and their plots) are exactly equal; only the leftmost shows values.
-            left.setWidth(54)
+            # Y axis: only the leftmost column carries the axis (labels + values);
+            # the other columns get a ZERO-width axis so there's no empty gap
+            # between plots. Equal stretch over the remaining space keeps the
+            # plots themselves the same width, and the left labels stay put.
             if ci == 0:
+                left.setWidth(54)
                 row_first[ri] = p
                 p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
                 # Ticks are inset from the view edges (pyqtgraph clips edge labels,
@@ -2166,7 +2174,8 @@ class MSViewerTab(QMainWindow):
                 vb.sigYRangeChanged.connect(_ticks)
                 p._tick_updater = _ticks
             else:
-                left.setStyle(showValues=False)   # width kept = 60 for equal columns
+                left.setStyle(showValues=False)
+                left.setWidth(0)                  # no empty axis -> no inter-column gap
                 if ri in row_first:
                     p.setYLink(row_first[ri])
 
