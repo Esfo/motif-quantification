@@ -146,6 +146,38 @@ class EnvelopeContext:
         return sim
 
 
+    def consensus_trace_scores(self, fids):
+        """Build a consensus elution trace and score each member against it.
+
+        A real isotope envelope shares one chromatographic shape, so each member
+        should match the intensity-summed consensus. Returns (scores_per_member,
+        mean_score). This is stronger than matching every member to an arbitrary
+        seed, which could itself be a tail peak.
+        """
+        traces = [self.traces[f] for f in fids]
+        lo = int(min(t["scans"].min() for t in traces))
+        hi = int(max(t["scans"].max() for t in traces))
+        n = hi - lo + 1
+        if n <= 0:
+            return [1.0] * len(fids), 1.0
+        vecs = []
+        consensus = np.zeros(n, dtype=np.float64)
+        for t in traces:
+            v = np.zeros(n, dtype=np.float64)
+            v[t["scans"] - lo] = t["intensities"]
+            vecs.append(v)
+            consensus += v
+        cn = np.linalg.norm(consensus)
+        if cn <= 0:
+            return [1.0] * len(fids), 1.0
+        scores = []
+        for v in vecs:
+            vn = np.linalg.norm(v)
+            scores.append(float(np.dot(v, consensus) / (vn * cn)) if vn > 0 else 0.0)
+        scores = [max(0.0, min(1.0, s)) for s in scores]
+        return scores, float(np.mean(scores))
+
+
 def derive_charges(ctx, seed):
     """Plausible charges for an envelope seeded at `seed`.
 
@@ -256,20 +288,25 @@ def score_envelope(ctx, occupied, z):
         nb = float(np.linalg.norm(pred))
         iso_score = max(0.0, num / (na * nb)) if na > 0 and nb > 0 else 0.0
 
-        # ---- missing-expected-peak penalty ----
+        # ---- missing-expected-peak penalty (detection-aware) ----
+        # An expected rung is only "missing" if it should have been visible:
+        # scale the averagine to the observed members and compare against the
+        # dimmest observed member (a proxy for the local detection floor). A rung
+        # predicted below that floor is below detection and is not penalised.
         present = set(int(i) for i in iso_idx)
+        obs_floor = float(obs_norm.min())
+        pred_full = scale * expected  # expected scaled into observed-norm units
         missing_interior = 0
         for k in range(int(iso_idx.min()), int(iso_idx.max()) + 1):
-            if k not in present and expected[k] > 0.15:
+            if k not in present and pred_full[k] > obs_floor:
                 missing_interior += 1
-        # monoisotope expectation: for low mass M+0 should be visible
-        if 0 not in present and expected[0] > 0.4:
+        # monoisotope expectation: for low mass M+0 should be clearly visible
+        if 0 not in present and pred_full[0] > max(obs_floor, 0.4):
             missing_interior += 1
         missing_score = 1.0 / (1.0 + missing_interior)
 
         # ---- trace-shape consensus ----
-        sims = [ctx.trace_similarity(fids[0], f) for f in fids[1:]]
-        trace_score = float(np.mean(sims)) if sims else 1.0
+        member_trace_scores, trace_score = ctx.consensus_trace_scores(fids)
 
         # ---- interloper penalty (kills decimated aliases) ----
         # A coeluting feature inside the envelope's m/z span that does NOT sit on
@@ -313,6 +350,7 @@ def score_envelope(ctx, occupied, z):
                     "mz_residual": float(resid[i]),
                     "intensity_observed": float(obs_norm[i]),
                     "intensity_expected": float(exp_obs[i]),
+                    "trace_score": float(member_trace_scores[i]),
                 }
                 for i in range(n_obs)
             ]
