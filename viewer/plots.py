@@ -7,9 +7,9 @@ def clear_plot(plot):
     plot.showGrid(x=True, y=True, alpha=0.25)
 
 
-def plot_spectrum(plot, mzs, intensities, title="", mz_label="m/z"):
+def plot_spectrum(plot, mzs, intensities, title="", mz_label="m/z", color=None):
     clear_plot(plot)
-    plot.setTitle(title)
+    plot.setTitle(title, color=color) if color else plot.setTitle(title)
     plot.setLabel("bottom", mz_label)
     plot.setLabel("left", "intensity")
 
@@ -30,7 +30,7 @@ def plot_spectrum(plot, mzs, intensities, title="", mz_label="m/z"):
     y[1::3] = intensities
     y[2::3] = np.nan
 
-    plot.plot(x, y, pen=pg.mkPen(width=1))
+    plot.plot(x, y, pen=pg.mkPen(color or "w", width=1))
 
 
 def plot_points(plot, mzs, intensities, title=""):

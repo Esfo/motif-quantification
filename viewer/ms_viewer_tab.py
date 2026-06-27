@@ -153,6 +153,18 @@ LINE_METRIC_COLUMNS = [
 ]
 
 
+class ThreeTickAxis(pg.AxisItem):
+    """Y axis that always shows exactly three ticks (bottom, middle, top) of the
+    current range, so the charge-grid rows stay legible instead of cluttered.
+    Updates dynamically because pyqtgraph calls tickValues with the live range."""
+
+    def tickValues(self, minVal, maxVal, size):
+        if not np.isfinite(minVal) or not np.isfinite(maxVal) or maxVal <= minVal:
+            return [(1.0, [minVal])]
+        mid = (minVal + maxVal) / 2.0
+        return [((maxVal - minVal) / 2.0, [minVal, mid, maxVal])]
+
+
 def fixed_toggle(off_text, on_text, width=70):
     """A two-state button whose label flips but whose size never changes."""
     button = QPushButton(off_text)
@@ -301,11 +313,12 @@ class MSViewerTab(QMainWindow):
         # direction as panel 2's x axis (azimuth -90). "align 3D" tips it to a
         # near-top-down 2D-like view. We deliberately avoid elevation == 90 (a
         # camera singularity in pyqtgraph that can crash when orbited through it).
-        # m/z is mapped to GL-x and time to GL-y, so azimuth 0 keeps m/z running
-        # left->right (aligned with panel 2's x). Default is a perspective; align
-        # tips it to near-top-down (89, not 90 -- 90 is a pyqtgraph singularity).
-        self._p1_3d_default_cam = dict(distance=3.4, elevation=28, azimuth=0)
-        self._p1_3d_aligned_cam = dict(distance=3.4, elevation=89.0, azimuth=0)
+        # m/z -> GL-x, time -> GL-y, intensity -> GL-z. With azimuth -90 the
+        # camera looks along +y, so screen-right is +x (m/z increasing rightward,
+        # aligned with panel 2's x); elevation 30 gives a readable 3D perspective.
+        # Spawn AND "align 3D" use this SAME camera so they always match.
+        self._p1_3d_default_cam = dict(distance=3.6, elevation=30, azimuth=-90)
+        self._p1_3d_aligned_cam = dict(distance=3.6, elevation=30, azimuth=-90)
         self.p1_3d_mz_label = QLabel("m/z")
         self.p1_3d_time_label = QLabel("time (min)")
         for lbl in (self.p1_3d_mz_label, self.p1_3d_time_label):
@@ -398,11 +411,15 @@ class MSViewerTab(QMainWindow):
     # ---- 3D side labels --------------------------------------------------
 
     def _recolor_gl(self, pal):
-        """Theme-adaptive colour for the screen-fixed m/z and time side labels."""
+        """Style the screen-fixed m/z and time side labels. A dark pill keeps them
+        readable on either theme (plain white text was invisible on the light Qt
+        chrome, which is why the labels looked 'gone')."""
         for lbl in (getattr(self, "p1_3d_mz_label", None),
                     getattr(self, "p1_3d_time_label", None)):
             if lbl is not None:
-                lbl.setStyleSheet(f"color: {pal['fg']};")
+                lbl.setStyleSheet(
+                    "color: white; background: rgba(20,20,20,170); "
+                    "padding: 1px 5px; border-radius: 3px; font-weight: bold;")
 
     def reset_3d_view(self):
         """Align the 3D view to a top-down, panel-2-aligned (2D-like) view."""
@@ -591,6 +608,23 @@ class MSViewerTab(QMainWindow):
         self._recolor_gl(pal)   # 3D side labels (exist with or without GL)
         if HAVE_GL:
             style_gl(self.p1_3d, pal)
+        # Re-render the data-bearing panels so theme-coloured bits (panel 1/3
+        # titles, the MS2 spectrum data, the charge-grid axes) follow the theme.
+        if self.current is not None and isinstance(getattr(self, "_last_points", None), dict):
+            self._redraw_from_cache()
+            self._redraw_panel3()
+
+    def _redraw_panel3(self):
+        """Re-draw whatever panel 3 is currently showing (MS2 spectrum / MS1
+        envelope / charge grid) so its theme-dependent colours update."""
+        if self.current is None:
+            return
+        if self._panel3_mode == "ms2" and self._ms2_scan is not None:
+            self.render_ms2(self._ms2_scan)
+        else:
+            self.draw_panel3_ms1(self.current,
+                                 getattr(self, "_last_scan_mz", None),
+                                 getattr(self, "_last_scan_int", None))
 
     # ---- list population + cross-linking ---------------------------------
 
@@ -828,6 +862,11 @@ class MSViewerTab(QMainWindow):
         self._rescale_points()
         # Keep the MS2 strip in sync with what's visible in panel 2.
         self._refresh_ms2_visible()
+        # Keep the 3D view's mass/time extent matched to panel 2 as it's moved
+        # (the 3D is normalised to self.window, so re-render from the cached pts).
+        if (HAVE_GL and self.dim_toggle.isChecked()
+                and getattr(self, "_p1_3d_inputs", None) is not None):
+            self.draw_panel1_3d(*self._p1_3d_inputs)
         # The big "data disappears on zoom" fix: we extract a PADDED region and
         # cache it. Zooming/panning *within* that cached region is a pure view
         # operation -- no re-extraction (which is what used to come back empty
@@ -876,9 +915,10 @@ class MSViewerTab(QMainWindow):
                 scatter.setSize(base * f2)
             except Exception:
                 pass
-        if self._p1_scatter_item is not None:
+        # Panel 1 is m/z (x) vs intensity (y); only the m/z zoom matters for dots.
+        for scatter, base in getattr(self, "_p1_scatters", []):
             try:
-                self._p1_scatter_item.setSymbolSize(4 * fmz)
+                scatter.setSize(base * fmz)
             except Exception:
                 pass
 
@@ -967,30 +1007,42 @@ class MSViewerTab(QMainWindow):
         self._set_loading(False)
 
     def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end):
-        profile = bool(self.use_profile() and self.current and self.current.get("profile"))
         self.p1_2d.clear()
-        self._p1_scatter_item = None
+        self._p1_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
+        title_color = palette(self.theme)["fg"]
         if isinstance(points, dict) and points["mz"].size:
-            # Noise off -> drop points not in any distribution (faster + cleaner).
-            pmz = points["mz"]; prt = points["rt"]; pint = points["intensity"]
-            if not self.use_noise() and self._assigned is not None and self._assigned.any():
-                pmz, prt, pint = pmz[self._assigned], prt[self._assigned], pint[self._assigned]
-            title_color = palette(self.theme)["fg"]
-            if pmz.size:
-                self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
-                # Both centroid and profile draw the same way: every datapoint as a
-                # dot (m/z vs intensity). Profile is just denser. Dots grow on
-                # zoom-in via _rescale_points.
-                self._p1_scatter_item = self.p1_2d.plot(
-                    pmz, pint, pen=None, symbol="o", symbolSize=3, symbolPen=None,
-                    symbolBrush=pg.mkBrush(120, 170, 255, 170))
+            mz = points["mz"]; inten = points["intensity"]
+            self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
+            # Colour each datapoint by the panel-2 distribution it belongs to
+            # (one scatter per distribution); points in no distribution are grey
+            # and only shown when noise is on. m/z vs intensity, every datapoint.
+            shown_max = 0.0
+            for _did, color, feat_masks in (self._groups or []):
+                idx = np.zeros(mz.size, dtype=bool)
+                for fm in feat_masks:
+                    idx |= fm
+                if idx.any():
+                    sc = pg.ScatterPlotItem(x=mz[idx], y=inten[idx], size=3, pen=None,
+                                            brush=pg.mkBrush(*color))
+                    self.p1_2d.addItem(sc)
+                    self._p1_scatters.append((sc, 3))
+                    shown_max = max(shown_max, float(inten[idx].max()))
+            if self.use_noise():
+                un = ~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)
+                if un.any():
+                    sc = pg.ScatterPlotItem(x=mz[un], y=inten[un], size=2, pen=None,
+                                            brush=pg.mkBrush(150, 150, 150, 150))
+                    self.p1_2d.addItem(sc)
+                    self._p1_scatters.append((sc, 2))
+                    shown_max = max(shown_max, float(inten[un].max()))
+            if self._p1_scatters:
                 self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
-                                    f"({pmz.size} pts)", color=title_color)
-                self.p1_2d.getViewBox().setYRange(0, float(pint.max()) * 1.05, padding=0)
+                                    f"({mz.size} pts)", color=title_color)
+                self.p1_2d.getViewBox().setYRange(0, (shown_max or 1.0) * 1.05, padding=0)
             else:
                 self.p1_2d.setTitle("no in-distribution points (noise off)", color=title_color)
         else:
-            self.p1_2d.setTitle("no MS1 points in window", color=palette(self.theme)["fg"])
+            self.p1_2d.setTitle("no MS1 points in window", color=title_color)
         # The 3D surface/scatter is expensive; only build it when 3D is actually
         # shown. Cache the inputs so toggling to 3D can render without a reload.
         self._p1_3d_inputs = (points, region, mz_min, mz_max, rt_start, rt_end)
@@ -1008,20 +1060,29 @@ class MSViewerTab(QMainWindow):
             return
 
         mz = points["mz"]; rt = points["rt"]; inten = points["intensity"]
-        n = mz.size
 
         # Per-point base colour = the panel-2 distribution colour (grey if the
         # point isn't in any distribution), so the 3D dots match panel 2.
-        base = np.full((n, 3), 0.5, dtype=np.float32)
+        base = np.full((mz.size, 3), 0.5, dtype=np.float32)
         for _did, color, feat_masks in (self._groups or []):
             c = np.array(color, dtype=np.float32) / 255.0
             for fm in feat_masks:
                 base[fm] = c
 
+        # Show EXACTLY panel 2's visible window (not the padded load region), so
+        # the 3D mass/time extent matches panel 2 instead of being "way off".
+        if self.window is not None:
+            mz_min, mz_max, rt_start, rt_end = self.window
+        view = (mz >= mz_min) & (mz <= mz_max) & (rt >= rt_start) & (rt <= rt_end)
+        mz, rt, inten, base = mz[view], rt[view], inten[view], base[view]
+        if mz.size == 0:
+            self.p1_scatter.setVisible(False)
+            return
+
         # Cap the scatter (intensity-priority so the peaks survive) to keep orbit
         # smooth.
         MAX_3D_POINTS = 5000
-        if n > MAX_3D_POINTS:
+        if mz.size > MAX_3D_POINTS:
             keep = np.argpartition(inten, -MAX_3D_POINTS)[-MAX_3D_POINTS:]
             mz, rt, inten, base = mz[keep], rt[keep], inten[keep], base[keep]
 
@@ -1219,6 +1280,18 @@ class MSViewerTab(QMainWindow):
             ys += [rt, rt, np.nan]
         self.ms2_curve.setData(np.array(xs, dtype=float), np.array(ys, dtype=float))
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
+        # Inverse-scale the line thickness with RT zoom: the more you zoom in, the
+        # THICKER each MS2 line gets (so it never fades to nothing). Reference is
+        # the full loaded RT span.
+        try:
+            (rv0, rv1) = self.p2.getViewBox().viewRange()[1]
+            view_span = max(rv1 - rv0, 1e-9)
+            full_span = (self._loaded_window[3] - self._loaded_window[2]
+                         if self._loaded_window else view_span)
+            factor = min(max((full_span / view_span) ** 0.6, 1.0), 6.0)
+            self.ms2_curve.setPen(pg.mkPen(255, 170, 50, 255, width=3.0 * factor))
+        except Exception:
+            pass
 
     def _on_ms2_hover(self, scene_pos):
         """Hovering an MS2 line on the strip puts a star at its (m/z, RT) on
@@ -1279,7 +1352,7 @@ class MSViewerTab(QMainWindow):
                 return
             mz, inten = scan_arrays(spectrum)
             self.p3_stack.setCurrentIndex(0)
-            plot_spectrum(self.p3, mz, inten,
+            plot_spectrum(self.p3, mz, inten, color=palette(self.theme)["fg"],
                           title=f"MS2  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
             # Ground the baseline at 0 (no gap below the sticks).
             top = float(np.max(inten)) * 1.05 if len(inten) else 1.0
@@ -1373,7 +1446,8 @@ class MSViewerTab(QMainWindow):
         exp_peak = 1.0
         if scan_mz is not None and len(scan_int):
             exp_peak = float(np.max(scan_int)) or 1.0
-            plot_spectrum(self.p3, scan_mz, scan_int, title=title)
+            plot_spectrum(self.p3, scan_mz, scan_int, title=title,
+                          color=palette(self.theme)["fg"])
 
         if plain and set(plain) <= set("ACDEFGHIKLMNPQRSTVWYUO"):
             try:
@@ -1488,7 +1562,8 @@ class MSViewerTab(QMainWindow):
         fg = palette(self.theme)["fg"]
 
         def cell(ri, ci):
-            p = self.p3_grid.addPlot(row=ri, col=ci)
+            p = self.p3_grid.addPlot(row=ri, col=ci,
+                                     axisItems={"left": ThreeTickAxis(orientation="left")})
             p.showGrid(x=True, y=True, alpha=0.2)
             p.hideButtons()
             left = p.getAxis("left"); bottom = p.getAxis("bottom")
@@ -1634,12 +1709,11 @@ class MSViewerTab(QMainWindow):
                 if c is not None:
                     c.setYLink(left)
         self._grid_ncols = len(charges)
-        # Apply the SAME fit the double-click reset produces, so the grid opens in
-        # the right state instead of needing a manual double-click. Deferred so the
-        # cells have a real geometry/auto-range to start from.
+        # Fit synchronously from the items' data (no deferred pass), so the grid
+        # opens directly in the right state -- the deferred reset was causing a
+        # one-frame flicker through the wrong auto-fit.
+        self._fit_grid_cols()
         self._fit_grid_rows()
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self.reset_charge_grid_zoom)
 
     # Rows drawn on a log y-scale (peak area, cross-charge, intensity sum %).
     GRID_LOG_ROWS = {1, 3, 4}
@@ -1657,6 +1731,44 @@ class MSViewerTab(QMainWindow):
                 if yd is not None and len(yd):
                     vals.append(np.asarray(yd, dtype=float).ravel())
         return vals
+
+    @staticmethod
+    def _grid_item_xvals(plotitem):
+        vals = []
+        for it in plotitem.items:
+            if isinstance(it, pg.BarGraphItem):
+                x = it.opts.get("x")
+                if x is not None:
+                    vals.append(np.asarray(x, dtype=float).ravel())
+            else:
+                xd = getattr(it, "xData", None)
+                if xd is not None and len(xd):
+                    vals.append(np.asarray(xd, dtype=float).ravel())
+        return vals
+
+    def _fit_grid_cols(self):
+        """Fit each column's x-axis (m/z) to its own data, on the column's top
+        (master) cell the rows are x-linked to. Deterministic = no flicker."""
+        for ci in range(getattr(self, "_grid_ncols", 0)):
+            top = self._grid_cells.get((0, ci))
+            if top is None:
+                continue
+            vals = []
+            for ri in range(len(self.CHARGE_ROW_LABELS)):
+                p = self._grid_cells.get((ri, ci))
+                if p is not None:
+                    vals += self._grid_item_xvals(p)
+            if not vals:
+                continue
+            allv = np.concatenate(vals)
+            allv = allv[np.isfinite(allv)]
+            if allv.size == 0:
+                continue
+            lo, hi = float(allv.min()), float(allv.max())
+            if hi - lo < 1e-9:
+                lo -= 0.5; hi += 0.5
+            pad = (hi - lo) * 0.05
+            top.getViewBox().setXRange(lo - pad, hi + pad, padding=0)
 
     def _fit_grid_rows(self):
         """Fit each row's y-axis to the UNION of all its columns' data, applied to
@@ -1694,11 +1806,8 @@ class MSViewerTab(QMainWindow):
             master.getViewBox().setYRange(lo - pad, hi + pad, padding=0)
 
     def reset_charge_grid_zoom(self):
-        # Deterministic reset: autorange x on each column master, re-fit y rows.
-        for ci in range(getattr(self, "_grid_ncols", 0)):
-            top = self._grid_cells.get((0, ci))
-            if top is not None:
-                top.getViewBox().enableAutoRange(axis=top.getViewBox().XAxis)
+        # Deterministic reset (same as the initial fit): no flicker/oscillation.
+        self._fit_grid_cols()
         self._fit_grid_rows()
 
     def _on_grid_clicked(self, event):
