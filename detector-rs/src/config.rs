@@ -46,6 +46,10 @@ pub struct Config {
     // charge grouping
     pub charge_mass_ppm: f64,
     pub min_charge_group_rt_score: f64,
+    // envelope-first builder
+    pub min_trace_similarity: f64,
+    pub min_envelope_score: f64,
+    pub ambiguity_margin: f64,
 }
 
 impl Default for Config {
@@ -86,6 +90,9 @@ impl Default for Config {
             new_inc_limit: 0.1,
             charge_mass_ppm: 12.0,
             min_charge_group_rt_score: 0.55,
+            min_trace_similarity: 0.5,
+            min_envelope_score: 0.45,
+            ambiguity_margin: 0.05,
         }
     }
 }

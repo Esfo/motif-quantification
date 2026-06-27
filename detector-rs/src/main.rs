@@ -12,9 +12,9 @@ mod distributions;
 mod store;
 
 use config::Config;
-use distributions::{build_analytes, build_distributions, build_edges, Features};
+use distributions::{build_analytes, build_distributions, Features};
 use linemodel::LineModel;
-use store::{compress_f32, write_db, ScanPoints, ScanRow};
+use store::{compress_f32, compress_i32, write_db, FeatureTraceRow, ScanPoints, ScanRow};
 
 #[derive(Parser, Debug)]
 #[command(about = "MS1 distribution detector (Rust port of distributions/index_ms1.py)")]
@@ -104,13 +104,33 @@ fn main() -> Result<()> {
     model.finalize();
     let line_secs = t_line.elapsed().as_secs_f64();
 
-    let t_edge = Instant::now();
-    let f = Features::from_rows(&model.features);
-    let edges = build_edges(&f, &cfg);
-    let edge_secs = t_edge.elapsed().as_secs_f64();
+    let f = Features::build(&model.features, &model.feature_traces);
+    let edge_secs = 0.0f64;
+
+    // Per-feature traces -> zlib-compressed little-endian arrays (scans i32,
+    // rts/mzs/intensities f32), mirroring distributions/store.py feature_traces.
+    let feature_traces: Vec<FeatureTraceRow> = model
+        .feature_traces
+        .iter()
+        .enumerate()
+        .map(|(fid, t)| {
+            let scans_i32: Vec<i32> = t.scans.iter().map(|v| *v as i32).collect();
+            let rts_f32: Vec<f32> = t.rts.iter().map(|v| *v as f32).collect();
+            let mzs_f32: Vec<f32> = t.mzs.iter().map(|v| *v as f32).collect();
+            let int_f32: Vec<f32> = t.intensities.iter().map(|v| *v as f32).collect();
+            FeatureTraceRow {
+                feature_id: fid as i64,
+                n: t.scans.len() as i64,
+                scans_blob: compress_i32(&scans_i32),
+                rts_blob: compress_f32(&rts_f32),
+                mzs_blob: compress_f32(&mzs_f32),
+                intensities_blob: compress_f32(&int_f32),
+            }
+        })
+        .collect();
 
     let t_dist = Instant::now();
-    let dists = build_distributions(&f, &cfg, &edges);
+    let dists = build_distributions(&f, &cfg);
     let dist_secs = t_dist.elapsed().as_secs_f64();
 
     let t_charge = Instant::now();
@@ -126,18 +146,18 @@ fn main() -> Result<()> {
             "counts".to_string(),
             format!(
                 "{{\"scans\":{},\"lines\":{},\"features\":{},\"edges\":{},\"distributions\":{},\"analytes\":{}}}",
-                scans.len(), model.lines.len(), model.features.len(), edges.len(), dists.len(), analytes.len()
+                scans.len(), model.lines.len(), model.features.len(), 0, dists.len(), analytes.len()
             ),
         ),
     ];
-    write_db(&args.out, args.overwrite, &params, &scans, &model.lines, &model.features, &dists, &analytes, &points)?;
+    write_db(&args.out, args.overwrite, &params, &scans, &model.lines, &model.features, &feature_traces, &dists, &analytes, &points)?;
     let write_secs = t_write.elapsed().as_secs_f64();
 
     let total = started.elapsed().as_secs_f64();
     println!(
         "{{\n  \"out\": \"{}\",\n  \"seconds\": {:.3},\n  \"stage_seconds\": {{\"line\": {:.3}, \"edges\": {:.3}, \"distributions\": {:.3}, \"charge\": {:.3}, \"write\": {:.3}}},\n  \"scans\": {},\n  \"lines\": {},\n  \"features\": {},\n  \"best_edges\": {},\n  \"distributions\": {},\n  \"analytes\": {}\n}}",
         args.out, total, line_secs, edge_secs, dist_secs, charge_secs, write_secs,
-        scans.len(), model.lines.len(), model.features.len(), edges.len(), dists.len(), analytes.len()
+        scans.len(), model.lines.len(), model.features.len(), 0, dists.len(), analytes.len()
     );
 
     // charge histogram + query
@@ -150,6 +170,12 @@ fn main() -> Result<()> {
     for (c, n) in &hist {
         eprintln!("  z={:<3} {:>8}  ({:.1}%)", c, n, 100.0 * *n as f64 / total_d);
     }
+    let mut status: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+    for d in &dists {
+        *status.entry(d.status.as_str()).or_insert(0) += 1;
+    }
+    let status_str: Vec<String> = status.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    eprintln!("  status: {}", status_str.join(", "));
     eprintln!(
         "sqlite3 {} \"SELECT charge, COUNT(*) AS n FROM distributions GROUP BY charge ORDER BY charge;\"",
         args.out

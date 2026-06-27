@@ -38,6 +38,17 @@ pub struct FeatureRow {
     pub quality: f64,
 }
 
+/// Per-feature chromatographic trace, kept so the envelope-first distribution
+/// builder can score isotope members on real elution shape (and persisted to the
+/// feature_traces table). Indexed by feature_id (dense, 0-based).
+#[derive(Clone)]
+pub struct FeatureTrace {
+    pub scans: Vec<i64>,
+    pub rts: Vec<f64>,
+    pub mzs: Vec<f64>,
+    pub intensities: Vec<f64>,
+}
+
 struct Trace {
     scans: Vec<i64>,
     rts: Vec<f64>,
@@ -95,6 +106,7 @@ pub struct LineModel {
     next_feature_id: i64,
     pub lines: Vec<LineRow>,
     pub features: Vec<FeatureRow>,
+    pub feature_traces: Vec<FeatureTrace>,
 }
 
 impl LineModel {
@@ -108,6 +120,7 @@ impl LineModel {
             next_feature_id: 0,
             lines: Vec::new(),
             features: Vec::new(),
+            feature_traces: Vec::new(),
         }
     }
 
@@ -441,6 +454,12 @@ impl LineModel {
             n_points: scans.len() as i64,
             quality,
         });
+        self.feature_traces.push(FeatureTrace {
+            scans: scans.to_vec(),
+            rts: rts.to_vec(),
+            mzs: mzs.to_vec(),
+            intensities: ints.to_vec(),
+        });
         self.next_feature_id += 1;
     }
 
@@ -539,6 +558,12 @@ impl LineModel {
                 area,
                 n_points: sub_scans.len() as i64,
                 quality,
+            });
+            self.feature_traces.push(FeatureTrace {
+                scans: sub_scans.to_vec(),
+                rts: sub_rts.to_vec(),
+                mzs: sub_mzs.to_vec(),
+                intensities: sub_ints.to_vec(),
             });
             self.next_feature_id += 1;
         }

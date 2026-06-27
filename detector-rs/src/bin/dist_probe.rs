@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::collections::BTreeMap;
 use ms1_detector::config::Config;
 use ms1_detector::linemodel::LineModel;
-use ms1_detector::distributions::{Features, build_edges, build_distributions, build_analytes};
+use ms1_detector::distributions::{Features, build_distributions, build_analytes};
 
 fn main() {
     let cfg = Config::default();
@@ -20,15 +20,14 @@ fn main() {
         model.process_scan(idx as i64, rt, &mzs, &ints);
     }
     model.finalize();
-    let f = Features::from_rows(&model.features);
-    let edges = build_edges(&f, &cfg);
-    let dists = build_distributions(&f, &cfg, &edges);
+    let f = Features::build(&model.features, &model.feature_traces);
+    let dists = build_distributions(&f, &cfg);
     let analytes = build_analytes(&cfg, &dists);
 
     let stdout = io::stdout(); let mut out = stdout.lock();
     let mut hist: BTreeMap<i64, i64> = BTreeMap::new();
     for d in &dists { *hist.entry(d.charge).or_insert(0) += 1; }
-    writeln!(out, "FEATURES {} EDGES {} DISTS {} ANALYTES {}", model.features.len(), edges.len(), dists.len(), analytes.len()).unwrap();
+    writeln!(out, "FEATURES {} EDGES 0 DISTS {} ANALYTES {}", model.features.len(), dists.len(), analytes.len()).unwrap();
     for (c, n) in &hist { writeln!(out, "z={c} {n}").unwrap(); }
     let mut rows: Vec<String> = dists.iter().map(|d| {
         format!("{} {:.5} {:.5} {:.4} {} {:.5} {:.5}", d.charge, d.neutral_mass, d.mono_mz, d.rt_apex, d.n_members, d.score, d.quality)
