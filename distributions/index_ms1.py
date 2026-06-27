@@ -199,6 +199,7 @@ class Analyte:
 class LineModel:
     def __init__(self, config):
         self.config = config
+        self.progress = 0
         self.active = {}
         self.misses = {}
         self.closed_traces = []
@@ -341,13 +342,27 @@ class LineModel:
                     "mean_mz": float(trace.mean_mz),
                     "start": int(scans[0]),
                     "end": int(scans[-1]),
-                    "scanset": set(int(s) for s in scans.tolist()),
                 }
             )
 
-        fragments.sort(key=lambda f: (f["start"], f["mean_mz"]))
+        if self.progress:
+            print(
+                f"merge_stage fragments={len(fragments)} (chaining...)",
+                file=sys.stderr,
+                flush=True,
+            )
 
-        for line_id, chain in enumerate(self.chain_fragments(fragments)):
+        fragments.sort(key=lambda f: (f["start"], f["mean_mz"]))
+        chains = self.chain_fragments(fragments)
+
+        if self.progress:
+            print(
+                f"merge_stage chains={len(chains)} merged_fragments={len(fragments) - len(chains)} (emitting...)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        for line_id, chain in enumerate(chains):
             scans = np.concatenate([f["scans"] for f in chain])
             rts = np.concatenate([f["rts"] for f in chain])
             mzs = np.concatenate([f["mzs"] for f in chain])
@@ -356,60 +371,93 @@ class LineModel:
             order = np.argsort(scans)
             self.emit_line(line_id, scans[order], rts[order], mzs[order], intensities[order])
 
+            if self.progress and line_id > 0 and line_id % 20000 == 0:
+                print(
+                    f"emit lines={line_id}/{len(chains)} features={len(self.features)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
     def chain_fragments(self, fragments):
-        # A second nearest-neighbour pass, but over whole fragments: link a
-        # fragment to an open chain when their m/z agree within tolerance, their
-        # scan ranges do not overlap (time-non-redundant), and the gap between
-        # them is within line_merge_gap_scans. Fragments sorted by start scan, so
-        # a chain that falls too far behind can never be extended again.
+        # A second nearest-neighbour pass over whole fragments: link a fragment
+        # to an open chain when their m/z agree within tolerance, their scan
+        # ranges do not overlap (time-non-redundant), and the gap between them is
+        # within line_merge_gap_scans. Fragments are processed in start-scan order
+        # so a fragment can only ever append to the END of a chain — meaning a
+        # plain `start <= chain.end` test is an exact non-redundancy guard (no
+        # per-scan set needed). Chains are bucketed by m/z so each fragment only
+        # compares against the handful of chains near its own m/z, keeping the
+        # pass near-linear on dense maps with millions of fragments.
         gap = self.config.line_merge_gap_scans
+        bin_width = 0.05
+        active_by_bin = {}
         chains = []
-        active = []
+
+        def bin_of(mz_value):
+            return int(mz_value / bin_width)
 
         for fragment in fragments:
+            f_start = fragment["start"]
+            f_mz = fragment["mean_mz"]
             tolerance = max(
                 self.config.line_merge_mz_abs,
-                fragment["mean_mz"] * self.config.line_merge_mz_ppm / 1_000_000.0,
+                f_mz * self.config.line_merge_mz_ppm / 1_000_000.0,
             )
+            home_bin = bin_of(f_mz)
 
             best_chain = None
             best_distance = math.inf
 
-            for chain in active:
-                if fragment["start"] - chain["end"] > gap:
+            for bin_id in (home_bin - 1, home_bin, home_bin + 1):
+                bucket = active_by_bin.get(bin_id)
+
+                if not bucket:
                     continue
 
-                if fragment["start"] <= chain["end"] and not chain["scanset"].isdisjoint(
-                    fragment["scanset"]
-                ):
-                    continue
+                kept = []
 
-                distance = abs(chain["mean_mz"] - fragment["mean_mz"])
+                for chain in bucket:
+                    if f_start - chain["end"] > gap:
+                        continue  # stale: can never be extended again, drop it
 
-                if distance <= tolerance and distance < best_distance:
-                    best_distance = distance
-                    best_chain = chain
+                    kept.append(chain)
+
+                    if f_start <= chain["end"]:
+                        continue  # scan ranges overlap -> not a continuation
+
+                    distance = abs(chain["mean_mz"] - f_mz)
+
+                    if distance <= tolerance and distance < best_distance:
+                        best_distance = distance
+                        best_chain = chain
+
+                active_by_bin[bin_id] = kept
 
             if best_chain is None:
                 chain = {
-                    "mean_mz": fragment["mean_mz"],
+                    "mean_mz": f_mz,
                     "end": fragment["end"],
                     "n": int(fragment["scans"].size),
-                    "scanset": set(fragment["scanset"]),
                     "fragments": [fragment],
                 }
                 chains.append(chain)
-                active.append(chain)
+                active_by_bin.setdefault(home_bin, []).append(chain)
             else:
+                old_bin = bin_of(best_chain["mean_mz"])
                 n0 = best_chain["n"]
                 n1 = int(fragment["scans"].size)
-                best_chain["mean_mz"] = (best_chain["mean_mz"] * n0 + fragment["mean_mz"] * n1) / (n0 + n1)
+                best_chain["mean_mz"] = (best_chain["mean_mz"] * n0 + f_mz * n1) / (n0 + n1)
                 best_chain["n"] = n0 + n1
                 best_chain["end"] = max(best_chain["end"], fragment["end"])
-                best_chain["scanset"].update(fragment["scanset"])
                 best_chain["fragments"].append(fragment)
 
-            active = [c for c in active if fragment["start"] - c["end"] <= gap]
+                new_bin = bin_of(best_chain["mean_mz"])
+
+                if new_bin != old_bin:
+                    bucket = active_by_bin.get(old_bin)
+                    if bucket and best_chain in bucket:
+                        bucket.remove(best_chain)
+                    active_by_bin.setdefault(new_bin, []).append(best_chain)
 
         return [chain["fragments"] for chain in chains]
 
@@ -1367,6 +1415,7 @@ def run(args):
     workers = resolve_workers(args.workers)
 
     model = LineModel(config)
+    model.progress = bool(args.progress)
     scans = []
 
     for scan in stream_ms1(args.mzml, args.min_intensity):
@@ -1389,9 +1438,11 @@ def run(args):
         )
 
         if args.progress and scan["ms1_index"] > 0 and scan["ms1_index"] % args.progress == 0:
+            # lines/features are emitted only after streaming (in the merge pass),
+            # so during streaming we report active + closed traces instead.
             print(
                 f"scans={scan['ms1_index']} active_lines={len(model.active)} "
-                f"lines={len(model.lines)} features={len(model.features)}",
+                f"closed_traces={len(model.closed_traces)}",
                 file=sys.stderr,
                 flush=True,
             )
