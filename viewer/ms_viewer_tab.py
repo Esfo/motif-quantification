@@ -1424,14 +1424,19 @@ class MSViewerTab(QMainWindow):
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
     # by both panel 1 (2D) and panel 3.
     def eventFilter(self, obj, event):
-        if obj is self.p3_grid.viewport() and event.type() == QEvent.Wheel:
+        # Guard: events can arrive while the docks are still being built (some
+        # of these widgets don't exist yet).
+        grid = getattr(self, "p3_grid", None)
+        if grid is not None and obj is grid.viewport() and event.type() == QEvent.Wheel:
             if self._grid_axis_wheel(event):
                 return True
             return super().eventFilter(obj, event)
+        p1 = getattr(self, "p1_2d", None)
+        p3 = getattr(self, "p3", None)
         target = None
-        if obj is self.p1_2d.viewport():
+        if p1 is not None and obj is p1.viewport():
             target = self.p1_2d
-        elif obj is self.p3.viewport():
+        elif p3 is not None and obj is p3.viewport():
             target = self.p3
         if target is not None and event.type() == QEvent.Wheel:
             axis = target.getPlotItem().getAxis("left")
