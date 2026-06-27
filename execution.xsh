@@ -532,6 +532,10 @@ if run_reorganize:
 distributions_dir = project_dir / "distributions"
 
 if run_distributions:
+    # --engine rust builds the detector (incremental, ~instant if unchanged) and
+    # runs the native binary, which also writes scan_points for the fast GUI.
+    # Add --overwrite to regenerate existing sqlites (e.g. switching from python).
     python @(str(distributions_py)) \
         --mzml-dir @(str(mzml_dir)) \
-        --out-dir @(str(distributions_dir))
+        --out-dir @(str(distributions_dir)) \
+        --engine rust

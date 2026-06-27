@@ -29,11 +29,14 @@ def ensure_rust_binary():
     """Build the Rust detector if needed and return the binary path. The Rust
     engine is a validated drop-in for index_ms1.py (same sqlite output) and is
     much faster; the line + edge stages dominate runtime and are native there."""
+    # Always build: cargo is incremental, so this is ~instant when nothing
+    # changed and picks up source edits otherwise (so the binary is never stale).
+    print("cargo build --release (rust detector)...", file=sys.stderr)
+    result = subprocess.run(["cargo", "build", "--release"], cwd=str(RUST_CRATE))
+    if result.returncode != 0:
+        raise SystemExit("cargo build failed")
     if not RUST_BIN.exists():
-        print("building rust detector (cargo build --release)...", file=sys.stderr)
-        result = subprocess.run(["cargo", "build", "--release"], cwd=str(RUST_CRATE))
-        if result.returncode != 0:
-            raise SystemExit("cargo build failed")
+        raise SystemExit(f"rust binary missing after build: {RUST_BIN}")
     return RUST_BIN
 
 

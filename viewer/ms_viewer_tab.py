@@ -452,6 +452,14 @@ class MSViewerTab(QMainWindow):
 
         listw = QListWidget()
         listw.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Keep the selection highlighted even when the list loses focus (Qt
+        # otherwise renders the inactive selection in a muted grey, so the blue
+        # "selected" cue disappeared when you clicked a panel/table).
+        listw.setStyleSheet(
+            "QListWidget::item:selected,"
+            "QListWidget::item:selected:!active"
+            " { background-color: #2f6fb3; color: white; }"
+        )
         listw.itemSelectionChanged.connect(on_select)
         layout.addWidget(listw, stretch=1)
         return listw
