@@ -231,6 +231,16 @@ CHARGE_TAB_COLUMNS = [
 ]
 
 
+def _gtick(value):
+    """Compact y-tick label so values fit a narrow axis."""
+    if value == 0:
+        return "0"
+    a = abs(value)
+    if a >= 1e4 or a < 1e-2:
+        return f"{value:.1e}"
+    return f"{value:.3g}"
+
+
 def _fmt(value, kind):
     if value is None:
         return ""
@@ -2088,6 +2098,8 @@ class MSViewerTab(QMainWindow):
         row_first = {}   # row index -> leftmost cell (owns the shared y-axis labels)
         fg = palette(self.theme)["fg"]
 
+        last_row = len(self.CHARGE_ROW_LABELS) - 1
+
         def cell(ri, ci):
             p = self.p3_grid.addPlot(row=ri, col=ci)
             p.showGrid(x=True, y=True, alpha=0.2)
@@ -2104,31 +2116,43 @@ class MSViewerTab(QMainWindow):
                 ax.enableAutoSIPrefix(False)   # no "1e6"-style SI prefixes
             if ri == 0:
                 p.setTitle(f"z={charges[ci]}", color=fg)
-            left.setWidth(54)
-            # Columns in a row share one y-axis: the leftmost cell owns the tick
-            # labels and every other column links its y-range to it and hides its
-            # own tick values. Labels: top + middle always, bottom only when the
-            # baseline is non-zero.
+
+            # Y axis: only the leftmost column shows values (always >= 2), every
+            # other column links its y-range to it and hides its own labels.
             if ci == 0:
                 row_first[ri] = p
+                left.setWidth(66)
                 p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
 
                 def _ticks(*_args, ax=left, vb=vb):
-                    # NB: sigYRangeChanged passes (viewbox, range) positionally, so
-                    # swallow all positional args and keep ax/vb as keyword defaults.
                     (y0, y1) = vb.viewRange()[1]
                     mid = (y0 + y1) / 2.0
-                    ticks = [(y1, f"{y1:.3g}"), (mid, f"{mid:.3g}")]
-                    if abs(y0) > 1e-12:
-                        ticks.append((y0, f"{y0:.3g}"))
+                    ticks = [(y1, _gtick(y1)), (y0, _gtick(y0))]   # >= 2 values
+                    if abs(mid - y0) > 1e-9 and abs(mid - y1) > 1e-9:
+                        ticks.append((mid, _gtick(mid)))
                     ax.setTicks([ticks])
 
                 vb.sigYRangeChanged.connect(_ticks)
                 p._tick_updater = _ticks
             else:
+                left.setStyle(showValues=False)
+                left.setWidth(8)            # reclaim horizontal space
                 if ri in row_first:
                     p.setYLink(row_first[ri])
-                left.setStyle(showValues=False)
+
+            # X axis: only the bottom row shows m/z values (3 ticks, no squish);
+            # every other row hides its x labels to reclaim vertical space.
+            if ri == last_row:
+                def _xticks(*_args, ax=bottom, vb=vb):
+                    (x0, x1) = vb.viewRange()[0]
+                    xm = (x0 + x1) / 2.0
+                    ax.setTicks([[(x0, f"{x0:.2f}"), (xm, f"{xm:.2f}"), (x1, f"{x1:.2f}")]])
+
+                vb.sigXRangeChanged.connect(_xticks)
+                p._xtick_updater = _xticks
+            else:
+                bottom.setStyle(showValues=False)
+                bottom.setHeight(6)         # reclaim vertical space
             self._grid_cells[(ri, ci)] = p
             return p
 
@@ -2263,6 +2287,9 @@ class MSViewerTab(QMainWindow):
         # column's plots are wider than another's.
         try:
             glayout = self.p3_grid.ci.layout
+            glayout.setHorizontalSpacing(1)   # tight gaps -> reclaim blank space
+            glayout.setVerticalSpacing(1)
+            glayout.setContentsMargins(2, 2, 2, 2)
             for ci in range(len(charges)):
                 glayout.setColumnStretchFactor(ci, 1)
                 glayout.setColumnPreferredWidth(ci, 0)
@@ -2282,6 +2309,8 @@ class MSViewerTab(QMainWindow):
         for p in self._grid_cells.values():
             if hasattr(p, "_tick_updater"):
                 p._tick_updater()
+            if hasattr(p, "_xtick_updater"):
+                p._xtick_updater()
 
     # Non-negative bar rows glued to a 0 baseline (peak area, cross-charge,
     # intensity sum %): y starts at 0 at the bottom, like the MS2 spectrum.
