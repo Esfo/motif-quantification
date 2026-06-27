@@ -809,13 +809,16 @@ class MSViewerTab(QMainWindow):
         # shown -- the user wants no descriptive caption above panel 3.
         self.p3_title = QLabel("")
         self.p3_title.setVisible(False)
+        # p3_loading is intentionally NOT added to the layout: its row was the
+        # dead-space border above panel 3. The loading state still updates this
+        # label (harmless) but it no longer occupies a row, so the plot fills the
+        # space.
         self.p3_loading = QLabel("")
         self.p3_loading.setStyleSheet("color: black;")
 
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
-        layout.addWidget(self.p3_loading)
         layout.addWidget(self.p3_stack, stretch=1)
 
         dock = QDockWidget("", self)
