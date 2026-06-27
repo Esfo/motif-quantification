@@ -335,49 +335,25 @@ class MSViewerTab(QMainWindow):
         # Wheel over the y-axis label strip (left of the plot) scrolls intensity.
         self.p1_2d.viewport().installEventFilter(self)
 
-        # Initial 3D orientation: a sensible perspective with m/z running the same
-        # direction as panel 2's x axis (azimuth -90). "align 3D" tips it to a
-        # near-top-down 2D-like view. We deliberately avoid elevation == 90 (a
-        # camera singularity in pyqtgraph that can crash when orbited through it).
-        # m/z -> GL-x, time -> GL-y, intensity -> GL-z. With azimuth -90 the
-        # camera looks along +y, so screen-right is +x (m/z increasing rightward,
-        # aligned with panel 2's x); elevation 30 gives a readable 3D perspective.
-        # Spawn AND "align 3D" use this SAME camera so they always match.
-        self._p1_3d_default_cam = dict(distance=3.6, elevation=30, azimuth=-90)
-        self._p1_3d_aligned_cam = dict(distance=3.6, elevation=30, azimuth=-90)
-        self.p1_3d_mz_label = QLabel("m/z")
-        self.p1_3d_time_label = QLabel("time (min)")
-        for lbl in (self.p1_3d_mz_label, self.p1_3d_time_label):
-            lbl.setAlignment(Qt.AlignCenter)
+        # Spawn / "align 3D" view: a FRONT-ON, near-orthographic view that looks
+        # exactly like the 2D plot -- m/z on the horizontal axis (aligned with
+        # panel 2), intensity vertical with the 0 baseline at the BOTTOM. Mapping:
+        # m/z -> GL-x, time -> GL-y, intensity -> GL-z (0 -> bottom). elevation 0
+        # + azimuth -90 looks straight along +time, so screen-right is +m/z and
+        # screen-up is +intensity. A small FOV makes it near-orthographic so the
+        # m/z axis is linear and lines up with panel 2. From here the user can
+        # orbit to reveal time; "align 3D" returns to exactly this.
+        self._p1_3d_fov = 4.0
+        self._p1_3d_cam = dict(distance=30.0, elevation=0.0, azimuth=-90.0)
         if HAVE_GL:
             self.p1_3d = gl.GLViewWidget()
-            # Load already aligned (top-down, panel-2-aligned) so the initial view
-            # and the "align 3D" button produce the SAME correct orientation.
-            self.p1_3d.setCameraPosition(**self._p1_3d_aligned_cam)
-            self.p1_surface = gl.GLSurfacePlotItem(
-                x=np.array([0.0, 1.0], dtype=np.float32),
-                y=np.array([0.0, 1.0], dtype=np.float32),
-                z=np.zeros((2, 2), dtype=np.float32),
-                shader="shaded", smooth=False,   # smooth normals are expensive
-            )
-            self.p1_surface.setVisible(False)
+            self.p1_3d.opts["fov"] = self._p1_3d_fov
+            self.p1_3d.setCameraPosition(**self._p1_3d_cam)
             self.p1_scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3), dtype=np.float32), size=4.0)
             self.p1_scatter.setVisible(False)
-            self.p1_3d.addItem(self.p1_surface)
             self.p1_3d.addItem(self.p1_scatter)
-            # No drawn axes/gnomon at all. The m/z + time names are plain QLabels
-            # pinned to the SIDES of the view (screen-fixed) so they never rotate,
-            # drift, or disorient the user as the 3D scene is moved.
-            gl_container = QWidget()
-            grid = QGridLayout(gl_container)
-            grid.setContentsMargins(0, 0, 0, 0)
-            grid.setSpacing(1)
-            grid.addWidget(self.p1_3d_time_label, 0, 0)  # left side = time
-            grid.addWidget(self.p1_3d, 0, 1)
-            grid.addWidget(self.p1_3d_mz_label, 1, 1)    # bottom = m/z (horizontal)
-            grid.setColumnStretch(1, 1)
-            grid.setRowStretch(0, 1)
-            self.p1_3d_widget = gl_container
+            # No drawn axes and no text labels at all (per the user).
+            self.p1_3d_widget = self.p1_3d
         else:
             self.p1_3d = QLabel("3D needs pyqtgraph OpenGL (pip install PyOpenGL)")
             self.p1_3d.setAlignment(Qt.AlignCenter)
@@ -440,20 +416,14 @@ class MSViewerTab(QMainWindow):
     # ---- 3D side labels --------------------------------------------------
 
     def _recolor_gl(self, pal):
-        """Style the screen-fixed m/z and time side labels. A dark pill keeps them
-        readable on either theme (plain white text was invisible on the light Qt
-        chrome, which is why the labels looked 'gone')."""
-        for lbl in (getattr(self, "p1_3d_mz_label", None),
-                    getattr(self, "p1_3d_time_label", None)):
-            if lbl is not None:
-                lbl.setStyleSheet(
-                    "color: white; background: rgba(20,20,20,170); "
-                    "padding: 1px 5px; border-radius: 3px; font-weight: bold;")
+        """No 3D labels anymore (removed per the user); nothing to recolour."""
+        return
 
     def reset_3d_view(self):
-        """Align the 3D view to a top-down, panel-2-aligned (2D-like) view."""
+        """Return the 3D view to the front-on, panel-2-aligned 2D-like view."""
         if HAVE_GL:
-            self.p1_3d.setCameraPosition(**self._p1_3d_aligned_cam)
+            self.p1_3d.opts["fov"] = self._p1_3d_fov
+            self.p1_3d.setCameraPosition(**self._p1_3d_cam)
 
     def build_panel2_dock(self):
         # Thin MS2 strip to the left of panel 2: MS2 scans as clickable points,
@@ -1085,8 +1055,10 @@ class MSViewerTab(QMainWindow):
                 self.p1_2d.setTitle("no in-distribution points (noise off)", color=title_color)
         else:
             self.p1_2d.setTitle("no MS1 points in window", color=title_color)
-        # The 3D surface/scatter is expensive; only build it when 3D is actually
-        # shown. Cache the inputs so toggling to 3D can render without a reload.
+        # Rescale dot sizes for the current zoom, then build the 3D if shown.
+        self._rescale_points()
+        # The 3D scatter is expensive; only build it when 3D is actually shown.
+        # Cache the inputs so toggling to 3D can render without a reload.
         self._p1_3d_inputs = (points, region, mz_min, mz_max, rt_start, rt_end)
         if HAVE_GL and self.dim_toggle.isChecked():
             self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
@@ -1094,9 +1066,7 @@ class MSViewerTab(QMainWindow):
     def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
         if not HAVE_GL:
             return
-        # Surface removed entirely (per the user): the 3D view is just the
-        # individual datapoints, for both centroid and profile.
-        self.p1_surface.setVisible(False)
+        # The 3D view is just the individual datapoints (no surface).
         if not (isinstance(points, dict) and points["mz"].size):
             self.p1_scatter.setVisible(False)
             return
@@ -1129,20 +1099,20 @@ class MSViewerTab(QMainWindow):
             mz, rt, inten, base = mz[keep], rt[keep], inten[keep], base[keep]
 
         zmax = float(inten.max()) or 1.0
-        z = (inten / zmax).astype(np.float32)
+        tnorm = (inten / zmax).astype(np.float32)   # 0..1 intensity for colour
         # White-tip gradient: low intensity keeps the distribution colour, high
         # intensity blends to white, so peak tips are white. Log option supported.
         if self.use_logcolor():
             t = np.log1p(inten); t = (t / (t.max() or 1.0)).astype(np.float32)
         else:
-            t = z
+            t = tnorm
         t = t[:, None]
         rgb = base * (1.0 - t) + np.float32(1.0) * t
         colors = np.column_stack([rgb, np.ones(rgb.shape[0], dtype=np.float32)]).astype(np.float32)
 
-        # Axes: m/z -> GL-x (horizontal, aligned with panel 2), time -> GL-y,
-        # intensity -> GL-z. x is aspect-scaled so the footprint fills the
-        # (rectangular) pane rather than a forced square.
+        # m/z -> GL-x (aspect-scaled to fill the pane width, aligned with panel 2),
+        # time -> GL-y, intensity -> GL-z mapped to [-1, +1] so intensity 0 sits at
+        # the BOTTOM (z=-1) like the 2D plot's baseline and the max at the top.
         mz_span = max(mz_max - mz_min, 1e-6)
         rt_span = max(rt_end - rt_start, 1e-6)
         try:
@@ -1151,6 +1121,7 @@ class MSViewerTab(QMainWindow):
             aspect = 1.0
         x = (((mz - mz_min) / mz_span * 2 - 1) * aspect).astype(np.float32)
         y = ((rt - rt_start) / rt_span * 2 - 1).astype(np.float32)
+        z = (tnorm * 2 - 1).astype(np.float32)
         pos = np.column_stack([x, y, z]).astype(np.float32)
         try:
             self.p1_scatter.setData(pos=pos, color=colors, size=4.0)
@@ -1478,9 +1449,16 @@ class MSViewerTab(QMainWindow):
         if dist_id is not None:
             group = self.db.charge_group(dist_id)
             if group:
-                self.draw_charge_grid(group, cur)
+                # Skip rebuilding the grid (and the flicker) when it's already
+                # showing this same distribution -- e.g. on a profile<->centroid
+                # toggle or an in-window reload, where the grid data is unchanged.
+                if not (self.p3_stack.currentIndex() == 1
+                        and getattr(self, "_grid_dist_id", None) == dist_id):
+                    self.draw_charge_grid(group, cur)
+                    self._grid_dist_id = dist_id
                 self.p3_stack.setCurrentIndex(1)
                 return
+        self._grid_dist_id = None
         self.p3_stack.setCurrentIndex(0)
         self.p3.clear()
         self.p3.setLabel("bottom", "m/z")
@@ -1663,11 +1641,10 @@ class MSViewerTab(QMainWindow):
                             p0.addItem(pg.ScatterPlotItem(x=cpoints["mz"][m], y=cpoints["rt"][m],
                                                           size=4, pen=None, brush=pg.mkBrush(*color)))
 
-                # Row 1: peak area (log).
+                # Row 1: peak area -- linear bars rising from the 0 baseline.
                 p1 = cell(1, ci)
-                p1.setLogMode(y=True)
                 if cmz.size:
-                    p1.addItem(pg.BarGraphItem(x=cmz, height=np.maximum(carea, 1e-9),
+                    p1.addItem(pg.BarGraphItem(x=cmz, height=carea, y0=0.0,
                                                width=BAR_W, brush=pg.mkBrush(*color)))
 
                 # Row 2: charge distances = diff(mz) * charge.
@@ -1677,11 +1654,10 @@ class MSViewerTab(QMainWindow):
                     p2.addItem(pg.BarGraphItem(x=mids, height=np.diff(cmz) * c,
                                                width=BAR_W, brush=pg.mkBrush(*color)))
 
-                # Row 3: cross-charge intensity ratios vs every other charge (log).
-                # Each bar is coloured by the OTHER charge it compares to (ref
-                # cols[nc]); bars are sub-divided so they sit side-by-side.
+                # Row 3: cross-charge intensity ratios vs every other charge.
+                # Linear bars from the 0 baseline; each bar coloured by the OTHER
+                # charge it compares to (ref cols[nc]), sub-divided side-by-side.
                 p3 = cell(3, ci)
-                p3.setLogMode(y=True)
                 nch = len(charges)
                 subw = BAR_W / max(nch, 1)
                 for nc in charges:
@@ -1692,16 +1668,15 @@ class MSViewerTab(QMainWindow):
                     ratio = np.divide(intens[nc][bi:bi + size], denom,
                                       out=np.ones(size), where=denom > 0)
                     bx = cmz[ai:ai + size] + (cols[nc] - (nch - 1) / 2.0) * subw
-                    p3.addItem(pg.BarGraphItem(x=bx, height=np.maximum(ratio, 1e-9),
+                    p3.addItem(pg.BarGraphItem(x=bx, height=ratio, y0=0.0,
                                                width=subw, brush=pg.mkBrush(*charge_color[nc])))
 
-                # Row 4: intensity sum % (log).
+                # Row 4: intensity sum % -- linear bars from the 0 baseline.
                 p4 = cell(4, ci)
-                p4.setLogMode(y=True)
                 n = min(cint.size, intsums.size)
                 if n:
                     denom = np.where(intsums[:n] > 0, intsums[:n], 1.0)
-                    p4.addItem(pg.BarGraphItem(x=cmz[:n], height=np.maximum(cint[:n] / denom, 1e-9),
+                    p4.addItem(pg.BarGraphItem(x=cmz[:n], height=cint[:n] / denom, y0=0.0,
                                                width=BAR_W, brush=pg.mkBrush(*color)))
 
                 # Row 5: adjacency = signed adjacent intensity ratios (symlog-ish).
@@ -1773,8 +1748,9 @@ class MSViewerTab(QMainWindow):
         self._fit_grid_cols()
         self._fit_grid_rows()
 
-    # Rows drawn on a log y-scale (peak area, cross-charge, intensity sum %).
-    GRID_LOG_ROWS = {1, 3, 4}
+    # Non-negative bar rows glued to a 0 baseline (peak area, cross-charge,
+    # intensity sum %): y starts at 0 at the bottom, like the MS2 spectrum.
+    GRID_ZERO_ROWS = {1, 3, 4}
 
     @staticmethod
     def _grid_item_yvals(plotitem):
@@ -1848,25 +1824,19 @@ class MSViewerTab(QMainWindow):
             allv = allv[np.isfinite(allv)]
             if allv.size == 0:
                 continue
-            if ri in self.GRID_LOG_ROWS:
-                # Ignore the tiny 1e-9 padding used for empty/zero bars, which
-                # otherwise stretched the log axis down to 1e-9 and squashed the
-                # real data into a sliver at the top.
-                pos = allv[allv > 1e-7]
-                if pos.size == 0:
-                    pos = allv[allv > 0]
-                if pos.size == 0:
-                    continue
-                lo, hi = np.log10(pos.min()), np.log10(pos.max())
-                if hi - lo < 1e-6:
-                    lo -= 0.5; hi += 0.5
-                pad = (hi - lo) * 0.05
+            hi = float(allv.max())
+            if ri in self.GRID_ZERO_ROWS:
+                # Glue the baseline to 0 at the bottom; only headroom on top.
+                lo = 0.0
+                if hi <= 0:
+                    hi = 1.0
+                master.getViewBox().setYRange(lo, hi * 1.08, padding=0)
             else:
-                lo, hi = float(allv.min()), float(allv.max())
+                lo = float(allv.min())
                 if hi - lo < 1e-9:
                     lo -= 1.0; hi += 1.0
                 pad = (hi - lo) * 0.08
-            master.getViewBox().setYRange(lo - pad, hi + pad, padding=0)
+                master.getViewBox().setYRange(lo - pad, hi + pad, padding=0)
 
     def reset_charge_grid_zoom(self):
         # Deterministic reset (same as the initial fit): no flicker/oscillation.
