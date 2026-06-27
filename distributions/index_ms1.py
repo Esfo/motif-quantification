@@ -92,6 +92,14 @@ class Config:
     # a small penalty so that, all else equal, a 2+/3+ interpretation of the same
     # features wins (a strong 1+ with more peaks still beats a weak 2+).
     charge_one_score_penalty: float = 0.85
+    # Adjacent isotope peaks need not be equal in intensity (the envelope rises
+    # then falls), but a real envelope does not jump by an extreme factor between
+    # neighbours. Reject an edge whose adjacent heights differ by more than this
+    # ratio in either direction -- this kills weak noise peaks bridging two strong
+    # unrelated traces. Replaces the old /2 + step_limit gate that accepted nearly
+    # everything. (step_limit / new_inc_limit are kept for CLI compatibility but
+    # are no longer used by the gate.)
+    max_adjacent_intensity_ratio: float = 10.0
 
     charge_mass_ppm: float = 12.0
     min_charge_group_rt_score: float = 0.10
@@ -795,17 +803,15 @@ def _score_edge(left_i, right_i, charge):
     if neutral_mass <= 0 or neutral_mass > cfg["max_neutral_mass"]:
         return None
 
-    # Reference intensity-step gating (distributionassembly.py:240-278): the
-    # fractional intensity difference between adjacent isotopes is gated more
-    # strictly when intensity is increasing (new_inc_limit) than decreasing
-    # (step_limit).
+    # Adjacent-isotope intensity gate: allow rises and falls, reject only extreme
+    # jumps (a weak noise peak bridging two strong unrelated traces). The old
+    # `abs(diff)/(sum)/2` form maxed out at 0.5 so step_limit=0.5 accepted nearly
+    # every decreasing edge.
     left_h = _EDGE["height"][left_i]
     right_h = _EDGE["height"][right_i]
-    denom = left_h + right_h
-    if denom > 0:
-        intensitypercdiff = abs(right_h - left_h) / denom / 2.0
-        ratiocheck = cfg["new_inc_limit"] if right_h > left_h else cfg["step_limit"]
-        if intensitypercdiff > ratiocheck:
+    if left_h > 0 and right_h > 0:
+        ratio = max(left_h, right_h) / min(left_h, right_h)
+        if ratio > cfg["max_adjacent_intensity_ratio"]:
             return None
 
     left_width = rt_end[left_i] - rt_start[left_i]
@@ -1001,6 +1007,24 @@ def _coherent_rt_path_ids(path, config_dict):
     return residual <= allowed
 
 
+def _envelope_shape_score(heights):
+    # A real isotope envelope is essentially unimodal: it rises to an apex and
+    # falls. Each deep interior valley (a weak peak sitting between two stronger
+    # ones) is the signature of an accidental envelope and is penalised. Returns
+    # 1.0 for a clean rise/fall, lower as interior valleys accumulate.
+    if heights.size < 3:
+        return 1.0
+
+    valleys = 0
+
+    for i in range(1, heights.size - 1):
+        lower_neighbour = min(heights[i - 1], heights[i + 1])
+        if heights[i] < heights[i - 1] and heights[i] < heights[i + 1] and heights[i] < 0.7 * lower_neighbour:
+            valleys += 1
+
+    return 1.0 / (1.0 + valleys)
+
+
 def _distribution_worker_for_charge(charge, edges, config_dict):
     mz_mean = _EDGE["mz_mean"]
     rt_start = _EDGE["rt_start"]
@@ -1079,7 +1103,8 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
         mono_feature_id = int(path_array[0])
 
         score = float(np.mean([edge["score"] for edge in path_edges])) if path_edges else 0.0
-        quality = float(score * math.sqrt(len(path)))
+        shape = _envelope_shape_score(height[path_array])
+        quality = float(score * math.sqrt(len(path)) * shape)
 
         rows.append(
             {
@@ -1454,6 +1479,7 @@ def make_config(args):
         min_distribution_members=args.min_distribution_members,
         min_members_charge_one=args.min_members_charge_one,
         charge_one_score_penalty=args.charge_one_score_penalty,
+        max_adjacent_intensity_ratio=args.max_adjacent_intensity_ratio,
         charge_mass_ppm=args.charge_mass_ppm,
         min_charge_group_rt_score=args.min_charge_group_rt_score,
         charge_tolerance=args.charge_tolerance,
@@ -1690,6 +1716,7 @@ def parse_args():
     parser.add_argument("--min-distribution-members", type=int, default=2)
     parser.add_argument("--min-members-charge-one", type=int, default=3)
     parser.add_argument("--charge-one-score-penalty", type=float, default=0.85)
+    parser.add_argument("--max-adjacent-intensity-ratio", type=float, default=10.0)
 
     parser.add_argument("--charge-mass-ppm", type=float, default=12.0)
     parser.add_argument("--min-charge-group-rt-score", type=float, default=0.10)
