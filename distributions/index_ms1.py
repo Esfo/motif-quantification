@@ -75,7 +75,6 @@ class Config:
     min_peak_prominence_fraction: float = 0.02
     max_trace_peaks: int = 0
 
-    max_charge: int = 6
     isotope_mz_ppm: float = 10.0
     isotope_mz_abs: float = 0.004
     max_neutral_mass: float = 8000.0
@@ -871,44 +870,56 @@ def _edge_worker(start, end, store_edges):
         left_i = int(order[sorted_left])
         left_mz = mz[left_i]
 
-        for charge in range(1, cfg["max_charge"] + 1):
-            target = left_mz + C13_DELTA / charge
+        # Charge is DERIVED from the data, not enumerated against a cap. The
+        # widest possible adjacent-isotope spacing is the C13-C12 gap (charge 1);
+        # higher charges sit proportionally closer. So scan every feature just
+        # above the seed out to one isotope gap and read the charge off the
+        # spacing: charge = round(C13 / spacing). No min/max charge, no flag --
+        # the only bound is what the peak spacing in the data implies.
+        tolerance = max(
+            cfg["isotope_mz_abs"],
+            (left_mz + C13_DELTA) * cfg["isotope_mz_ppm"] / 1_000_000.0,
+        )
 
-            tolerance = max(
-                cfg["isotope_mz_abs"],
-                target * cfg["isotope_mz_ppm"] / 1_000_000.0,
-            )
+        lo = np.searchsorted(sorted_mz, left_mz, side="right")
+        hi = np.searchsorted(sorted_mz, left_mz + C13_DELTA + tolerance, side="right")
 
-            left = np.searchsorted(sorted_mz, target - tolerance, side="left")
-            right = np.searchsorted(sorted_mz, target + tolerance, side="right")
+        best_by_charge = {}
 
-            best = None
+        for sorted_right in range(lo, hi):
+            right_i = int(order[sorted_right])
 
-            for sorted_right in range(left, right):
-                right_i = int(order[sorted_right])
+            if right_i == left_i:
+                continue
 
-                if right_i == left_i:
-                    continue
+            spacing = mz[right_i] - left_mz
 
-                if mz[right_i] <= left_mz:
-                    continue
+            if spacing <= 0:
+                continue
 
-                edge = _score_edge(left_i, right_i, charge)
+            charge = int(round(C13_DELTA / spacing))
 
-                if edge is None:
-                    continue
+            if charge < 1:
+                continue
 
-                if store_edges == "all":
-                    stored_edges.append(edge)
+            edge = _score_edge(left_i, right_i, charge)
 
-                if best is None or edge["score"] > best["score"]:
-                    best = edge
+            if edge is None:
+                continue
 
-            if best is not None:
-                best_edges.append(best)
+            if store_edges == "all":
+                stored_edges.append(edge)
 
-                if store_edges == "best":
-                    stored_edges.append(best)
+            current = best_by_charge.get(charge)
+
+            if current is None or edge["score"] > current["score"]:
+                best_by_charge[charge] = edge
+
+        for edge in best_by_charge.values():
+            best_edges.append(edge)
+
+            if store_edges == "best":
+                stored_edges.append(edge)
 
     return best_edges, stored_edges
 
@@ -1470,7 +1481,6 @@ def make_config(args):
         max_peak_width=args.max_peak_width,
         min_peak_prominence_fraction=args.min_peak_prominence_fraction,
         max_trace_peaks=args.max_trace_peaks,
-        max_charge=args.max_charge,
         isotope_mz_ppm=args.isotope_mz_ppm,
         isotope_mz_abs=args.isotope_mz_abs,
         max_neutral_mass=args.max_neutral_mass,
@@ -1706,7 +1716,6 @@ def parse_args():
     parser.add_argument("--min-peak-prominence-fraction", type=float, default=0.02)
     parser.add_argument("--max-trace-peaks", type=int, default=0)
 
-    parser.add_argument("--max-charge", type=int, default=6)
     parser.add_argument("--isotope-mz-ppm", type=float, default=10.0)
     parser.add_argument("--isotope-mz-abs", type=float, default=0.004)
     parser.add_argument("--max-neutral-mass", type=float, default=8000.0)
