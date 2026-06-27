@@ -100,15 +100,9 @@ class Config:
     high_charge_threshold: int = 5
     high_charge_min_members: int = 3
     # Global charge competition: candidate envelopes compete for features so a
-    # feature belongs to at most one distribution. 1+ candidates are ranked with
-    # a small penalty so that, all else equal, a 2+/3+ interpretation of the same
-    # features wins (a strong 1+ with more peaks still beats a weak 2+).
-    charge_one_score_penalty: float = 0.85
-    # Charge prior in competition: prefer lower charge so a real 2+ envelope wins
-    # the same features over a spurious higher-charge chain unless the higher
-    # charge has clearly stronger evidence. rank *= 1/(1 + strength*(charge-2)),
-    # so charge 2 is the peak; raise strength to push the distribution toward 2+.
-    charge_prior_strength: float = 0.15
+    # feature belongs to at most one distribution. Ranking is pure envelope-fit
+    # evidence (quality) -- no charge prior; the winning charge comes only from
+    # which envelope actually fits the data best.
     # Adjacent isotope peaks need not be equal in intensity (the envelope rises
     # then falls), but a real envelope does not jump by an extreme factor between
     # neighbours. Reject an edge whose adjacent heights differ by more than this
@@ -1239,18 +1233,11 @@ def _min_members_for_charge(charge, config_dict):
     return config_dict["high_charge_min_members"] + extra
 
 
-def _charge_prior(charge, config_dict):
-    # Prefer lower charge: peak at 2, gently down-weight higher charges; 1+ keeps
-    # its own penalty.
-    if charge == 1:
-        return config_dict["charge_one_score_penalty"]
-    return 1.0 / (1.0 + config_dict["charge_prior_strength"] * (charge - 2))
-
-
 def _candidate_rank(row, config_dict):
-    # Higher is stronger. quality rewards member count + edge quality; the charge
-    # prior makes a real 2+ win the same features over a spurious higher charge.
-    return row["quality"] * _charge_prior(row["charge"], config_dict)
+    # Pure evidence: the envelope quality (mean edge fit x sqrt(n) x shape). No
+    # charge prior -- the charge that wins the shared features is the one whose
+    # isotope envelope actually fits best.
+    return row["quality"]
 
 
 def resolve_charge_competition(rows, config_dict):
@@ -1606,8 +1593,6 @@ def make_config(args):
         min_members_charge_one=args.min_members_charge_one,
         high_charge_threshold=args.high_charge_threshold,
         high_charge_min_members=args.high_charge_min_members,
-        charge_one_score_penalty=args.charge_one_score_penalty,
-        charge_prior_strength=args.charge_prior_strength,
         max_adjacent_intensity_ratio=args.max_adjacent_intensity_ratio,
         charge_mass_ppm=args.charge_mass_ppm,
         min_charge_group_rt_score=args.min_charge_group_rt_score,
@@ -1864,8 +1849,6 @@ def parse_args():
     parser.add_argument("--min-members-charge-one", type=int, default=3)
     parser.add_argument("--high-charge-threshold", type=int, default=5)
     parser.add_argument("--high-charge-min-members", type=int, default=3)
-    parser.add_argument("--charge-one-score-penalty", type=float, default=0.85)
-    parser.add_argument("--charge-prior-strength", type=float, default=0.15)
     parser.add_argument("--max-adjacent-intensity-ratio", type=float, default=10.0)
 
     parser.add_argument("--charge-mass-ppm", type=float, default=12.0)

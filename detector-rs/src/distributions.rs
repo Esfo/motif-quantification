@@ -365,16 +365,9 @@ fn min_members_for_charge(charge: i64, cfg: &Config) -> usize {
     }
 }
 
-fn charge_prior(charge: i64, cfg: &Config) -> f64 {
-    if charge == 1 {
-        cfg.charge_one_score_penalty
-    } else {
-        1.0 / (1.0 + cfg.charge_prior_strength * (charge - 2) as f64)
-    }
-}
-
-fn resolve_competition(cfg: &Config, rows: Vec<DistRow>) -> Vec<DistRow> {
-    let rank = |r: &DistRow| -> f64 { r.quality * charge_prior(r.charge, cfg) };
+fn resolve_competition(_cfg: &Config, rows: Vec<DistRow>) -> Vec<DistRow> {
+    // Pure evidence: rank by envelope quality only -- no charge prior.
+    let rank = |r: &DistRow| -> f64 { r.quality };
     let mut idx: Vec<usize> = (0..rows.len()).collect();
     idx.sort_by(|&a, &b| rank(&rows[b]).partial_cmp(&rank(&rows[a])).unwrap());
     let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
