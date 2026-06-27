@@ -73,17 +73,18 @@ fn intensity_score(f: &Features, l: usize, r: usize) -> f64 {
 }
 
 fn score_edge(f: &Features, cfg: &Config, l: usize, r: usize, charge: i64) -> Option<Edge> {
-    // Adjacent isotope spacing is C13/charge (NOT proton), with a tight tolerance
-    // capped below the gap to the adjacent charge's spacing.
-    let expected = C13_DELTA / charge as f64;
+    let expdiff = PROTON / charge as f64;
     let observed = f.mz[r] - f.mz[l];
-    let mz_error = observed - expected;
-    let base_tol = cfg.isotope_mz_abs.max(f.mz[r] * cfg.isotope_mz_ppm / 1_000_000.0);
-    let bin_gap = C13_DELTA / (charge * (charge + 1)) as f64;
-    let tolerance = base_tol.min(0.45 * bin_gap);
-    if mz_error.abs() > tolerance {
+    let acdiff = expdiff - observed;
+    let diffcut = expdiff * cfg.charge_tolerance;
+    let masswidthlimit = cfg.mass_width_limit;
+    let lower = -(diffcut * cfg.charge_tolerance + masswidthlimit);
+    let upper = diffcut + masswidthlimit;
+    if !(acdiff > lower && acdiff <= upper) {
         return None;
     }
+    let mz_error = -acdiff;
+    let tolerance = if upper > 0.0 { upper } else { cfg.isotope_mz_abs.max(1e-9) };
 
     let neutral_mass = (f.mz[l] - PROTON) * charge as f64;
     if neutral_mass <= 0.0 || neutral_mass > cfg.max_neutral_mass {
@@ -179,64 +180,18 @@ pub fn build_edges(f: &Features, cfg: &Config) -> Vec<Edge> {
         .collect()
 }
 
-fn poisson_envelope(lam: f64, n: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; n];
-    if n == 0 {
-        return out;
+fn envelope_shape_score(heights: &[f64]) -> f64 {
+    if heights.len() < 3 {
+        return 1.0;
     }
-    let mut p = (-lam).exp();
-    out[0] = p;
-    for k in 1..n {
-        p *= lam / k as f64;
-        out[k] = p;
-    }
-    out
-}
-
-fn envelope_fit_score(heights: &[f64], neutral_mass: f64) -> f64 {
-    use crate::config::AVERAGINE_LAMBDA_PER_DA;
-    let n = heights.len();
-    let obs_sum: f64 = heights.iter().sum();
-    if n == 0 || obs_sum <= 0.0 {
-        return 0.0;
-    }
-    let lam = (neutral_mass * AVERAGINE_LAMBDA_PER_DA).max(1e-6);
-    let full_n = n.max(lam as usize + 4);
-    let full = poisson_envelope(lam, full_n);
-    let expected = &full[..n];
-
-    let obs_norm: f64 = heights.iter().map(|h| h * h).sum::<f64>().sqrt() + 1e-12;
-    let exp_norm: f64 = expected.iter().map(|e| e * e).sum::<f64>().sqrt() + 1e-12;
-    let cosine: f64 = heights
-        .iter()
-        .zip(expected.iter())
-        .map(|(h, e)| (h / obs_norm) * (e / exp_norm))
-        .sum();
-    let completeness = expected.iter().sum::<f64>() / (full.iter().sum::<f64>() + 1e-12);
-    cosine.max(0.0) * completeness
-}
-
-fn has_monoisotope_predecessor(f: &Features, cfg: &Config, mono: usize, charge: i64) -> bool {
-    let target = f.mz[mono] - C13_DELTA / charge as f64;
-    if target <= 0.0 {
-        return false;
-    }
-    let base_tol = cfg.isotope_mz_abs.max(target * cfg.isotope_mz_ppm / 1_000_000.0);
-    let bin_gap = C13_DELTA / (charge * (charge + 1)) as f64;
-    let tol = base_tol.min(0.45 * bin_gap);
-    let lo = lower_bound(&f.sorted_mz, target - tol);
-    let hi = upper_bound_le(&f.sorted_mz, target + tol);
-    for s in lo..hi {
-        let j = f.order[s];
-        if j == mono {
-            continue;
-        }
-        let overlap = f.rt_end[mono].min(f.rt_end[j]) - f.rt_start[mono].max(f.rt_start[j]);
-        if overlap > 0.0 && f.height[j] >= 0.05 * f.height[mono] {
-            return true;
+    let mut valleys = 0;
+    for i in 1..heights.len() - 1 {
+        let lower = heights[i - 1].min(heights[i + 1]);
+        if heights[i] < heights[i - 1] && heights[i] < heights[i + 1] && heights[i] < 0.7 * lower {
+            valleys += 1;
         }
     }
-    false
+    1.0 / (1.0 + valleys as f64)
 }
 
 fn coherent_rt_path(f: &Features, cfg: &Config, path: &[usize]) -> bool {
@@ -362,20 +317,13 @@ fn dist_worker_for_charge(f: &Features, cfg: &Config, charge: i64, edges: &[&Edg
         };
         let apex_feature = path[apex_local];
         let mono = path[0];
-
-        // Reject if the leftmost member isn't really monoisotopic.
-        if has_monoisotope_predecessor(f, cfg, mono, charge) {
-            continue;
-        }
-
-        let neutral_mass = (f.mz[mono] - PROTON) * charge as f64;
         let score = if path_edges.is_empty() {
             0.0
         } else {
             path_edges.iter().map(|e| e.score).sum::<f64>() / path_edges.len() as f64
         };
-        let fit = envelope_fit_score(&heights, neutral_mass);
-        let quality = score * (path.len() as f64).sqrt() * fit;
+        let shape = envelope_shape_score(&heights);
+        let quality = score * (path.len() as f64).sqrt() * shape;
 
         let members: Vec<(usize, i64, f64)> = path
             .iter()
@@ -389,7 +337,7 @@ fn dist_worker_for_charge(f: &Features, cfg: &Config, charge: i64, edges: &[&Edg
         rows.push(DistRow {
             distribution_id: -1,
             charge,
-            neutral_mass,
+            neutral_mass: (f.mz[mono] - PROTON) * charge as f64,
             mono_mz: f.mz[mono],
             rt_start: path.iter().map(|&p| f.rt_start[p]).fold(f64::INFINITY, f64::min),
             rt_apex: f.rt_apex[apex_feature],
@@ -406,15 +354,14 @@ fn dist_worker_for_charge(f: &Features, cfg: &Config, charge: i64, edges: &[&Edg
     rows
 }
 
-fn min_members_for_charge(charge: i64, _cfg: &Config) -> usize {
-    // Evidence floor: a two-peak "envelope" is just a coeluting pair. Require
-    // enough isotope peaks to actually call the charge.
-    //   z=1 -> 4, z=2/3 -> 3, z=4/5 -> 4, z>=6 -> 5
-    match charge {
-        1 => 4,
-        2 | 3 => 3,
-        4 | 5 => 4,
-        _ => 5,
+fn min_members_for_charge(charge: i64, cfg: &Config) -> usize {
+    if charge == 1 {
+        cfg.min_members_charge_one
+    } else if charge <= cfg.high_charge_threshold {
+        cfg.min_distribution_members
+    } else {
+        let extra = ((charge - cfg.high_charge_threshold - 1) / 5).max(0) as usize;
+        cfg.high_charge_min_members + extra
     }
 }
 

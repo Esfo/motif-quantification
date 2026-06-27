@@ -31,10 +31,6 @@ except ImportError:
 
 
 C13_DELTA = 1.00335483507
-# Expected number of C13 incorporations per Da for an averagine peptide
-# (~avg carbon fraction x C13 natural abundance). The isotope envelope is well
-# approximated by a Poisson(lambda = mass * this) over the isotope index.
-AVERAGINE_LAMBDA_PER_DA = 0.000594
 SCRIPT_VERSION = "0.3.0"
 
 _EDGE = {}
@@ -867,20 +863,22 @@ def _score_edge(left_i, right_i, charge):
     rt_apex = _EDGE["rt_apex"]
     rt_end = _EDGE["rt_end"]
 
-    # Adjacent isotope peaks are spaced by the C13-C12 gap / charge (NOT proton).
-    # Score against that, with a TIGHT symmetric tolerance that can never reach
-    # the adjacent charge's spacing (the z vs z+1 spacings differ by
-    # C13/(z*(z+1)), so cap the tolerance below half that gap).
-    expected = C13_DELTA / charge
+    # Faithful to the reference (distributionassembly.py:226-231): acdiff is the
+    # signed deviation of the observed isotope spacing from proton/charge, with an
+    # ASYMMETRIC tolerance scaled by charge_tolerance (+ mass_width_limit).
+    expdiff = proton / charge
     observed = mz[right_i] - mz[left_i]
-    mz_error = observed - expected
+    acdiff = expdiff - observed
+    diffcut = expdiff * cfg["charge_tolerance"]
+    masswidthlimit = cfg["mass_width_limit"]
+    lower = -(diffcut * cfg["charge_tolerance"] + masswidthlimit)
+    upper = diffcut + masswidthlimit
 
-    base_tol = max(cfg["isotope_mz_abs"], mz[right_i] * cfg["isotope_mz_ppm"] / 1_000_000.0)
-    bin_gap = C13_DELTA / (charge * (charge + 1))
-    tolerance = min(base_tol, 0.45 * bin_gap)
-
-    if abs(mz_error) > tolerance:
+    if not (acdiff > lower and acdiff <= upper):
         return None
+
+    mz_error = -acdiff
+    tolerance = upper if upper > 0 else max(cfg["isotope_mz_abs"], 1e-9)
 
     neutral_mass = (mz[left_i] - proton) * charge
 
@@ -1103,74 +1101,22 @@ def _coherent_rt_path_ids(path, config_dict):
     return residual <= allowed
 
 
-def _averagine_envelope(neutral_mass, n):
-    # Poisson(lambda) isotope pattern for a peptide of this neutral mass, over
-    # isotope indices 0..n-1. lambda grows with mass, so the apex shifts to
-    # M+1/M+2 for large peptides -- exactly the mass-dependence a real envelope
-    # must obey.
-    lam = max(neutral_mass * AVERAGINE_LAMBDA_PER_DA, 1e-6)
-    expected = np.empty(n, dtype=np.float64)
-    p = math.exp(-lam)
-    expected[0] = p
-    for k in range(1, n):
-        p *= lam / k
-        expected[k] = p
-    return expected, lam
+def _envelope_shape_score(heights):
+    # A real isotope envelope is essentially unimodal: it rises to an apex and
+    # falls. Each deep interior valley (a weak peak sitting between two stronger
+    # ones) is the signature of an accidental envelope and is penalised. Returns
+    # 1.0 for a clean rise/fall, lower as interior valleys accumulate.
+    if heights.size < 3:
+        return 1.0
 
+    valleys = 0
 
-def _envelope_fit_score(heights, neutral_mass):
-    # How well the observed isotope intensities match the averagine (Poisson)
-    # envelope for this neutral mass: cosine similarity x completeness (the
-    # fraction of the expected envelope the observed peaks actually cover). A
-    # random 2-peak high-charge pair covers little of a broad expected envelope
-    # and scores low; a real envelope scores high.
-    obs = np.asarray(heights, dtype=np.float64)
-    n = obs.size
-    if n == 0 or obs.sum() <= 0:
-        return 0.0
+    for i in range(1, heights.size - 1):
+        lower_neighbour = min(heights[i - 1], heights[i + 1])
+        if heights[i] < heights[i - 1] and heights[i] < heights[i + 1] and heights[i] < 0.7 * lower_neighbour:
+            valleys += 1
 
-    lam = max(neutral_mass * AVERAGINE_LAMBDA_PER_DA, 1e-6)
-    full_n = max(n, int(lam) + 4)
-    full, _ = _averagine_envelope(neutral_mass, full_n)
-    expected = full[:n]
-
-    obs_norm = obs / (np.linalg.norm(obs) + 1e-12)
-    exp_norm = expected / (np.linalg.norm(expected) + 1e-12)
-    cosine = float(np.dot(obs_norm, exp_norm))
-    completeness = float(expected.sum() / (full.sum() + 1e-12))
-    return max(0.0, cosine) * completeness
-
-
-def _has_monoisotope_predecessor(mono_i, charge, config_dict):
-    # A real monoisotopic peak has no coeluting feature one isotope step BELOW it
-    # (mono_mz - C13/charge). If one exists, the path started at M+1/M+2 and the
-    # neutral mass would be wrong -- reject it.
-    mz = _EDGE["mz_mean"]
-    sorted_mz = _EDGE["sorted_mz"]
-    order = _EDGE["order"]
-    rt_start = _EDGE["rt_start"]
-    rt_end = _EDGE["rt_end"]
-    height = _EDGE["height"]
-
-    target = mz[mono_i] - C13_DELTA / charge
-    if target <= 0:
-        return False
-
-    tol = max(config_dict["isotope_mz_abs"], target * config_dict["isotope_mz_ppm"] / 1_000_000.0)
-    bin_gap = C13_DELTA / (charge * (charge + 1))
-    tol = min(tol, 0.45 * bin_gap)
-
-    lo = np.searchsorted(sorted_mz, target - tol, side="left")
-    hi = np.searchsorted(sorted_mz, target + tol, side="right")
-
-    for s in range(lo, hi):
-        j = int(order[s])
-        if j == mono_i:
-            continue
-        overlap = min(rt_end[mono_i], rt_end[j]) - max(rt_start[mono_i], rt_start[j])
-        if overlap > 0 and height[j] >= 0.05 * height[mono_i]:
-            return True
-    return False
+    return 1.0 / (1.0 + valleys)
 
 
 def _distribution_worker_for_charge(charge, edges, config_dict):
@@ -1244,20 +1190,14 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
         apex_feature_id = int(path_array[np.argmax(height[path_array])])
         mono_feature_id = int(path_array[0])
 
-        # The leftmost member must actually be monoisotopic: reject if a coeluting
-        # feature sits one isotope step below it.
-        if _has_monoisotope_predecessor(mono_feature_id, charge, config_dict):
-            continue
-
-        neutral_mass = float((mz_mean[mono_feature_id] - proton) * charge)
         score = float(np.mean([edge["score"] for edge in path_edges])) if path_edges else 0.0
-        fit = _envelope_fit_score(height[path_array], neutral_mass)
-        quality = float(score * math.sqrt(len(path)) * fit)
+        shape = _envelope_shape_score(height[path_array])
+        quality = float(score * math.sqrt(len(path)) * shape)
 
         rows.append(
             {
                 "charge": int(charge),
-                "neutral_mass": neutral_mass,
+                "neutral_mass": float((mz_mean[mono_feature_id] - proton) * charge),
                 "mono_mz": float(mz_mean[mono_feature_id]),
                 "rt_start": float(np.min(rt_start[path_array])),
                 "rt_apex": float(rt_apex[apex_feature_id]),
@@ -1283,11 +1223,14 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
 
 
 def _min_members_for_charge(charge, config_dict):
-    # Evidence floor: a two-peak "envelope" is just a coeluting pair, which is
-    # constant noise in a dense map -- especially at z>=4 where the spacing is
-    # tiny. Require enough isotope peaks to actually call the charge.
-    #   z=1 -> 4, z=2/3 -> 3, z=4/5 -> 4, z>=6 -> 5
-    return {1: 4, 2: 3, 3: 3, 4: 4, 5: 4}.get(charge, 5)
+    # Higher charges (tinier isotope spacing) are easy to fake from accidental
+    # pairs, so require more peaks as charge rises.
+    if charge == 1:
+        return config_dict["min_members_charge_one"]
+    if charge <= config_dict["high_charge_threshold"]:
+        return config_dict["min_distribution_members"]
+    extra = (charge - config_dict["high_charge_threshold"] - 1) // 5
+    return config_dict["high_charge_min_members"] + extra
 
 
 def _candidate_rank(row, config_dict):

@@ -2,9 +2,6 @@
 
 pub const PROTON: f64 = 1.007276554940804;
 pub const C13_DELTA: f64 = 1.00335483507;
-/// Expected C13 incorporations per Da (averagine); the isotope envelope is
-/// approximated by Poisson(lambda = mass * this).
-pub const AVERAGINE_LAMBDA_PER_DA: f64 = 0.000594;
 
 #[derive(Clone, Debug)]
 // Some fields mirror the Python Config for parity but are not read by the Rust
