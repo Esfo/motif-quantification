@@ -232,12 +232,14 @@ CHARGE_TAB_COLUMNS = [
 
 
 def _gtick(value):
-    """Compact y-tick label so values fit a narrow axis."""
+    """Compact y-tick label so values stay narrow (no overlap with the row
+    label): drop the exponent's '+'/leading zero, e.g. 1.98e+05 -> 1.98e5."""
     if value == 0:
         return "0"
     a = abs(value)
     if a >= 1e4 or a < 1e-2:
-        return f"{value:.1e}"
+        s = f"{value:.2e}"
+        return s.replace("e+0", "e").replace("e+", "e").replace("e-0", "e-")
     return f"{value:.3g}"
 
 
@@ -2140,7 +2142,7 @@ class MSViewerTab(QMainWindow):
 
             # Y axis: EVERY column reserves the same axis width so all columns
             # (and their plots) are exactly equal; only the leftmost shows values.
-            left.setWidth(60)
+            left.setWidth(54)
             if ci == 0:
                 row_first[ri] = p
                 p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
@@ -2315,7 +2317,7 @@ class MSViewerTab(QMainWindow):
         # column's plots are wider than another's.
         try:
             glayout = self.p3_grid.ci.layout
-            glayout.setHorizontalSpacing(1)   # tight gaps -> reclaim blank space
+            glayout.setHorizontalSpacing(0)   # tight gaps -> reclaim blank space
             glayout.setVerticalSpacing(1)
             glayout.setContentsMargins(2, 2, 2, 2)
             for ci in range(len(charges)):
