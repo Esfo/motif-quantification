@@ -116,6 +116,14 @@ class Config:
     charge_mass_ppm: float = 12.0
     min_charge_group_rt_score: float = 0.55
 
+    # Envelope-first builder (envelope.py). Charge is decided by fitting the whole
+    # isotope lattice, not from a single adjacent spacing. min_trace_similarity
+    # gates which coeluting features may join a lattice (chromatographic-shape
+    # cosine); min_envelope_score is the floor on the combined evidence score
+    # (m/z lattice + averagine + trace shape + missing-peak).
+    min_trace_similarity: float = 0.5
+    min_envelope_score: float = 0.45
+
     # Reference (distributionassembly.py) isotope-edge acceptance, ported faithfully:
     # asymmetric acdiff tolerance around proton-spacing, plus intensity-step gating.
     # mass_width_limit stands in for the reference masswidthlimit (=roundcutoff*2),
@@ -1304,7 +1312,48 @@ def resolve_charge_competition(rows, config_dict):
     return kept
 
 
-def build_distributions(features, best_edges, config, workers=1, progress=False):
+def build_distributions(features, traces, config, progress=False):
+    """Envelope-first distribution builder (see distributions/envelope.py).
+
+    Charge is decided by fitting the whole isotope lattice per local cluster
+    (averagine + trace-shape + missing-peak evidence, no path-length reward),
+    not read off a single adjacent spacing. Isotope edges are still produced
+    upstream but only as a diagnostic table, not as the charge authority.
+    """
+    try:
+        from .envelope import build_distributions_envelope
+    except ImportError:
+        from envelope import build_distributions_envelope
+
+    config_dict = asdict(config)
+    rows = build_distributions_envelope(features, traces, config_dict, progress=progress)
+
+    rows.sort(key=lambda row: (row["charge"], row["neutral_mass"], row["rt_apex"], row["mono_mz"]))
+
+    distributions = []
+    for distribution_id, row in enumerate(rows):
+        distributions.append(
+            Distribution(
+                distribution_id=distribution_id,
+                charge=row["charge"],
+                neutral_mass=row["neutral_mass"],
+                mono_mz=row["mono_mz"],
+                rt_start=row["rt_start"],
+                rt_apex=row["rt_apex"],
+                rt_end=row["rt_end"],
+                ms1_start=row["ms1_start"],
+                ms1_apex=row["ms1_apex"],
+                ms1_end=row["ms1_end"],
+                n_members=row["n_members"],
+                score=row["score"],
+                quality=row["quality"],
+                members=row["members"],
+            )
+        )
+    return distributions
+
+
+def _build_distributions_edge_first(features, best_edges, config, workers=1, progress=False):
     if not best_edges:
         return []
 
@@ -1335,7 +1384,7 @@ def build_distributions(features, best_edges, config, workers=1, progress=False)
             context = None
 
         if context is None:
-            return build_distributions(
+            return _build_distributions_edge_first(
                 features=features,
                 best_edges=best_edges,
                 config=config,
@@ -1721,9 +1770,8 @@ def run(args):
 
     distributions = build_distributions(
         features=model.features,
-        best_edges=best_edges,
+        traces=model.feature_traces,
         config=config,
-        workers=workers,
         progress=bool(args.progress),
     )
 
