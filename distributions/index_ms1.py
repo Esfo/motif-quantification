@@ -57,10 +57,11 @@ class Config:
     line_merge_mz_abs: float = 0.004
     line_merge_gap_scans: int = 6
 
-    # split_trace only splits a continuous line into multiple features when a
-    # genuine valley separates two apices (valley < fraction * smaller apex);
-    # shallow dips on a single elution peak are kept as one feature.
-    min_split_valley_fraction: float = 0.5
+    # Optional post-merge of peaks that axis_peaks resolved: combine two apices
+    # only when no real valley separates them. DEFAULT 0.0 = disabled, so the
+    # existing peak picker (peaks.axis_peaks) is authoritative and we never merge
+    # two peaks it deliberately kept separate. Set > 0 to re-enable.
+    min_split_valley_fraction: float = 0.0
 
     min_trace_points: int = 4
     peak_mindist: int = 2
@@ -1691,7 +1692,7 @@ def parse_args():
     parser.add_argument("--line-merge-mz-ppm", type=float, default=10.0)
     parser.add_argument("--line-merge-mz-abs", type=float, default=0.004)
     parser.add_argument("--line-merge-gap-scans", type=int, default=6)
-    parser.add_argument("--min-split-valley-fraction", type=float, default=0.5)
+    parser.add_argument("--min-split-valley-fraction", type=float, default=0.0)
 
     parser.add_argument("--min-trace-points", type=int, default=4)
     parser.add_argument("--peak-mindist", type=int, default=2)
