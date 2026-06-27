@@ -745,9 +745,7 @@ class MSViewerTab(QMainWindow):
         self.table1.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table1.verticalHeader().setVisible(False)
 
-        # 'lines' + 'distributions' tabs: sortable, double-click to jump.
-        self.lines_view, self.lines_model = self._make_table_view(
-            LINES_TAB_COLUMNS, self._on_line_activated)
+        # 'distributions' tab: sortable, double-click to jump.
         self.dists_view, self.dists_model = self._make_table_view(
             DIST_TAB_COLUMNS, self._on_distribution_activated)
 
@@ -760,10 +758,10 @@ class MSViewerTab(QMainWindow):
         self.charge_tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.charge_tree.setSortingEnabled(True)
         self.charge_tree.doubleClicked.connect(self._on_charge_tree_activated)
+        self.charge_tree.expanded.connect(self._on_charge_expanded)
 
         self.table1_tabs = QTabWidget()
         self.table1_tabs.addTab(self.table1, "current")
-        self.table1_tabs.addTab(self.lines_view, "lines")
         self.table1_tabs.addTab(self.dists_view, "distributions")
         self.table1_tabs.addTab(self.charge_tree, "charge distributions")
         self.table1_tabs.currentChanged.connect(self._on_table1_tab_changed)
@@ -1829,8 +1827,7 @@ class MSViewerTab(QMainWindow):
     def reset_table1_tabs(self):
         """Forget loaded tab data (call when the file/db changes)."""
         self._table1_loaded = set()
-        if getattr(self, "lines_model", None) is not None:
-            self.lines_model.set_rows([])
+        if getattr(self, "dists_model", None) is not None:
             self.dists_model.set_rows([])
             self.charge_model.removeRows(0, self.charge_model.rowCount())
         # Re-populate whatever tab is currently visible.
@@ -1843,9 +1840,7 @@ class MSViewerTab(QMainWindow):
         name = self.table1_tabs.tabText(index)
         if name in self._table1_loaded:
             return
-        if name == "lines":
-            self.lines_model.set_rows(self.db.all_lines())
-        elif name == "distributions":
+        if name == "distributions":
             self.dists_model.set_rows(self.db.all_distributions())
         elif name == "charge distributions":
             self._load_charge_tree()
@@ -1854,31 +1849,50 @@ class MSViewerTab(QMainWindow):
         self._table1_loaded.add(name)
 
     def _load_charge_tree(self):
+        # Build ONLY the top-level analyte rows; children (member distributions)
+        # are loaded lazily on expand. A single placeholder child gives each row
+        # an expand arrow without querying anything up front. Sorting/updates are
+        # disabled during the bulk build for speed.
+        self.charge_tree.setSortingEnabled(False)
+        self.charge_tree.setUpdatesEnabled(False)
         self.charge_model.removeRows(0, self.charge_model.rowCount())
         self.charge_model.setHorizontalHeaderLabels([h for _, h, _ in CHARGE_TAB_COLUMNS])
         for analyte in self.db.all_analytes():
             top = [QStandardItem(_fmt(analyte.get(f), k)) for f, _, k in CHARGE_TAB_COLUMNS]
             for col, (f, _, k) in enumerate(CHARGE_TAB_COLUMNS):
                 top[col].setData(analyte.get(f), Qt.EditRole)
-            top[0].setData({"_analyte": True}, Qt.UserRole)
-            # children = member distributions mapped into the same columns
-            for d in self.db.analyte_distributions(analyte["analyte_id"]):
-                mapped = {
-                    "neutral_mass": d.get("neutral_mass"),
-                    "charge_min": d.get("charge"),
-                    "charge_max": d.get("charge"),
-                    "n_distributions": d.get("n_members"),
-                    "rt_apex": d.get("rt_apex"),
-                    "rt_start": d.get("rt_start"),
-                    "rt_end": d.get("rt_end"),
-                    "score": d.get("quality"),
-                }
-                child = [QStandardItem(_fmt(mapped.get(f), k)) for f, _, k in CHARGE_TAB_COLUMNS]
-                for col, (f, _, k) in enumerate(CHARGE_TAB_COLUMNS):
-                    child[col].setData(mapped.get(f), Qt.EditRole)
-                child[0].setData(d, Qt.UserRole)  # the distribution dict, for jump
-                top[0].appendRow(child)
+            top[0].setData(analyte, Qt.UserRole)        # analyte dict (has analyte_id)
+            top[0].setData(False, Qt.UserRole + 1)      # children-loaded flag
+            top[0].appendRow(QStandardItem(""))          # single placeholder -> expand arrow
             self.charge_model.appendRow(top)
+        self.charge_tree.setUpdatesEnabled(True)
+        self.charge_tree.setSortingEnabled(True)
+
+    def _on_charge_expanded(self, index):
+        item0 = self.charge_model.itemFromIndex(index.sibling(index.row(), 0))
+        if item0 is None or item0.data(Qt.UserRole + 1):
+            return
+        analyte = item0.data(Qt.UserRole)
+        if not isinstance(analyte, dict) or "analyte_id" not in analyte:
+            return
+        item0.setData(True, Qt.UserRole + 1)
+        item0.removeRows(0, item0.rowCount())  # drop placeholder
+        for d in self.db.analyte_distributions(analyte["analyte_id"]):
+            mapped = {
+                "neutral_mass": d.get("neutral_mass"),
+                "charge_min": d.get("charge"),
+                "charge_max": d.get("charge"),
+                "n_distributions": d.get("n_members"),
+                "rt_apex": d.get("rt_apex"),
+                "rt_start": d.get("rt_start"),
+                "rt_end": d.get("rt_end"),
+                "score": d.get("quality"),
+            }
+            child = [QStandardItem(_fmt(mapped.get(f), k)) for f, _, k in CHARGE_TAB_COLUMNS]
+            for col, (f, _, k) in enumerate(CHARGE_TAB_COLUMNS):
+                child[col].setData(mapped.get(f), Qt.EditRole)
+            child[0].setData(d, Qt.UserRole)  # distribution dict, for jump
+            item0.appendRow(child)
 
     def _jump_to(self, mz_center, rt, distribution_id=None):
         """Centre panels 1 & 2 on (m/z, RT) and optionally select a distribution."""
