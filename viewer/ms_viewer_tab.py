@@ -408,6 +408,9 @@ class MSViewerTab(QMainWindow):
         self._selected_charge_group = None   # {charge: {distribution, features}} for the analyte
         self._selected_bbox = None           # (mz_min, mz_max, rt_start, rt_end) of the selection
         self._sel_border_item = None         # the dotted-rectangle item on panel 2
+        self._border_color = None            # None = normal (fg); "red" = hypothetical box
+        self._selected_rt_band = None        # (rt_start, rt_end) of the analyte, for hypotheticals
+        self._selected_n_members = None      # isotope count of the selection, for hypothetical width
         self._panel3_mode = "ms1"  # "ms1" (envelope/charge grid) or "ms2" (spectrum)
         self._ms2_scan = None      # the MS2 scan currently shown in panel 3
         self._nav = []            # navigation history of (window, charge)
@@ -2720,6 +2723,7 @@ class MSViewerTab(QMainWindow):
             self.current["neutral_mass"] = dist.get("neutral_mass")
             self.current["rt"] = dist.get("rt_apex")
         self.assumed_charge = dist.get("charge")
+        self._border_color = None   # a real distribution -> normal (fg) border
         if members:
             self._selected_bbox = (
                 min(m["mz_min"] for m in members),
@@ -2727,12 +2731,40 @@ class MSViewerTab(QMainWindow):
                 min(m["rt_start"] for m in members),
                 max(m["rt_end"] for m in members),
             )
+            self._selected_rt_band = (self._selected_bbox[2], self._selected_bbox[3])
+            self._selected_n_members = len(members)
         else:
             self._selected_bbox = None
         if not keep_group:
             self._selected_charge_group = self.db.charge_group(distribution_id)
         self._selected_dist_id = distribution_id
         self._render_selection_border()
+
+    def _set_hypothetical(self, charge):
+        """Show a RED dotted box where the distribution at `charge` *would* sit if
+        it existed: the theoretical isotope m/z span at the selection's neutral
+        mass, over the analyte's RT band. Auto-fits to it like a real lock-on."""
+        nm = self.current.get("neutral_mass") if isinstance(self.current, dict) else None
+        if nm is None:
+            self._clear_selection()
+            self._recenter_for_charge()
+            return
+        n = self._selected_n_members or 6
+        mzs = isotope_mzs(nm, max(1, charge), n=n)
+        if not mzs:
+            self._clear_selection()
+            self._recenter_for_charge()
+            return
+        if self._selected_rt_band is not None:
+            y0, y1 = self._selected_rt_band
+        elif self.window is not None:
+            y0, y1 = self.window[2], self.window[3]
+        else:
+            y0, y1 = 0.0, 1.0
+        self._selected_bbox = (min(mzs), max(mzs), y0, y1)
+        self._border_color = "red"
+        self._selected_dist_id = None
+        self._fit_to_selected()
 
     def _clear_selection(self):
         self._selected_bbox = None
@@ -2756,7 +2788,8 @@ class MSViewerTab(QMainWindow):
         py = (y1 - y0) * 0.04 + 1e-4
         xs = np.array([x0 - px, x1 + px, x1 + px, x0 - px, x0 - px])
         ys = np.array([y0 - py, y0 - py, y1 + py, y1 + py, y0 - py])
-        pen = pg.mkPen(color=palette(self.theme)["fg"], width=1.4, style=Qt.DashLine)
+        color = (230, 70, 70) if self._border_color == "red" else palette(self.theme)["fg"]
+        pen = pg.mkPen(color=color, width=1.4, style=Qt.DashLine)
         item = pg.PlotCurveItem(xs, ys, pen=pen)
         item.setZValue(50)
         self.p2.addItem(item)
@@ -2806,13 +2839,12 @@ class MSViewerTab(QMainWindow):
             self._set_selected(did, keep_group=True)
             self._fit_to_selected()
             return
-        # Otherwise keep the free theoretical search (recentre where that charge
-        # would be) and drop the border -- no distribution exists there.
+        # Otherwise no distribution exists at this charge: show a RED box where the
+        # hypothetical distribution would be, and fit to it.
         self.assumed_charge = target
         if isinstance(self.current, dict):
             self.current["charge"] = target
-        self._clear_selection()
-        self._recenter_for_charge()
+        self._set_hypothetical(target)
 
     def set_charge(self, z):
         if self.current is None:
