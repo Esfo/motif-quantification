@@ -139,10 +139,14 @@ class EvidenceWorker(QThread):
             self.done.emit({"error": f"{exc}\n{traceback.format_exc()}"})
 
 
-# Left margin (px) before panel 2's plot (the MS2 strip width). Panel 1's 2D
-# left axis and the 3D's left spacer use the SAME value so all three plots'
-# m/z (x) axes start at the same screen x and line up.
-MS2_STRIP_W = 70
+# Horizontal alignment of the m/z (x) axis across panel 1 (2D & 3D) and panel 2.
+# Panel 2's plot starts at the MS2 strip (pure bands) + its OWN real RT axis;
+# panel 1's 2D left axis and the 3D's left gutter are set to that same total
+# (PLOT_LEFT) so a given m/z sits at the same screen x in all of them. Using a
+# real (fixed-width) axis on BOTH panels is what makes it deterministic.
+MS2_STRIP_W = 34       # MS2 strip: pure bands, no axis
+P2_AXIS_W = 46         # panel 2's RT (y) axis width
+PLOT_LEFT = MS2_STRIP_W + P2_AXIS_W   # = where every plot's m/z axis begins
 
 
 DIST_PALETTE = [
@@ -351,21 +355,16 @@ class MSViewerTab(QMainWindow):
             self.p1_3d = gl.GLViewWidget()
             self.p1_3d.opts["fov"] = self._p1_3d_fov
             self.p1_3d.setCameraPosition(**self._p1_3d_cam)
+            from PySide6.QtWidgets import QSizePolicy
+            self.p1_3d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.p1_scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3), dtype=np.float32), size=4.0)
             self.p1_scatter.setVisible(False)
             self.p1_3d.addItem(self.p1_scatter)
-            # Left spacer = the strip width, so the 3D content starts at the same
-            # screen x as panel 2's plot (and panel 1's 2D plot), keeping m/z
-            # aligned across all three.
-            gl_row = QWidget()
-            hb = QHBoxLayout(gl_row)
-            hb.setContentsMargins(0, 0, 0, 0)
-            hb.setSpacing(0)
-            spacer = QWidget()
-            spacer.setFixedWidth(MS2_STRIP_W)
-            hb.addWidget(spacer)
-            hb.addWidget(self.p1_3d, stretch=1)
-            self.p1_3d_widget = gl_row
+            # The GL widget fills the WHOLE panel (same area as the 2D plot widget);
+            # the m/z data is offset within it (in draw_panel1_3d) so it starts at
+            # the strip width, matching panel 2 -- the empty left gutter mirrors the
+            # 2D plot's left axis area.
+            self.p1_3d_widget = self.p1_3d
         else:
             self.p1_3d = QLabel("3D needs pyqtgraph OpenGL (pip install PyOpenGL)")
             self.p1_3d.setAlignment(Qt.AlignCenter)
@@ -432,25 +431,32 @@ class MSViewerTab(QMainWindow):
         return
 
     def reset_3d_view(self):
-        """Return the 3D view to the front-on, panel-2-aligned 2D-like view."""
+        """Return the 3D view to the EXACT front-on, panel-2-aligned spawn view --
+        including resetting the pan centre, which ctrl+drag moves (that's why it
+        didn't realign after panning)."""
         if HAVE_GL:
+            try:
+                self.p1_3d.opts["center"] = pg.Vector(0.0, 0.0, 0.0)
+            except Exception:
+                pass
             self.p1_3d.opts["fov"] = self._p1_3d_fov
             self.p1_3d.setCameraPosition(**self._p1_3d_cam)
+            # Re-fit the data to the (possibly resized) pane.
+            if getattr(self, "_p1_3d_inputs", None) is not None:
+                self.draw_panel1_3d(*self._p1_3d_inputs)
 
     def build_panel2_dock(self):
         # Thin MS2 strip to the left of panel 2: MS2 scans as clickable points,
         # RT-aligned with panel 2 (shared y). It fits in the space panel 1's wide
         # y-axis labels leave between panels 1 and 2.
         self.ms2_plot = pg.PlotWidget()
-        # The strip is the RT (y) ruler for the whole row and is the ONLY left
-        # margin before panel 2's plot (panel 2 has no left axis), so panel 2's
-        # plot starts exactly at the strip's right edge. Panel 1's left axis is
-        # set to this same width below, which is what keeps the m/z (x) axes of
-        # panel 1 and panel 2 aligned.
+        # Pure band strip (no axis), fixed width. The RT scale lives on panel 2's
+        # own left axis to its right; using real axes on both panels is what keeps
+        # the m/z (x) axes deterministically aligned.
         self.ms2_plot.setFixedWidth(MS2_STRIP_W)
         self.ms2_plot.setMouseEnabled(x=False, y=True)
         self.ms2_plot.getPlotItem().hideAxis("bottom")
-        self.ms2_plot.setLabel("left", "MS2 RT", units="min")
+        self.ms2_plot.getPlotItem().hideAxis("left")
         # Fix the x range so the strip never collapses when RT (y) is zoomed.
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
         self.ms2_plot.getViewBox().setMouseEnabled(x=False, y=True)
@@ -469,21 +475,22 @@ class MSViewerTab(QMainWindow):
         self.ms2_plot.scene().sigMouseClicked.connect(self._on_ms2_strip_clicked)
         self._ms2_all = []      # all loaded MS2 scans; filtered to the view below
 
-        # Panel 2: m/z on x (aligned with panel 1), RT on y. It has NO left axis
-        # at all -- the MS2 strip to its left is the RT ruler -- so its plot area
-        # begins exactly at the strip's right edge (MS2_STRIP_W).
+        # Panel 2: m/z on x (aligned with panel 1), RT on its own real left axis
+        # (fixed width) sitting to the right of the band strip.
         self.p2 = pg.PlotWidget()
         self.p2.setLabel("bottom", "m/z")
-        self.p2.getPlotItem().hideAxis("left")
+        self.p2.setLabel("left", "RT", units="min")
+        self.p2.getAxis("left").setWidth(P2_AXIS_W)
         self.p2_image = pg.ImageItem()
         if self._cmap is not None:
             self.p2_image.setColorMap(self._cmap)
         self.p2.addItem(self.p2_image)
 
-        # The m/z (x) axes align because panel 2's plot starts at MS2_STRIP_W
-        # (the strip width, panel 2 having no left axis) and panel 1's left axis
-        # is the SAME width -- so a given m/z sits at the same screen x in both.
-        self.p1_2d.getAxis("left").setWidth(MS2_STRIP_W)
+        # The m/z (x) axes align because panel 2's plot starts at PLOT_LEFT
+        # (strip + its RT axis) and panel 1's left axis is the SAME width -- so a
+        # given m/z sits at the same screen x in both. Both use real fixed-width
+        # axes, which makes the alignment deterministic.
+        self.p1_2d.getAxis("left").setWidth(PLOT_LEFT)
 
         # No in-plot auto-range "A" buttons (they overlapped the data).
         self.p2.getPlotItem().hideButtons()
@@ -550,10 +557,10 @@ class MSViewerTab(QMainWindow):
         self.p3_stack.addWidget(self.p3)        # 0 = single plot
         self.p3_stack.addWidget(self.p3_grid)   # 1 = charge grid
 
-        # No leftover "Panel 3" caption (matches panels 1/2, which have none); the
-        # label is reused only for the per-plot status / loading line.
+        # p3_title still exists (error/status sink for setText calls) but is NOT
+        # shown -- the user wants no descriptive caption above panel 3.
         self.p3_title = QLabel("")
-        self.p3_title.setStyleSheet("font-weight: bold;")
+        self.p3_title.setVisible(False)
         self.p3_loading = QLabel("")
         self.p3_loading.setStyleSheet("color: black;")
 
@@ -561,7 +568,6 @@ class MSViewerTab(QMainWindow):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.addWidget(self.p3_loading)
-        layout.addWidget(self.p3_title)
         layout.addWidget(self.p3_stack, stretch=1)
 
         dock = QDockWidget("", self)
@@ -1031,7 +1037,6 @@ class MSViewerTab(QMainWindow):
     def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end):
         self.p1_2d.clear()
         self._p1_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
-        title_color = palette(self.theme)["fg"]
         if isinstance(points, dict) and points["mz"].size:
             mz = points["mz"]; rt = points["rt"]; inten = points["intensity"]
             # Panel 1 collapses RT onto m/z-vs-intensity, so it MUST be filtered to
@@ -1068,13 +1073,8 @@ class MSViewerTab(QMainWindow):
                     self._p1_scatters.append((sc, 2))
                     shown_max = max(shown_max, float(inten[un].max()))
             if self._p1_scatters:
-                self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
-                                    f"({mz.size} pts)", color=title_color)
                 self.p1_2d.getViewBox().setYRange(0, (shown_max or 1.0) * 1.05, padding=0)
-            else:
-                self.p1_2d.setTitle("no in-distribution points (noise off)", color=title_color)
-        else:
-            self.p1_2d.setTitle("no MS1 points in window", color=title_color)
+        # No title on panel 1 (per the user).
         # Rescale dot sizes for the current zoom, then build the 3D if shown.
         self._rescale_points()
         # The 3D scatter is expensive; only build it when 3D is actually shown.
@@ -1140,10 +1140,17 @@ class MSViewerTab(QMainWindow):
         mz_span = max(mz_max - mz_min, 1e-6)
         rt_span = max(rt_end - rt_start, 1e-6)
         try:
-            vh = max(self.p1_3d.height(), 1) / max(self.p1_3d.width(), 1)
+            gl_w = max(self.p1_3d.width(), 1)
+            gl_h = max(self.p1_3d.height(), 1)
         except Exception:
-            vh = 1.0
-        x = ((mz - mz_min) / mz_span * 2 - 1).astype(np.float32)
+            gl_w, gl_h = 1, 1
+        vh = gl_h / gl_w
+        # The GL widget fills the whole panel, but m/z must start at PLOT_LEFT to
+        # line up with panel 2's plot. Screen x in [0, gl_w] maps to GL-x in
+        # [-1, 1]; the data's left edge sits at the PLOT_LEFT fraction.
+        left_frac = min(max(PLOT_LEFT / gl_w, 0.0), 0.9)
+        x_left = -1.0 + 2.0 * left_frac
+        x = (x_left + (mz - mz_min) / mz_span * (1.0 - x_left)).astype(np.float32)
         y = ((rt - rt_start) / rt_span * 2 - 1).astype(np.float32)
         # baseline (tnorm=0) -> -vh (bottom), peak (tnorm=1) -> ~+vh (top), with a
         # little headroom so the tallest peak isn't clipped at the very top.
