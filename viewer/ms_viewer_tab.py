@@ -434,13 +434,17 @@ class MSViewerTab(QMainWindow):
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
         self.ms2_plot.getViewBox().setMouseEnabled(x=False, y=True)
         self.ms2_plot.getViewBox().disableAutoRange(axis=pg.ViewBox.XAxis)
-        # MS2 scans = solid horizontal bands drawn in RT data-space (not
-        # fixed-pixel strokes and not dots), so they read as distinct lines and
-        # get WIDER as you zoom into RT. Clicking the strip selects the nearest
-        # band (handled via a scene click, since the bands themselves aren't
-        # individually clickable items).
-        self._ms2_bands = []    # QGraphicsRectItem-like bars per MS2 scan
+        # MS2 scans = solid horizontal lines spanning the strip at each RT, drawn
+        # as ONE curve (NaN-separated segments) with a fixed pixel width so they
+        # are always clearly visible as lines (never dots, never vanish) and stay
+        # a consistent thickness at any zoom -- zooming in just spreads them apart
+        # so individual scans become distinguishable. Clicking the strip selects
+        # the nearest line by RT (scene click; a single curve isn't per-segment
+        # clickable).
         self._ms2_scans = []    # sorted [(rt, scan_dict)] for click hit-testing
+        self.ms2_curve = pg.PlotCurveItem([], [], connect="finite",
+                                          pen=pg.mkPen(255, 170, 50, 255, width=3))
+        self.ms2_plot.addItem(self.ms2_curve)
         self.ms2_plot.scene().sigMouseClicked.connect(self._on_ms2_strip_clicked)
 
         # Panel 2: m/z on x (aligned with panel 1), RT on y.
@@ -576,8 +580,12 @@ class MSViewerTab(QMainWindow):
     def apply_theme(self, theme):
         self.theme = theme
         pal = palette(theme)
-        for plot in (self.p1_2d, self.p2, self.p3):
+        for plot in (self.p1_2d, self.p2, self.p3, self.ms2_plot):
             style_plot(plot, pal)
+        try:
+            self.p3_grid.setBackground(pal["bg"])
+        except Exception:
+            pass
         if HAVE_GL:
             style_gl(self.p1_3d, pal)
             self._recolor_gl(pal)
@@ -620,21 +628,40 @@ class MSViewerTab(QMainWindow):
         return rows
 
     def _peptide_label(self, row):
-        # Annotate LFQ-only peptides (quantified but with no PSM in this file).
         n = str(row.get("n_psms", "") or "").strip()
         pep = row.get("peptide", "")
-        if n in ("", "0"):
-            return f"{pep}   · LFQ-only"
-        return f"{pep}   ({n})"
+        return f"{pep}   ({n})" if n not in ("", "0") else pep
+
+    def _identified_plains(self):
+        """Plain sequences of peptides actually identified (have a PSM) in the
+        current file -- used to keep the lists to file-identified entries only
+        (LFQ-only / transferred peptides are excluded)."""
+        return {plain_seq(r.get("peptide", "")) for r in self.file_psms()}
+
+    def identified_peptides(self):
+        ident = self._identified_plains()
+        return [r for r in self.session.file_peptides(self.current_file or "")
+                if plain_seq(r.get("peptide", "")) in ident]
+
+    def identified_proteins(self):
+        ident = self._identified_plains()
+        out = []
+        for r in self.session.file_proteins(self.current_file or ""):
+            peps = [p for p in str(r.get("peptides", "")).split(";") if p]
+            if any(plain_seq(p) in ident for p in peps):
+                out.append(r)
+        return out
 
     def show_all_proteins(self, preserve=True):
-        rows = self.session.file_proteins(self.current_file or "")
+        # Only proteins with a peptide identified in THIS file (no LFQ-only).
+        rows = self.identified_proteins()
         self._fill(self.protein_list, [(r.get("protein_id", ""), r) for r in rows
                                        if r.get("protein_id") and self._filter(r["protein_id"])],
                    preserve=preserve)
 
     def show_all_peptides(self, preserve=True):
-        rows = self.session.file_peptides(self.current_file or "")
+        # Only peptides identified (with a PSM) in THIS file (no LFQ-only).
+        rows = self.identified_peptides()
         self._fill(self.peptide_list, [(self._peptide_label(r), r) for r in rows
                                        if r.get("peptide") and self._filter(r["peptide"])],
                    preserve=preserve)
@@ -656,8 +683,8 @@ class MSViewerTab(QMainWindow):
         row = items[0].data(Qt.UserRole)
         peptides = set(p for p in str(row.get("peptides", "")).split(";") if p)
         plains = {plain_seq(p) for p in peptides}
-        # show this protein's peptides (matched within the file's peptide table)
-        matched = [r for r in self.session.file_peptides(self.current_file or "")
+        # show this protein's peptides, but only those identified in this file.
+        matched = [r for r in self.identified_peptides()
                    if r.get("peptide") in peptides or plain_seq(r.get("peptide", "")) in plains]
         self._fill(self.peptide_list, [(r.get("peptide", ""), r) for r in matched])
 
@@ -935,29 +962,39 @@ class MSViewerTab(QMainWindow):
             pmz = points["mz"]; prt = points["rt"]; pint = points["intensity"]
             if not self.use_noise() and self._assigned is not None and self._assigned.any():
                 pmz, prt, pint = pmz[self._assigned], prt[self._assigned], pint[self._assigned]
+            title_color = palette(self.theme)["fg"]
             if pmz.size:
                 self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
                 if profile:
-                    # Profile data is continuous: draw one curve per scan so the
-                    # envelope stays visible (and crisp) at any zoom.
+                    # Profile data is continuous: one curve per scan, but built as
+                    # a single NaN-separated polyline so it's one fast item.
+                    xs, ys = [], []
+                    nan = np.array([np.nan])
                     for r in np.unique(prt):
                         m = prt == r
                         order = np.argsort(pmz[m])
-                        self.p1_2d.plot(pmz[m][order], pint[m][order],
-                                        pen=pg.mkPen(120, 170, 255, 90, width=0.5))
+                        xs.append(pmz[m][order]); xs.append(nan)
+                        ys.append(pint[m][order]); ys.append(nan)
+                    self.p1_2d.addItem(pg.PlotCurveItem(
+                        np.concatenate(xs), np.concatenate(ys), connect="finite",
+                        pen=pg.mkPen(120, 170, 255, 110, width=0.6)))
                 else:
                     # Small dots (matplotlib-style), grown on zoom-in by _rescale_points.
                     self._p1_scatter_item = self.p1_2d.plot(
                         pmz, pint, pen=None, symbol="o", symbolSize=3, symbolPen=None,
                         symbolBrush=pg.mkBrush(120, 170, 255, 170))
                 self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
-                                    f"({pmz.size} pts)")
+                                    f"({pmz.size} pts)", color=title_color)
                 self.p1_2d.getViewBox().setYRange(0, float(pint.max()) * 1.05, padding=0)
             else:
-                self.p1_2d.setTitle("no in-distribution points (noise off)")
+                self.p1_2d.setTitle("no in-distribution points (noise off)", color=title_color)
         else:
-            self.p1_2d.setTitle("no MS1 points in window")
-        self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
+            self.p1_2d.setTitle("no MS1 points in window", color=palette(self.theme)["fg"])
+        # The 3D surface/scatter is expensive; only build it when 3D is actually
+        # shown. Cache the inputs so toggling to 3D can render without a reload.
+        self._p1_3d_inputs = (points, region, mz_min, mz_max, rt_start, rt_end)
+        if HAVE_GL and self.dim_toggle.isChecked():
+            self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
 
     def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
         if not HAVE_GL:
@@ -1015,8 +1052,10 @@ class MSViewerTab(QMainWindow):
     def _assignment(self, points, window):
         """Membership of each raw point in a sqlite distribution. Returns
         ``(assigned_mask, groups)`` where groups is a list of
-        ``(distribution_id, colour, point_mask)``. Computed once per reload and
-        shared by panels 1 and 2 + the noise toggle."""
+        ``(distribution_id, colour, [feature_point_masks])`` -- one mask per
+        *line* (feature), since a connect-the-dots line must follow a single
+        line's trace, not jump across a whole distribution. Computed once per
+        reload and shared by panels 1 and 2 + the noise toggle."""
         if not isinstance(points, dict) or points["mz"].size == 0 or self.db is None:
             return None, []
         mz = points["mz"]; rt = points["rt"]
@@ -1025,39 +1064,49 @@ class MSViewerTab(QMainWindow):
         groups = []
         for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
             did = dist["distribution_id"]
-            dmask = np.zeros(mz.size, dtype=bool)
+            feat_masks = []
             for feat in self.db.distribution_members(did):
                 m = ((mz >= feat["mz_min"]) & (mz <= feat["mz_max"]) &
                      (rt >= feat["rt_start"]) & (rt <= feat["rt_end"]) & (~assigned))
                 if m.any():
                     assigned |= m
-                    dmask |= m
-            if dmask.any():
-                groups.append((did, self.distribution_color(did), dmask))
+                    feat_masks.append(m)
+            if feat_masks:
+                groups.append((did, self.distribution_color(did), feat_masks))
         return assigned, groups
 
     def draw_panel2(self, points, window):
         # Connect-the-dots: raw points (m/z x, RT y) as small dots + thin
-        # connecting lines, coloured by the sqlite distribution each line belongs
-        # to. Each distribution's dots are clickable -> selects it and shows the
-        # MS1 panel 3. Sizing follows the user's matplotlib reference (tiny dots,
-        # 0.2-ish line width), still inverse-scaled on zoom by _rescale_points.
+        # connecting lines. Each *line* (feature) is connected along its own trace
+        # (sorted by RT) -- NOT across the whole distribution. Colour is per
+        # distribution. Consolidated into one curve + one scatter per distribution
+        # (instead of per feature) to keep it fast. Clicking a dot selects the
+        # distribution and opens its MS1 panel 3.
         self.p2.clear()
         self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
         if not isinstance(points, dict) or points["mz"].size == 0:
             return
         mz = points["mz"]
         rt = points["rt"]
+        nan = np.array([np.nan])
 
-        for did, color, dmask in (self._groups or []):
-            order = np.argsort(rt[dmask])
-            # thin connecting line (same colour) under the dots
-            self.p2.plot(mz[dmask][order], rt[dmask][order],
-                         pen=pg.mkPen(color=(*color, 200), width=0.5))
+        for did, color, feat_masks in (self._groups or []):
+            # One polyline for the whole distribution, but each line's points are
+            # contiguous and separated by NaN so the curve never jumps between
+            # different lines.
+            xs, ys, smz, srt = [], [], [], []
+            for fm in feat_masks:
+                o = np.argsort(rt[fm])
+                xs.append(mz[fm][o]); xs.append(nan)
+                ys.append(rt[fm][o]); ys.append(nan)
+                smz.append(mz[fm]); srt.append(rt[fm])
+            self.p2.addItem(pg.PlotCurveItem(
+                np.concatenate(xs), np.concatenate(ys), connect="finite",
+                pen=pg.mkPen(color=(*color, 200), width=0.5)))
+            cmz = np.concatenate(smz); crt = np.concatenate(srt)
             scatter = pg.ScatterPlotItem(
-                x=mz[dmask], y=rt[dmask], size=3, pen=None,
-                brush=pg.mkBrush(*color, 230),
-                data=[did] * int(dmask.sum()))
+                x=cmz, y=crt, size=3, pen=None,
+                brush=pg.mkBrush(*color, 230), data=[did] * cmz.size)
             scatter.sigClicked.connect(self.on_panel2_dist_clicked)
             self.p2.addItem(scatter)
             self._p2_scatters.append((scatter, 3))
@@ -1096,51 +1145,34 @@ class MSViewerTab(QMainWindow):
                              getattr(self, "_last_scan_int", None))
 
     def draw_ms2_strip(self, ms2):
-        # MS2 scans as solid horizontal bands at their RT, drawn in RT data-space
-        # so they widen (not thin) as the time axis is zoomed in and read as
-        # distinct lines. RT (y) is shared with panel 2.
-        for band in self._ms2_bands:
-            self.ms2_plot.removeItem(band)
-        self._ms2_bands = []
-
+        # MS2 scans as fixed-width horizontal lines (one NaN-separated curve),
+        # spanning the strip's x (0..1) at each RT. RT (y) is shared with panel 2.
         scans = sorted(((m["rt"], m) for m in ms2 if m.get("rt") is not None),
                        key=lambda t: t[0])
         self._ms2_scans = scans
-        rts = [rt for rt, _ in scans]
-        # Band half-height in RT minutes ~ 1/3 of the typical MS2 spacing: thick
-        # enough to see and tell apart, with gaps preserved between adjacent
-        # scans. Data-space => grows on zoom-in.
-        if len(rts) > 1:
-            spacing = float(np.median(np.diff(rts)))
-            half = max(spacing * 0.33, 1e-4)
-        else:
-            half = 5e-3
-        self._ms2_half = half
-        brush = pg.mkBrush(255, 170, 50, 235)
-        pen = pg.mkPen(255, 170, 50, 235)
-        for rt in rts:
-            band = pg.LinearRegionItem(values=(rt - half, rt + half),
-                                       orientation="horizontal", movable=False,
-                                       brush=brush, pen=pen)
-            band.setZValue(-5)
-            self.ms2_plot.addItem(band)
-            self._ms2_bands.append(band)
-
+        xs, ys = [], []
+        for rt, _ in scans:
+            xs += [0.0, 1.0, np.nan]
+            ys += [rt, rt, np.nan]
+        self.ms2_curve.setData(np.array(xs, dtype=float), np.array(ys, dtype=float))
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
 
     def _on_ms2_strip_clicked(self, event):
-        """Click anywhere on the MS2 strip -> select the nearest MS2 band by RT."""
+        """Click anywhere on the MS2 strip -> select the nearest MS2 line by RT."""
         if not self._ms2_scans:
             return
         try:
-            pos = self.ms2_plot.getViewBox().mapSceneToView(event.scenePos())
+            vb = self.ms2_plot.getViewBox()
+            pos = vb.mapSceneToView(event.scenePos())
         except Exception:
             return
         y = pos.y()
         rt_arr = np.array([rt for rt, _ in self._ms2_scans])
         i = int(np.argmin(np.abs(rt_arr - y)))
-        # Only act if the click is reasonably near a band (within ~2 half-heights).
-        if abs(rt_arr[i] - y) <= max(getattr(self, "_ms2_half", 5e-3) * 2.0, 1e-3):
+        # Only act if the click is near a line: within ~3% of the visible RT span.
+        (y0, y1) = vb.viewRange()[1]
+        tol = max(abs(y1 - y0) * 0.03, 1e-4)
+        if abs(rt_arr[i] - y) <= tol:
             self.render_ms2(self._ms2_scans[i][1])
 
     def render_ms2(self, scan):
@@ -1364,15 +1396,26 @@ class MSViewerTab(QMainWindow):
 
         points = getattr(self, "_last_points", None)
         self._grid_cells = {}
+        fg = palette(self.theme)["fg"]
 
         def cell(ri, ci):
             p = self.p3_grid.addPlot(row=ri, col=ci)
             p.showGrid(x=True, y=True, alpha=0.2)
             p.hideButtons()
+            left = p.getAxis("left"); bottom = p.getAxis("bottom")
+            for ax in (left, bottom):
+                ax.setPen(pg.mkPen(fg)); ax.setTextPen(pg.mkPen(fg))
+                ax.enableAutoSIPrefix(False)   # no "1e6"-style SI prefixes
             if ri == 0:
-                p.setTitle(f"z={charges[ci]}")
+                p.setTitle(f"z={charges[ci]}", color=fg)
             if ci == 0:
-                p.setLabel("left", self.CHARGE_ROW_LABELS[ri])
+                # Only the left-most column carries the row-name label + y values;
+                # give it room so the numbers don't overlap the label.
+                p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
+                left.setWidth(64)
+            else:
+                left.setStyle(showValues=False)   # declutter inner columns
+                left.setWidth(8)
             self._grid_cells[(ri, ci)] = p
             return p
 
@@ -1504,6 +1547,9 @@ class MSViewerTab(QMainWindow):
         self.dim_toggle.setText("2D" if to_3d else "3D")
         self.p1_stack.setCurrentIndex(1 if to_3d else 0)
         self.reset3d_button.setEnabled(to_3d and HAVE_GL)
+        # Build the 3D view lazily on first switch (it's skipped while 2D shows).
+        if to_3d and HAVE_GL and getattr(self, "_p1_3d_inputs", None) is not None:
+            self.draw_panel1_3d(*self._p1_3d_inputs)
 
     def _recenter_window(self):
         if self.center is None:

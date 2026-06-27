@@ -62,7 +62,7 @@ data the pipeline produces. The four founding goals:
 - ✅ **Empty GUI by default** — start filled with empty widgets (not a blank placeholder);
   **double-click the empty area** to open the folder dialog (in addition to File ▸ Open).
 - ✅ **Ctrl+C from the CLI quits** cleanly (no force-kill needed).
-- ✅ **Instant light/dark theme** toggle (button press, applies to all plots + GL).
+- ✅ **Instant light/dark theme** toggle (button press, applies to all plots + GL). Dark-mode axis/label/title text is now **pure white** (was a dim grey the user found illegible), applied to Panel 1 (incl. its title), Panel 2, the MS2 strip, and the Panel 3 charge grid.
 - ✅ Removed the **"Panel 1"/"Panel 2"** dock title text (and now the **"Panel 3"** text too — see 1.10).
 - ✅ **Bounded region** — the profile/region view is the ID's ± m/z / ± RT window, **never the
   entire spectrum** (which was unreadable).
@@ -92,7 +92,7 @@ data the pipeline produces. The four founding goals:
 - ✅ Each list title has an **"All" button**.
 - ✅ Cross-linking: click a **protein** → peptide list shows that protein's peptides; click a **peptide** → protein list shows its proteins **and** PSM list shows its PSMs; same relationship PSMs↔peptides.
 - ✅ **All** button restores the full unfiltered list (stops showing only associated entries) and **preserves the list's current selection + scroll position**.
-- ✅ Peptides with no PSM in this file (LFQ-only / quantified-but-not-identified) are labeled — this is expected, not a bug.
+- ✅ The lists show **only entries identified (with a PSM) in the selected file**. Peptides quantified-but-not-identified in this file (LFQ-only / match-between-runs transfers) and proteins with no file-identified peptide are **excluded** (per the user; supersedes the earlier "label LFQ-only" behaviour). Identified set = plain sequences from this file's PSMs (`identified_peptides` / `identified_proteins`).
 
 ## 1.3 Panel 1 — spectrum (2D⇄3D, centroid⇄profile)
 - ✅ Starts as **non-profile (centroid)** and **non-3D (2D)**.
@@ -107,7 +107,7 @@ data the pipeline produces. The four founding goals:
   - ⬜ **Grid lines on the m/z and time axes** marking where each scan was; ⬜ measured datapoints shown as **spherical points** along the grid at their intensity height.
   - ⬜ Points **colored by intensity** via a **gradient**; ⬜ the **3D peaks are a continuous surface** built from the **area between the 3D datapoints** (the surface legitimately represents each time×mass datapoint), with the **datapoints keeping their own point color** on top.
   - 🟡 surface renders; ⬜ make it the true point-to-point area-fill, and ⬜ profile points must **align with the surface** (was misaligned).
-  - **3D bugs (reported):** ✅ removed the **central gnomon/axis line** (the giant line aiming up) — only the m/z and time edge axes are drawn now; ✅ axis **labels are theme-adaptive** (recoloured to the palette fg on theme switch); ✅ labels **attach to the axis ends** (pinned to the far end of each edge axis); 🟡 it **starts x-aligned with Panel 2** orientation (default camera azimuth=-90 so time→right, m/z→back); ✅ added an **"align/reset 3D" button** (Panel 1 toolbar + top bar) to snap it back; ✅ **upside-down / stuck orientation** recoverable via that button; 🟡 reduced **zoom lag** (intensity-priority decimation to 12k points; ⬜ reuse cached region still).
+  - **3D bugs (reported):** ✅ removed the **central gnomon/axis line** (the giant line aiming up) — only the m/z and time edge axes are drawn now; ✅ axis **labels are theme-adaptive** (recoloured to the palette fg on theme switch); ✅ labels **attach to the axis ends** (pinned to the far end of each edge axis); 🟡 it **starts x-aligned with Panel 2** orientation (default camera azimuth=-90 so time→right, m/z→back); ✅ added an **"align/reset 3D" button** (Panel 1 toolbar + top bar) to snap it back; ✅ **upside-down / stuck orientation** recoverable via that button; 🟡 reduced **zoom lag** (intensity-priority decimation to 12k points; the 3D surface/scatter is now **built lazily — only when the 3D view is actually shown**, not on every 2D reload; panel curves consolidated into single NaN-separated items; ⬜ further speedups still possible).
   - ✅ In 3D, moving/rotating **does not move the m/z or time axes** — it only changes the 3D perspective. ✅ When the perspective is rearranged and Panel 2 moves, the perspective stays the same even though the data/axes change.
 
 ## 1.4 Panel 2 — m/z × time map
@@ -115,7 +115,7 @@ data the pipeline produces. The four founding goals:
 - ✅ Axes: m/z on **x** (swapped to align with Panel 1's x), time on **y**. (Original ask was m/z on y / time on x; swapped per later request so Panel 1↔2 x-axes align — ✅ now aligned.)
 - ✅ Moving Panel 1 (in 2D) pans horizontally on the **mass axis** and moves Panel 2's mass axis too (synchronized). ✅ Moving Panel 2 realigns Panel 1's (2D) mass axis.
 - ✅ Zoom/drag on Panel 2 (both axes + scroll-to-zoom) reloads the data only when the view **leaves the cached region**.
-- ✅ Render as **connect-the-dots**: individual datapoints as **dots** for time vs mass, **plus thin connecting lines**; the **line is thinner than the dots and the same color**; **each distribution a separate color** (colors from the sqlite). Points not in any distribution = faint gray. (Like the matplotlib time-vs-mass "connect the dots" reference.)
+- ✅ Render as **connect-the-dots**: individual datapoints as **dots** for time vs mass, **plus thin connecting lines**; the **line is thinner than the dots and the same color**; **each distribution a separate color** (colors from the sqlite). Points not in any distribution = faint gray. **Bug fixed:** the connecting line now follows **each individual line (feature) along its own RT-sorted trace** — it no longer jumps across the different lines of a distribution (NaN-separated polyline per distribution). Consolidated to one curve + one scatter **per distribution** (was per feature) for speed.
 - ✅ **Data no longer disappears on zoom** (was the BIGGEST bug). Root cause: every zoom re-extracted only the *visible* window, and an RT view narrower than the MS1 scan spacing returned **zero scans** → blank. Fix: extract a **padded region** (`_padded`, m/z ×2, RT ×2.2) and **cache its extent** (`_loaded_window`); zoom/pan **within** the cache is now a pure view operation (no re-extraction, never empty), reloading only when the view leaves the cached region.
 - ✅ Zooming in **inverse-scales the datapoint size** (`_rescale_points`, √ of the cached-vs-view span, clamped 1–4×) so dots stay visible as you zoom in, in both Panel 1 (2D) and Panel 2.
 - ✅ Clicking a **distribution's dots in Panel 2 selects it** and brings up the matching **MS1 Panel 3** (charge grid / isotope overlay) for that distribution.
@@ -126,7 +126,7 @@ data the pipeline produces. The four founding goals:
 ## 1.5 MS2 strip (left of Panel 2)
 - ✅ A **tall thin plot just to the left of Panel 2**. It shares Panel 2's **time (y) axis** and is **the sole RT ruler** for the row: Panel 2's own left axis is value-less, so the two RT axes **can never overlap** and this left strip is always visible.
 - ✅ MS2 scans shown as **horizontal lines/bands that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.**
-- ✅ **Bug fixed:** the MS2 RT lines are drawn as **solid horizontal bands in RT data-space** (`LinearRegionItem`, opaque, half-height ≈ **0.33× median MS2 spacing**) — distinct lines, not dots — so they get **WIDER / more visible as you zoom in** (and thinner as you zoom out). The earlier thin-dots look came from a constant-pixel scatter overlay, which has been **removed**; selection is now a **click anywhere on the strip → nearest band by RT**.
+- ✅ **Bug fixed:** the MS2 RT lines are now **solid horizontal lines** (one NaN-separated `PlotCurveItem`, fixed **3 px** width) spanning the strip at each RT. Fixed-pixel width keeps them **always visible and a consistent size at any zoom** (they never collapse to dots or vanish); zooming in just **spreads them apart** so individual scans become distinguishable. (The earlier data-space `LinearRegionItem` bands resized inconsistently across reloads — replaced.) Selection = **click anywhere on the strip → nearest line by RT**.
 
 ## 1.6 Distribution & line selection + coloring
 - Distributions and their member **lines** come from the **sqlite in `<project>/distributions/`**
@@ -164,6 +164,7 @@ data the pipeline produces. The four founding goals:
 - ✅ All MS1 Panel 3 plots that **share the mass x-axis are synchronized** when moved; ✅ **double-click resets** them all.
 - ✅ **Panel 3 (single-plot) zoom** matches Panel 1: dragging/scrolling inside the plot zooms the **m/z (x) axis only**; wheel over the **y-axis strip zooms intensity** with the **baseline pinned at 0**; **double-click resets** the zoom.
 - ✅ The MS1 Panel 3 now takes the **full Panel 3 + Table 2 space**: Table 2 is **hidden unless Panel 3 is in MS2 mode** (see 1.11 / Table 2).
+- ✅ Charge-grid **y-axis labelling cleaned up**: only the **left-most column** shows the row-name label + y tick values (inner columns hide their y values); axis text is **white**; **SI/scientific-notation prefixes disabled**; left axis widened so numbers don't overlap the row label.
 - ✅ Removed the leftover **"Panel 3"** title text (both the in-panel caption and the dock title).
 
 ## 1.11 Panel 3 — MS2 view

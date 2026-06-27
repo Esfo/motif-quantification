@@ -8,7 +8,9 @@ import pyqtgraph as pg
 
 DARK = {
     "bg": "#101216",
-    "fg": "#d8d8d8",
+    # Pure white axis/label text for legibility (was a dim grey that the user
+    # found hard to read on the plots).
+    "fg": "#ffffff",
     "gl_bg": (16, 18, 22),
     "accent": "#4c72b0",
     "surface": (76, 114, 176),
