@@ -87,6 +87,11 @@ class Config:
     # are extremely common in a dense MS1 map. Require more isotope peaks for 1+
     # than for higher charges so random pairs do not become fake 1+ envelopes.
     min_members_charge_one: int = 3
+    # Global charge competition: candidate envelopes compete for features so a
+    # feature belongs to at most one distribution. 1+ candidates are ranked with
+    # a small penalty so that, all else equal, a 2+/3+ interpretation of the same
+    # features wins (a strong 1+ with more peaks still beats a weak 2+).
+    charge_one_score_penalty: float = 0.85
 
     charge_mass_ppm: float = 12.0
     min_charge_group_rt_score: float = 0.10
@@ -1104,6 +1109,43 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
     return rows
 
 
+def _candidate_rank(row, config_dict):
+    # Higher is stronger. quality already rewards member count and edge quality;
+    # 1+ is down-weighted so a competing higher-charge envelope of the same
+    # features wins on a tie, while a clearly stronger 1+ still survives.
+    rank = row["quality"]
+
+    if row["charge"] == 1:
+        rank *= config_dict["charge_one_score_penalty"]
+
+    return rank
+
+
+def resolve_charge_competition(rows, config_dict):
+    """Make candidate envelopes compete for features.
+
+    A feature may belong to at most one distribution. Candidates are taken in
+    descending rank; a candidate is kept only if none of its features are already
+    claimed by a stronger one. This removes the duplicate low-charge envelopes
+    that reuse features already explained by a stronger 2+/3+ envelope.
+    """
+    ranked = sorted(rows, key=lambda row: _candidate_rank(row, config_dict), reverse=True)
+
+    claimed = set()
+    kept = []
+
+    for row in ranked:
+        feature_ids = [member["feature_id"] for member in row["members"]]
+
+        if any(feature_id in claimed for feature_id in feature_ids):
+            continue
+
+        claimed.update(feature_ids)
+        kept.append(row)
+
+    return kept
+
+
 def build_distributions(features, best_edges, config, workers=1, progress=False):
     if not best_edges:
         return []
@@ -1163,7 +1205,17 @@ def build_distributions(features, best_edges, config, workers=1, progress=False)
                         flush=True,
                     )
 
-    all_rows.sort(
+    kept_rows = resolve_charge_competition(all_rows, config_dict)
+
+    if progress:
+        print(
+            f"charge_competition candidates={len(all_rows)} kept={len(kept_rows)} "
+            f"dropped={len(all_rows) - len(kept_rows)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    kept_rows.sort(
         key=lambda row: (
             row["charge"],
             row["neutral_mass"],
@@ -1174,7 +1226,7 @@ def build_distributions(features, best_edges, config, workers=1, progress=False)
 
     distributions = []
 
-    for distribution_id, row in enumerate(all_rows):
+    for distribution_id, row in enumerate(kept_rows):
         distributions.append(
             Distribution(
                 distribution_id=distribution_id,
@@ -1401,6 +1453,7 @@ def make_config(args):
         min_edge_score=args.min_edge_score,
         min_distribution_members=args.min_distribution_members,
         min_members_charge_one=args.min_members_charge_one,
+        charge_one_score_penalty=args.charge_one_score_penalty,
         charge_mass_ppm=args.charge_mass_ppm,
         min_charge_group_rt_score=args.min_charge_group_rt_score,
         charge_tolerance=args.charge_tolerance,
@@ -1636,6 +1689,7 @@ def parse_args():
     parser.add_argument("--min-edge-score", type=float, default=0.30)
     parser.add_argument("--min-distribution-members", type=int, default=2)
     parser.add_argument("--min-members-charge-one", type=int, default=3)
+    parser.add_argument("--charge-one-score-penalty", type=float, default=0.85)
 
     parser.add_argument("--charge-mass-ppm", type=float, default=12.0)
     parser.add_argument("--min-charge-group-rt-score", type=float, default=0.10)
