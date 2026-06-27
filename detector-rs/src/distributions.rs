@@ -425,29 +425,6 @@ pub struct AnalyteRow {
     pub members: Vec<(i64, i64)>, // (distribution_id, charge)
 }
 
-struct UnionFind {
-    parent: Vec<usize>,
-}
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        UnionFind { parent: (0..n).collect() }
-    }
-    fn find(&mut self, mut x: usize) -> usize {
-        while self.parent[x] != x {
-            self.parent[x] = self.parent[self.parent[x]];
-            x = self.parent[x];
-        }
-        x
-    }
-    fn union(&mut self, a: usize, b: usize) {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra != rb {
-            self.parent[rb] = ra;
-        }
-    }
-}
-
 fn distribution_rt_score(a: &DistRow, b: &DistRow) -> f64 {
     let overlap = a.rt_end.min(b.rt_end) - a.rt_start.max(b.rt_start);
     let union = a.rt_end.max(b.rt_end) - a.rt_start.min(b.rt_start);
@@ -462,45 +439,56 @@ pub fn build_analytes(cfg: &Config, dists: &[DistRow]) -> Vec<AnalyteRow> {
     if dists.is_empty() {
         return vec![];
     }
-    // sort distributions by neutral_mass (stable, matching Python's sorted)
+    // Seed-based grouping (replaces transitive UnionFind, which chained distinct
+    // RT peaks into giant analytes). Best-quality distribution first; each
+    // unclaimed seed pulls in the single best-coeluting distribution at each
+    // OTHER charge within neutral-mass tolerance -> at most one per charge, tight
+    // in RT.
     let mut order: Vec<usize> = (0..dists.len()).collect();
     order.sort_by(|&a, &b| dists[a].neutral_mass.partial_cmp(&dists[b].neutral_mass).unwrap());
     let sorted: Vec<&DistRow> = order.iter().map(|&i| &dists[i]).collect();
     let masses: Vec<f64> = sorted.iter().map(|d| d.neutral_mass).collect();
 
-    let mut uf = UnionFind::new(sorted.len());
-    for i in 0..sorted.len() {
-        let nm = sorted[i].neutral_mass;
-        let tol = 0.002_f64.max(nm * cfg.charge_mass_ppm / 1_000_000.0);
-        let start = lower_bound(&masses, nm - tol);
-        let end = upper_bound_le(&masses, nm + tol);
-        for j in start..end {
-            if i == j {
-                continue;
-            }
-            if sorted[j].charge == sorted[i].charge {
-                continue;
-            }
-            if distribution_rt_score(sorted[i], sorted[j]) >= cfg.min_charge_group_rt_score {
-                uf.union(i, j);
-            }
-        }
-    }
+    let mut by_quality: Vec<usize> = (0..sorted.len()).collect();
+    by_quality.sort_by(|&a, &b| sorted[b].quality.partial_cmp(&sorted[a].quality).unwrap());
 
-    // Preserve Python's dict insertion order: a group is keyed by the first index
-    // that maps to its root, so analyte_id matches the reference.
-    use std::collections::HashMap;
-    let mut group_index: HashMap<usize, usize> = HashMap::new();
+    let mut claimed = vec![false; sorted.len()];
     let mut groups: Vec<Vec<usize>> = Vec::new();
-    for i in 0..sorted.len() {
-        let root = uf.find(i);
-        match group_index.get(&root) {
-            Some(&g) => groups[g].push(i),
-            None => {
-                group_index.insert(root, groups.len());
-                groups.push(vec![i]);
+
+    for &idx in &by_quality {
+        if claimed[idx] {
+            continue;
+        }
+        claimed[idx] = true;
+        let seed = sorted[idx];
+        let mut members = vec![idx];
+        let mut charges_used: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        charges_used.insert(seed.charge);
+
+        let tol = 0.002_f64.max(seed.neutral_mass * cfg.charge_mass_ppm / 1_000_000.0);
+        let start = lower_bound(&masses, seed.neutral_mass - tol);
+        let end = upper_bound_le(&masses, seed.neutral_mass + tol);
+
+        let mut candidates: Vec<(f64, usize)> = Vec::new();
+        for j in start..end {
+            if claimed[j] || j == idx || charges_used.contains(&sorted[j].charge) {
+                continue;
+            }
+            let rt_score = distribution_rt_score(seed, sorted[j]);
+            if rt_score >= cfg.min_charge_group_rt_score {
+                candidates.push((rt_score, j));
             }
         }
+        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        for (_, j) in candidates {
+            if claimed[j] || charges_used.contains(&sorted[j].charge) {
+                continue;
+            }
+            claimed[j] = true;
+            charges_used.insert(sorted[j].charge);
+            members.push(j);
+        }
+        groups.push(members);
     }
 
     let mut analytes = vec![];

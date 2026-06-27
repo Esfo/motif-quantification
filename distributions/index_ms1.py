@@ -1401,35 +1401,54 @@ def build_analytes(distributions, config):
     if not distributions:
         return []
 
+    # Seed-based grouping (replaces transitive UnionFind, which chained distinct
+    # RT peaks into giant analytes). Process distributions best-quality first;
+    # each unclaimed one seeds an analyte and pulls in the single best-coeluting
+    # distribution at each OTHER charge within neutral-mass tolerance -- so an
+    # analyte holds at most one distribution per charge and stays tight in RT.
     sorted_dists = sorted(distributions, key=lambda x: x.neutral_mass)
     masses = np.asarray([dist.neutral_mass for dist in sorted_dists], dtype=np.float64)
-    uf = UnionFind(len(sorted_dists))
+    order = sorted(range(len(sorted_dists)), key=lambda i: -sorted_dists[i].quality)
+    claimed = [False] * len(sorted_dists)
+    grouped = []
 
-    for i, dist in enumerate(sorted_dists):
-        tolerance = max(0.002, dist.neutral_mass * config.charge_mass_ppm / 1_000_000.0)
-        start = np.searchsorted(masses, dist.neutral_mass - tolerance, side="left")
-        end = np.searchsorted(masses, dist.neutral_mass + tolerance, side="right")
+    for idx in order:
+        if claimed[idx]:
+            continue
 
+        seed = sorted_dists[idx]
+        claimed[idx] = True
+        members = [seed]
+        charges_used = {seed.charge}
+
+        tolerance = max(0.002, seed.neutral_mass * config.charge_mass_ppm / 1_000_000.0)
+        start = np.searchsorted(masses, seed.neutral_mass - tolerance, side="left")
+        end = np.searchsorted(masses, seed.neutral_mass + tolerance, side="right")
+
+        candidates = []
         for j in range(start, end):
-            if i == j:
+            if claimed[j] or j == idx:
                 continue
-
             other = sorted_dists[j]
-
-            if other.charge == dist.charge:
+            if other.charge in charges_used:
                 continue
+            rt_score = distribution_rt_score(seed, other)
+            if rt_score >= config.min_charge_group_rt_score:
+                candidates.append((rt_score, j, other))
 
-            if distribution_rt_score(dist, other) >= config.min_charge_group_rt_score:
-                uf.union(i, j)
+        candidates.sort(key=lambda item: -item[0])
+        for _, j, other in candidates:
+            if claimed[j] or other.charge in charges_used:
+                continue
+            claimed[j] = True
+            charges_used.add(other.charge)
+            members.append(other)
 
-    groups = {}
-
-    for i, dist in enumerate(sorted_dists):
-        groups.setdefault(uf.find(i), []).append(dist)
+        grouped.append(members)
 
     analytes = []
 
-    for members in groups.values():
+    for members in grouped:
         weights = np.asarray([max(member.score, 1e-6) for member in members], dtype=np.float64)
         masses = np.asarray([member.neutral_mass for member in members], dtype=np.float64)
         charges = [member.charge for member in members]
