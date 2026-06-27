@@ -711,7 +711,9 @@ class MSViewerTab(QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 0, 2, 2)
-        layout.addWidget(self.p2_loading)
+        # p2_loading is intentionally NOT added to the layout: its row was the
+        # dead-space border between panel 1 and panel 2. The loading state still
+        # shows in panel 1's bar (and panel 3).
         layout.addWidget(row_widget, stretch=1)
 
         dock = QDockWidget("", self)
