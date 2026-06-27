@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDockWidget,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -287,15 +288,17 @@ class MSViewerTab(QMainWindow):
         # Wheel over the y-axis label strip (left of the plot) scrolls intensity.
         self.p1_2d.viewport().installEventFilter(self)
 
-        # Default 3D camera orientation, kept as the single source of truth so the
-        # "reset 3D" button can always snap back to a known, right-side-up view.
-        self._p1_3d_default_cam = dict(distance=3.4, elevation=22, azimuth=-90)
-        self._gl_labels = []      # (GLTextItem, base_color) for theme recolouring
+        # "align 3D" = a top-down view that reads like a 2D m/z x time plot, with
+        # m/z running the same direction as panel 2's x axis. Elevation ~90 looks
+        # straight down; the azimuth keeps m/z horizontal/aligned.
+        self._p1_3d_aligned_cam = dict(distance=3.4, elevation=90, azimuth=-90)
+        self.p1_3d_mz_label = QLabel("m/z")
+        self.p1_3d_time_label = QLabel("time (min)")
+        for lbl in (self.p1_3d_mz_label, self.p1_3d_time_label):
+            lbl.setAlignment(Qt.AlignCenter)
         if HAVE_GL:
             self.p1_3d = gl.GLViewWidget()
-            # Deterministic orientation: time runs left->right, m/z front->back,
-            # so the m/z axis reads the same direction as panel 2's x.
-            self.p1_3d.setCameraPosition(**self._p1_3d_default_cam)
+            self.p1_3d.setCameraPosition(**self._p1_3d_aligned_cam)
             self.p1_surface = gl.GLSurfacePlotItem(
                 x=np.array([0.0, 1.0], dtype=np.float32),
                 y=np.array([0.0, 1.0], dtype=np.float32),
@@ -307,17 +310,27 @@ class MSViewerTab(QMainWindow):
             self.p1_scatter.setVisible(False)
             self.p1_3d.addItem(self.p1_surface)
             self.p1_3d.addItem(self.p1_scatter)
-            # Only the m/z and time axes are drawn (no central gnomon): two edge
-            # lines on the z=-1 base plane, with their name labels pinned to the
-            # far end of each axis. Colours are theme-adaptive (see _recolor_gl).
-            self._build_gl_axes()
+            # No drawn axes/gnomon at all. The m/z + time names are plain QLabels
+            # pinned to the SIDES of the view (screen-fixed) so they never rotate,
+            # drift, or disorient the user as the 3D scene is moved.
+            gl_container = QWidget()
+            grid = QGridLayout(gl_container)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setSpacing(1)
+            grid.addWidget(self.p1_3d_mz_label, 0, 0)    # left side = m/z
+            grid.addWidget(self.p1_3d, 0, 1)
+            grid.addWidget(self.p1_3d_time_label, 1, 1)  # bottom = time
+            grid.setColumnStretch(1, 1)
+            grid.setRowStretch(0, 1)
+            self.p1_3d_widget = gl_container
         else:
             self.p1_3d = QLabel("3D needs pyqtgraph OpenGL (pip install PyOpenGL)")
             self.p1_3d.setAlignment(Qt.AlignCenter)
+            self.p1_3d_widget = self.p1_3d
 
         self.p1_stack = QStackedWidget()
-        self.p1_stack.addWidget(self.p1_2d)   # index 0 = 2D
-        self.p1_stack.addWidget(self.p1_3d)   # index 1 = 3D
+        self.p1_stack.addWidget(self.p1_2d)          # index 0 = 2D
+        self.p1_stack.addWidget(self.p1_3d_widget)   # index 1 = 3D
 
         self.dim_toggle = fixed_toggle("3D", "2D")     # shows what it will switch TO
         self.dim_toggle.clicked.connect(self.toggle_dimension)
@@ -327,11 +340,13 @@ class MSViewerTab(QMainWindow):
         # hides it (label flips to what the next press does, like the others).
         self.noise_toggle = fixed_toggle("noise off", "noise on", width=80)
         self.noise_toggle.clicked.connect(self._toggle_noise)
-        # Snap the 3D view back to its default upright orientation (recovers a
-        # stuck / upside-down camera); only meaningful in 3D mode.
+        # Log/linear colour scale for the 3D intensity colouring.
+        self.logcolor_toggle = fixed_toggle("log color", "lin color", width=80)
+        self.logcolor_toggle.clicked.connect(self._toggle_logcolor)
+        # Snap the 3D view to the aligned top-down (2D-like) orientation.
         self.reset3d_button = QPushButton("align 3D")
         self.reset3d_button.setFixedWidth(70)
-        self.reset3d_button.setToolTip("reset the 3D view to its default orientation")
+        self.reset3d_button.setToolTip("align the 3D view to a top-down, panel-2-aligned 2D view")
         self.reset3d_button.clicked.connect(self.reset_3d_view)
         self.reset3d_button.setEnabled(False)
 
@@ -343,6 +358,7 @@ class MSViewerTab(QMainWindow):
         bar.addWidget(self.dim_toggle)
         bar.addWidget(self.source_toggle)
         bar.addWidget(self.noise_toggle)
+        bar.addWidget(self.logcolor_toggle)
         bar.addWidget(self.reset3d_button)
         bar.addSpacing(8)
         bar.addWidget(self.p1_loading)
@@ -363,60 +379,19 @@ class MSViewerTab(QMainWindow):
         dock.setWidget(container)
         self.dock_panel1 = dock
 
-    # ---- 3D axes (no gnomon) ---------------------------------------------
-
-    def _build_gl_axes(self):
-        """Draw only the m/z (y) and time (x) axes as edge lines on the base
-        plane, with their name labels attached to the far end of each axis.
-
-        Replaces the default GLAxisItem gnomon (the central crosshair that
-        "aimed up"): the user only wants the two data axes labelled. Colours are
-        applied separately in _recolor_gl so they adapt to the theme.
-        """
-        if not HAVE_GL:
-            return
-        base = -1.0
-        # time runs along x at the m/z-min (y=-1) edge; m/z runs along y at the
-        # time-min (x=-1) edge. Both sit on the z=base floor.
-        time_axis = np.array([[-1.0, -1.0, base], [1.0, -1.0, base]], dtype=np.float32)
-        mz_axis = np.array([[-1.0, -1.0, base], [-1.0, 1.0, base]], dtype=np.float32)
-        self._gl_time_line = gl.GLLinePlotItem(pos=time_axis, width=1.5, antialias=True)
-        self._gl_mz_line = gl.GLLinePlotItem(pos=mz_axis, width=1.5, antialias=True)
-        self.p1_3d.addItem(self._gl_time_line)
-        self.p1_3d.addItem(self._gl_mz_line)
-        # Labels pinned to the far end of each axis.
-        for text, pos in (("time (min)", (1.15, -1.0, base)), ("m/z", (-1.0, 1.15, base))):
-            try:
-                item = gl.GLTextItem(pos=np.array(pos, dtype=np.float32), text=text)
-                self.p1_3d.addItem(item)
-                self._gl_labels.append(item)
-            except Exception:
-                pass
+    # ---- 3D side labels --------------------------------------------------
 
     def _recolor_gl(self, pal):
-        """Theme-adaptive colours for the 3D axis lines + labels (the labels were
-        previously hard-coded light grey and vanished in light mode)."""
-        if not HAVE_GL:
-            return
-        fg = pg.mkColor(pal["fg"])
-        rgba = (fg.red(), fg.green(), fg.blue(), 255)
-        line_color = (fg.red() / 255.0, fg.green() / 255.0, fg.blue() / 255.0, 0.9)
-        for line in (getattr(self, "_gl_time_line", None), getattr(self, "_gl_mz_line", None)):
-            if line is not None:
-                try:
-                    line.setData(color=line_color)
-                except Exception:
-                    pass
-        for item in self._gl_labels:
-            try:
-                item.setData(color=rgba)
-            except Exception:
-                pass
+        """Theme-adaptive colour for the screen-fixed m/z and time side labels."""
+        for lbl in (getattr(self, "p1_3d_mz_label", None),
+                    getattr(self, "p1_3d_time_label", None)):
+            if lbl is not None:
+                lbl.setStyleSheet(f"color: {pal['fg']};")
 
     def reset_3d_view(self):
-        """Snap the 3D camera back to its default upright orientation."""
+        """Align the 3D view to a top-down, panel-2-aligned (2D-like) view."""
         if HAVE_GL:
-            self.p1_3d.setCameraPosition(**self._p1_3d_default_cam)
+            self.p1_3d.setCameraPosition(**self._p1_3d_aligned_cam)
 
     def build_panel2_dock(self):
         # Thin MS2 strip to the left of panel 2: MS2 scans as clickable points,
@@ -586,9 +561,9 @@ class MSViewerTab(QMainWindow):
             self.p3_grid.setBackground(pal["bg"])
         except Exception:
             pass
+        self._recolor_gl(pal)   # 3D side labels (exist with or without GL)
         if HAVE_GL:
             style_gl(self.p1_3d, pal)
-            self._recolor_gl(pal)
 
     # ---- list population + cross-linking ---------------------------------
 
@@ -778,6 +753,15 @@ class MSViewerTab(QMainWindow):
         # Pure redraw from cached data -- no re-extraction needed.
         self._redraw_from_cache()
 
+    def use_logcolor(self):
+        return self.logcolor_toggle.isChecked()
+
+    def _toggle_logcolor(self):
+        self.logcolor_toggle.setText("lin color" if self.logcolor_toggle.isChecked() else "log color")
+        # Recolour the cached 3D points without re-extraction.
+        if HAVE_GL and getattr(self, "_p1_3d_inputs", None) is not None:
+            self.draw_panel1_3d(*self._p1_3d_inputs)
+
     def _redraw_from_cache(self):
         """Redraw panels 1 & 2 from the last extracted points (e.g. after the
         noise toggle) without hitting the mzML again."""
@@ -965,24 +949,12 @@ class MSViewerTab(QMainWindow):
             title_color = palette(self.theme)["fg"]
             if pmz.size:
                 self.p1_2d.showGrid(x=True, y=True, alpha=0.25)
-                if profile:
-                    # Profile data is continuous: one curve per scan, but built as
-                    # a single NaN-separated polyline so it's one fast item.
-                    xs, ys = [], []
-                    nan = np.array([np.nan])
-                    for r in np.unique(prt):
-                        m = prt == r
-                        order = np.argsort(pmz[m])
-                        xs.append(pmz[m][order]); xs.append(nan)
-                        ys.append(pint[m][order]); ys.append(nan)
-                    self.p1_2d.addItem(pg.PlotCurveItem(
-                        np.concatenate(xs), np.concatenate(ys), connect="finite",
-                        pen=pg.mkPen(120, 170, 255, 110, width=0.6)))
-                else:
-                    # Small dots (matplotlib-style), grown on zoom-in by _rescale_points.
-                    self._p1_scatter_item = self.p1_2d.plot(
-                        pmz, pint, pen=None, symbol="o", symbolSize=3, symbolPen=None,
-                        symbolBrush=pg.mkBrush(120, 170, 255, 170))
+                # Both centroid and profile draw the same way: every datapoint as a
+                # dot (m/z vs intensity). Profile is just denser. Dots grow on
+                # zoom-in via _rescale_points.
+                self._p1_scatter_item = self.p1_2d.plot(
+                    pmz, pint, pen=None, symbol="o", symbolSize=3, symbolPen=None,
+                    symbolBrush=pg.mkBrush(120, 170, 255, 170))
                 self.p1_2d.setTitle(f"{self.current['row'].get('peptide','')} z={self.current['charge']}  "
                                     f"({pmz.size} pts)", color=title_color)
                 self.p1_2d.getViewBox().setYRange(0, float(pint.max()) * 1.05, padding=0)
@@ -1001,15 +973,27 @@ class MSViewerTab(QMainWindow):
             return
         mz_span = max(mz_max - mz_min, 1e-6)
         rt_span = max(rt_end - rt_start, 1e-6)
+        profile = bool(self.use_profile() and self.current and self.current.get("profile"))
 
-        if isinstance(region, dict) and region.get("z") is not None and region["z"].size:
+        # Shared intensity scale so the surface and the scatter sit at the SAME
+        # height (they used to be normalised independently, leaving the surface
+        # in a "subterranean" layer below the dots).
+        zmax = 1.0
+        if isinstance(points, dict) and points["mz"].size:
+            zmax = float(points["intensity"].max()) or 1.0
+        elif isinstance(region, dict) and region.get("z") is not None and region["z"].size:
+            zmax = float(region["z"].max()) or 1.0
+
+        # The interpolated surface only makes sense for continuous PROFILE data;
+        # for sparse centroid peaks it collapses to a spiky floor under the dots,
+        # so hide it there.
+        show_surface = profile and isinstance(region, dict) and \
+            region.get("z") is not None and region["z"].size
+        if show_surface:
             z = region["z"]
             rts = region["rts"]
             mz_grid = region["mz_grid"]
-            zmax = float(z.max()) or 1.0
-            zr = (z / zmax).astype(np.float32)            # (n_rt, n_mz)
-            # Map surface to ACTUAL rt/mz (not even index spacing) so it lines up
-            # with the scatter points -- fixes the profile points/surface mismatch.
+            zr = (z / zmax).astype(np.float32)            # (n_rt, n_mz), shared scale
             xs = ((rts - rt_start) / rt_span * 2 - 1).astype(np.float32)
             ys = ((mz_grid - mz_min) / mz_span * 2 - 1).astype(np.float32)
             try:
@@ -1018,30 +1002,63 @@ class MSViewerTab(QMainWindow):
                 self.p1_surface.setVisible(True)
             except Exception:
                 pass
+        else:
+            self.p1_surface.setVisible(False)
 
         if isinstance(points, dict) and points["mz"].size:
             mz = points["mz"]; rt = points["rt"]; inten = points["intensity"]
             # Cap the scatter so a dense window doesn't make rotation/zoom lag.
-            # Keep the strongest points (intensity-priority) rather than a blind
-            # stride, so the visible peaks survive the decimation.
             MAX_3D_POINTS = 12000
             if mz.size > MAX_3D_POINTS:
                 keep = np.argpartition(inten, -MAX_3D_POINTS)[-MAX_3D_POINTS:]
                 mz, rt, inten = mz[keep], rt[keep], inten[keep]
             x = ((rt - rt_start) / rt_span * 2 - 1).astype(np.float32)
             y = ((mz - mz_min) / mz_span * 2 - 1).astype(np.float32)
-            zmax = float(inten.max()) or 1.0
-            z = (inten / zmax).astype(np.float32)
+            z = (inten / zmax).astype(np.float32)         # same scale as surface
             pos = np.column_stack([x, y, z])
-            if self._cmap is not None:
-                colors = self._cmap.map(z, mode="float")
+            # Colour by intensity, log or linear per the colour toggle.
+            if self.use_logcolor():
+                cval = np.log1p(inten)
+                cval = (cval / (cval.max() or 1.0)).astype(np.float32)
             else:
-                colors = np.tile(np.array([1, 1, 1, 1], dtype=np.float32), (z.size, 1))
+                cval = z
+            if self._cmap is not None:
+                colors = self._cmap.map(cval, mode="float")
+            else:
+                colors = np.tile(np.array([1, 1, 1, 1], dtype=np.float32), (cval.size, 1))
             try:
                 self.p1_scatter.setData(pos=pos, color=colors, size=4.0)
                 self.p1_scatter.setVisible(True)
             except Exception:
                 pass
+
+    def _features_points(self, feats, cur):
+        """Raw points covering a set of features (one charge state's lines),
+        read directly from the store so charge states outside the panel-1 window
+        still plot. One read over the features' combined m/z x RT span, cached."""
+        if not feats:
+            return None
+        store = (cur.get("profile") if (self.use_profile() and cur.get("profile"))
+                 else cur.get("centroid"))
+        if store is None:
+            return None
+        mzlo = min(f["mz_min"] for f in feats); mzhi = max(f["mz_max"] for f in feats)
+        rtlo = min(f["rt_start"] for f in feats); rthi = max(f["rt_end"] for f in feats)
+        key = (id(store), round(mzlo, 4), round(mzhi, 4), round(rtlo, 4), round(rthi, 4))
+        cache = getattr(self, "_feat_points_cache", None)
+        if cache is None:
+            cache = self._feat_points_cache = {}
+        if key in cache:
+            return cache[key]
+        try:
+            store.load_metadata()
+            pts = store.extract_points(mzlo, mzhi, rtlo, rthi)
+        except Exception:
+            pts = None
+        if len(cache) > 64:
+            cache.clear()
+        cache[key] = pts
+        return pts
 
     def distribution_color(self, distribution_id):
         """Stable colour per distribution (assigned in first-seen order)."""
@@ -1429,17 +1446,21 @@ class MSViewerTab(QMainWindow):
                 if group[c].get("distribution") else DIST_PALETTE[ci % len(DIST_PALETTE)]
 
             try:
-                # Row 0: retention time -- raw points (m/z vs rt) for this charge's lines.
+                # Row 0: retention time -- raw points (m/z vs rt) per line. Other
+                # charge states sit at a different m/z than the loaded window, so
+                # fetch each charge's own points directly (this is why the left-
+                # most charge's RT plot used to come up empty).
                 p0 = cell(0, ci)
-                if isinstance(points, dict) and points["mz"].size:
+                cpoints = self._features_points(group[c]["features"], cur)
+                if isinstance(cpoints, dict) and cpoints["mz"].size:
                     for feat in group[c]["features"]:
-                        m = ((points["mz"] >= feat["mz_min"]) & (points["mz"] <= feat["mz_max"]) &
-                             (points["rt"] >= feat["rt_start"]) & (points["rt"] <= feat["rt_end"]))
+                        m = ((cpoints["mz"] >= feat["mz_min"]) & (cpoints["mz"] <= feat["mz_max"]) &
+                             (cpoints["rt"] >= feat["rt_start"]) & (cpoints["rt"] <= feat["rt_end"]))
                         if m.any():
-                            o = np.argsort(points["rt"][m])
-                            p0.plot(points["mz"][m][o], points["rt"][m][o],
+                            o = np.argsort(cpoints["rt"][m])
+                            p0.plot(cpoints["mz"][m][o], cpoints["rt"][m][o],
                                     pen=pg.mkPen(*color, 200, width=1))
-                            p0.addItem(pg.ScatterPlotItem(x=points["mz"][m], y=points["rt"][m],
+                            p0.addItem(pg.ScatterPlotItem(x=cpoints["mz"][m], y=cpoints["rt"][m],
                                                           size=3, pen=None, brush=pg.mkBrush(*color, 200)))
 
                 # Row 1: peak area (log).
@@ -1522,7 +1543,7 @@ class MSViewerTab(QMainWindow):
 
         # Each column shares one m/z (x) axis -> link all rows in a column to the
         # top cell so panning/zooming mass moves them together (per-column, since
-        # different charges have different m/z scales). Double-click resets all.
+        # different charges have different m/z scales).
         for ci in range(len(charges)):
             top = self._grid_cells.get((0, ci))
             if top is None:
@@ -1531,6 +1552,17 @@ class MSViewerTab(QMainWindow):
                 c = self._grid_cells.get((ri, ci))
                 if c is not None:
                     c.setXLink(top)
+        # Each ROW shares one y (intensity/metric) axis -> link every column to
+        # the left-most cell so the single left y-axis represents the whole row,
+        # aligned and synchronised across charges. Double-click resets all.
+        for ri in range(len(self.CHARGE_ROW_LABELS)):
+            left = self._grid_cells.get((ri, 0))
+            if left is None:
+                continue
+            for ci in range(1, len(charges)):
+                c = self._grid_cells.get((ri, ci))
+                if c is not None:
+                    c.setYLink(left)
 
     def reset_charge_grid_zoom(self):
         for cellplot in getattr(self, "_grid_cells", {}).values():

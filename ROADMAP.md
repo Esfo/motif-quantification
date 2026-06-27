@@ -99,7 +99,7 @@ data the pipeline produces. The four founding goals:
 - ✅ Two **toggle buttons**: one shows **"3D"/"2D"**, one shows **"profile"/"centroid"** — each label shows **what it will switch to** when pressed. ✅ Buttons are **fixed size/location** so they don't move when the text changes.
 - ✅ So Panel 1 is either 2D or 3D, and either profile or centroid.
 - **2D view**: ✅ m/z on **x-axis**, intensity on **y-axis**; ⬜ different lines/distributions **colored differently** (from the sqlite distributions).
-  - ✅ Shows **every datapoint** (not averages). Profile = continuous per-scan curves; centroid = dots.
+  - ✅ Shows **every datapoint** (not averages). Both centroid and **profile draw as dots** (m/z vs intensity) — profile is just denser. (Earlier profile-as-per-scan-curves was a regression the user rejected; reverted to dots.)
   - ⬜ Profile dots/curves should **scale dynamically on zoom** so they stay visible (currently can get sparse/laggy).
   - ✅ Only the **m/z (x) axis** is interactive when 2D — **no vertical drag**; y auto-scales.
   - ✅ Wheel **over the y-axis label strip** (left of the axis) scrolls **intensity (y)**; ✅ pinned so the **baseline stays at 0** (data is always > 0; the baseline never lifts).
@@ -107,7 +107,7 @@ data the pipeline produces. The four founding goals:
   - ⬜ **Grid lines on the m/z and time axes** marking where each scan was; ⬜ measured datapoints shown as **spherical points** along the grid at their intensity height.
   - ⬜ Points **colored by intensity** via a **gradient**; ⬜ the **3D peaks are a continuous surface** built from the **area between the 3D datapoints** (the surface legitimately represents each time×mass datapoint), with the **datapoints keeping their own point color** on top.
   - 🟡 surface renders; ⬜ make it the true point-to-point area-fill, and ⬜ profile points must **align with the surface** (was misaligned).
-  - **3D bugs (reported):** ✅ removed the **central gnomon/axis line** (the giant line aiming up) — only the m/z and time edge axes are drawn now; ✅ axis **labels are theme-adaptive** (recoloured to the palette fg on theme switch); ✅ labels **attach to the axis ends** (pinned to the far end of each edge axis); 🟡 it **starts x-aligned with Panel 2** orientation (default camera azimuth=-90 so time→right, m/z→back); ✅ added an **"align/reset 3D" button** (Panel 1 toolbar + top bar) to snap it back; ✅ **upside-down / stuck orientation** recoverable via that button; 🟡 reduced **zoom lag** (intensity-priority decimation to 12k points; the 3D surface/scatter is now **built lazily — only when the 3D view is actually shown**, not on every 2D reload; panel curves consolidated into single NaN-separated items; ⬜ further speedups still possible).
+  - **3D bugs (reported):** ✅ **no axes/gnomon drawn at all** — the m/z and time names are now plain **screen-fixed QLabels pinned to the left/bottom sides** of the view, so they never rotate, drift, or disorient as the scene moves (the old in-scene GLTextItem/edge-line labels that "behaved weird on scroll" are gone); ✅ labels are **theme-white**; ✅ **"align 3D" button** now snaps to a **top-down, panel-2-aligned (2D-like) view** (elevation 90, azimuth −90) rather than a generic reset; ✅ **upside-down / stuck orientation** recoverable via that button; ✅ **surface vs dots alignment** fixed — both now use a **shared intensity scale**, and the interpolated **surface only renders for profile** data (it collapsed to a spiky sub-floor under the dots for sparse centroid data, so it's hidden there); 🟡 reduced **zoom lag** (decimation to 12k points; 3D built lazily only when shown; ⬜ more possible).
   - ✅ In 3D, moving/rotating **does not move the m/z or time axes** — it only changes the 3D perspective. ✅ When the perspective is rearranged and Panel 2 moves, the perspective stays the same even though the data/axes change.
 
 ## 1.4 Panel 2 — m/z × time map
@@ -159,6 +159,8 @@ data the pipeline produces. The four founding goals:
 
 ## 1.10 Panel 3 — MS1 view (charge-comparison grid)
 - 🟡 When an **MS1 distribution** is clicked, Panel 3 shows the plot from `examples/panel-3-plot.py`: the **charge-state-determination grid** that **links multiple distributions (charge states of one analyte) into one plot of many comparisons** — columns = charge states, **8 rows**: retention time / peak area / charge distances / cross-charge / intensity sum % / adjacency / ppm-to-mean / ppm-error.
+  - ✅ Each **row shares one y-axis across all charge columns** (y-linked + aligned to the left-most cell, which is the only one showing values), so the single left y-axis represents the whole row; columns stay x-linked per charge.
+  - ✅ The **retention-time row now plots for every charge** (incl. the left-most): each charge's raw points are read from the store over that charge's own m/z×RT span (`_features_points`, cached) instead of relying on the panel-1 window, which only covered the selected charge.
   - 🟡 grid renders; ⬜ make it **faithful to `panel-3-plot.py`** (per-row scales — peak-area log, charge-distance ylim, cross-charge log, intensity-sum% log, adjacency symlog; the white-on-gray styling adapted to theme; spine hiding; per-column titles `z(distid)`); ⬜ fix colors/readability.
 - ⬜ Use **`descending_partial_products` (`libraryadditions.py` / `isotopes.py`)** to compute the **expected isotopic distribution of the peptide** if a peptide is being viewed and found via the search, and **twin-plot** it with the experimental on **different x-axes**, scaled so the **theoretically-most-abundant isotope and the max experimentally-measured datapoint are at the same height**.
 - ✅ All MS1 Panel 3 plots that **share the mass x-axis are synchronized** when moved; ✅ **double-click resets** them all.
@@ -187,7 +189,7 @@ data the pipeline produces. The four founding goals:
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).
 - ✅ Reset zoom; ✅ charge ◀/▶ + history ⟲/⟳; ✅ theme toggle.
-- ⬜ **Color settings drop-down** on the top bar: selected-distribution color, other-distributions color, **3D gradient min/max via a full color selector for both values**, and a **normal/log color-scale switch** (same fixed-size switch style as the 2D/3D and profile/centroid toggles).
+- 🟡 **Color settings**: ✅ a **log/linear colour-scale switch** for the 3D intensity colouring (fixed-size toggle on the Panel 1 bar, same style as 2D/3D & profile/centroid); ⬜ full color-settings drop-down still to do (selected/other-distribution colours, 3D gradient min/max pickers).
 - ⬜ Manual **charge** entry field; ✅ **"align/reset 3D"** button (top bar + Panel 1 toolbar).
 - 🟡 **"loading… <context>"** label (rendered in **black**, not the old amber) now shown above **Panel 1, Panel 2, and Panel 3** while the evidence worker runs, cleared when drawn (`_set_loading`); ⬜ Panel 3 MS2 / charge-grid sub-loads not yet separately labelled.
 
