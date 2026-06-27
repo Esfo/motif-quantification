@@ -554,6 +554,13 @@ class MSViewerTab(QMainWindow):
         self.reset3d_button.clicked.connect(self.reset_3d_view)
         self.reset3d_button.setEnabled(False)
 
+        # Theme toggle, to the right of "align 3D". main_window wires
+        # on_theme_toggle; the label tracks the current theme.
+        self.on_theme_toggle = None
+        self.theme_btn = QPushButton("Light mode" if self.theme == "dark" else "Dark mode")
+        self.theme_btn.setFixedWidth(80)
+        self.theme_btn.clicked.connect(lambda: self.on_theme_toggle and self.on_theme_toggle())
+
         # "loading… <context>" shown above panel 1 while its worker runs.
         self.p1_loading = QLabel("")
         self.p1_loading.setStyleSheet("color: black;")
@@ -561,12 +568,12 @@ class MSViewerTab(QMainWindow):
         # Charge-search arrows: right-aligned, to the right of "align 3D".
         self.charge_prev_btn = QPushButton("◀")
         self.charge_prev_btn.setFixedWidth(28)
-        self.charge_prev_btn.setToolTip("charge search: one charge lower at the same RT")
-        self.charge_prev_btn.clicked.connect(lambda: self.charge_step(-1))
+        self.charge_prev_btn.setToolTip("charge search: one charge higher at the same RT")
+        self.charge_prev_btn.clicked.connect(lambda: self.charge_step(1))
         self.charge_next_btn = QPushButton("▶")
         self.charge_next_btn.setFixedWidth(28)
-        self.charge_next_btn.setToolTip("charge search: one charge higher at the same RT")
-        self.charge_next_btn.clicked.connect(lambda: self.charge_step(1))
+        self.charge_next_btn.setToolTip("charge search: one charge lower at the same RT")
+        self.charge_next_btn.clicked.connect(lambda: self.charge_step(-1))
 
         bar = QHBoxLayout()
         bar.addWidget(self.dim_toggle)
@@ -574,6 +581,7 @@ class MSViewerTab(QMainWindow):
         bar.addWidget(self.noise_toggle)
         bar.addWidget(self.logcolor_toggle)
         bar.addWidget(self.reset3d_button)
+        bar.addWidget(self.theme_btn)
         bar.addSpacing(8)
         bar.addWidget(self.p1_loading)
         bar.addStretch(1)
@@ -877,12 +885,18 @@ class MSViewerTab(QMainWindow):
     def apply_theme(self, theme):
         self.theme = theme
         pal = palette(theme)
+        if getattr(self, "theme_btn", None) is not None:
+            self.theme_btn.setText("Light mode" if theme == "dark" else "Dark mode")
         for plot in (self.p1_2d, self.p2, self.p3, self.ms2_plot):
             style_plot(plot, pal)
         try:
             self.p3_grid.setBackground(pal["bg"])
         except Exception:
             pass
+        # Force the charge grid to rebuild on a theme change (its axis pens, tick
+        # text and titles are coloured at build time, and the rebuild is otherwise
+        # skipped when the same distribution is showing).
+        self._grid_dist_id = None
         # Fill the panel-1 2D left spacer with the same plot background so it
         # blends in (instead of an awkward blank gap next to panel 2's strip).
         if getattr(self, "_p1_2d_spacer", None) is not None:
@@ -892,9 +906,10 @@ class MSViewerTab(QMainWindow):
             style_gl(self.p1_3d, pal)
         # Re-render the data-bearing panels so theme-coloured bits (panel 1/3
         # titles, the MS2 spectrum data, the charge-grid axes) follow the theme.
-        if self.current is not None and isinstance(getattr(self, "_last_points", None), dict):
-            self._redraw_from_cache()
-            self._redraw_panel3()
+        if self.current is not None:
+            if isinstance(getattr(self, "_last_points", None), dict):
+                self._redraw_from_cache()
+            self._redraw_panel3()   # rebuilds the charge grid with the new theme
 
     def _redraw_panel3(self):
         """Re-draw whatever panel 3 is currently showing (MS2 spectrum / MS1

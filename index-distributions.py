@@ -61,9 +61,10 @@ def parse_args():
     parser.add_argument("--mzml-dir", type=Path, help="override: directory of centroid mzML files")
     parser.add_argument("--out-dir", type=Path, help="override: directory to write the sqlite files")
     parser.add_argument("--overwrite", action="store_true", help="rebuild existing sqlite files")
-    parser.add_argument("--engine", choices=("python", "rust"), default="python",
-                        help="detector engine: python (index_ms1.py) or rust "
-                             "(detector-rs/ms1-detector, faster, same sqlite)")
+    parser.add_argument("--engine", choices=("python", "rust"), default="rust",
+                        help="detector engine: rust (default; detector-rs/ms1-detector,"
+                             " builds + runs the native binary) or python (index_ms1.py,"
+                             " the reference)")
     parser.add_argument("forward", nargs="*",
                         help="args forwarded to the detector (place after --)")
     return parser.parse_args()

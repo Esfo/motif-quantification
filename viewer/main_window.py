@@ -123,14 +123,9 @@ class MainWindow(QMainWindow):
         hist_fwd.setToolTip("navigation history: forward")
         hist_fwd.triggered.connect(lambda: self.ms_tab and self.ms_tab.nav_forward())
 
-        bar.addSeparator()
-        # (Reset-zoom and the duplicate Align-3D button were removed from the top
-        # bar; the 3D align button lives above the 3D plot itself.)
-        reset_layout = bar.addAction("Reset layout")
-        reset_layout.triggered.connect(self.reset_layout)
-        bar.addSeparator()
-        self.theme_action_tb = bar.addAction("Light mode")
-        self.theme_action_tb.triggered.connect(self.toggle_theme)
+        # Reset-layout and Light-mode toolbar buttons removed: theme toggle now
+        # lives in panel 1's bar (right of "align 3D"); layout reset stays in the
+        # View menu.
 
     def _spin(self, lo, hi, decimals, value, step, handler):
         spin = QDoubleSpinBox()
@@ -171,7 +166,6 @@ class MainWindow(QMainWindow):
         if self.ms_tab is not None:
             self.ms_tab.apply_theme(theme)
         self.theme_action.setText("Switch to &light mode" if theme == "dark" else "Switch to &dark mode")
-        self.theme_action_tb.setText("Light mode" if theme == "dark" else "Dark mode")
 
     # ---- opening folders -------------------------------------------------
 
@@ -238,6 +232,7 @@ class MainWindow(QMainWindow):
         self.ms_tab = MSViewerTab(self.session, distributions_db=db,
                                   xics_ppm=self.xics_ppm, xics_rt_window=self.rt_spin.value(),
                                   theme=self.theme)
+        self.ms_tab.on_theme_toggle = self.toggle_theme   # panel-1 Light/Dark button
 
         tabs = QTabWidget()
         tabs.addTab(self.ms_tab, "MS viewing")

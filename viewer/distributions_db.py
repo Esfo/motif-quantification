@@ -158,9 +158,15 @@ class DistributionsDB:
         """The member distributions of an analyte (charge region)."""
         rows = self.connect().execute(
             """
-            SELECT d.*
+            SELECT d.*, IFNULL(a.auc, 0.0) AS auc
             FROM analyte_members am
             JOIN distributions d ON d.distribution_id = am.distribution_id
+            LEFT JOIN (
+                SELECT m.distribution_id, SUM(f.area) AS auc
+                FROM distribution_members m
+                JOIN features f ON f.feature_id = m.feature_id
+                GROUP BY m.distribution_id
+            ) a ON a.distribution_id = d.distribution_id
             WHERE am.analyte_id = ?
             ORDER BY d.charge
             """,
