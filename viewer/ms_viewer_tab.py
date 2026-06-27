@@ -35,7 +35,6 @@ from PySide6.QtCore import (
     QThread,
     Signal,
 )
-from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -53,7 +52,6 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -736,6 +734,22 @@ class MSViewerTab(QMainWindow):
         )
         return view, model
 
+    def _wrap_with_all(self, view, on_all):
+        """Put an 'All' button (like the lists) above a view."""
+        container = QWidget()
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        bar = QHBoxLayout()
+        bar.addStretch(1)
+        btn = QPushButton("All")
+        btn.setFixedWidth(48)
+        btn.clicked.connect(on_all)
+        bar.addWidget(btn)
+        lay.addLayout(bar)
+        lay.addWidget(view)
+        return container
+
     def build_table1_dock(self):
         # 'current' tab: the existing per-distribution line table.
         self.table1 = QTableWidget()
@@ -745,27 +759,30 @@ class MSViewerTab(QMainWindow):
         self.table1.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table1.verticalHeader().setVisible(False)
 
-        # 'distributions' tab: sortable, double-click to jump.
+        # 'lines' tab: lines of the most-recently selected distribution (+charge).
+        self.lines_view, self.lines_model = self._make_table_view(
+            LINES_TAB_COLUMNS, self._on_line_activated)
+
+        # 'distributions' tab: all distributions (or one analyte's members after a
+        # charge-distribution double-click). Click loads panel 3 + its lines.
         self.dists_view, self.dists_model = self._make_table_view(
             DIST_TAB_COLUMNS, self._on_distribution_activated)
-
-        # 'charge distributions' tab: a tree (analyte -> its distributions),
-        # expandable; double-click a child distribution to jump.
-        self.charge_tree = QTreeView()
-        self.charge_model = QStandardItemModel()
-        self.charge_model.setHorizontalHeaderLabels([h for _, h, _ in CHARGE_TAB_COLUMNS])
-        self.charge_tree.setModel(self.charge_model)
-        self.charge_tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.charge_tree.setSortingEnabled(True)
-        self.charge_tree.doubleClicked.connect(self._on_charge_tree_activated)
-        self.charge_tree.expanded.connect(self._on_charge_expanded)
-        self.charge_tree.clicked.connect(self._on_charge_clicked)
         self.dists_view.clicked.connect(self._on_dist_clicked)
+
+        # 'charge distributions' tab: flat table of multi-charge analytes (single
+        # rows). Click loads panel 3; double-click opens its member distributions
+        # in the distributions tab and jumps panels 1/2.
+        self.charge_view, self.charge_model = self._make_table_view(
+            CHARGE_TAB_COLUMNS, self._on_charge_activated)
+        self.charge_view.clicked.connect(self._on_charge_clicked)
 
         self.table1_tabs = QTabWidget()
         self.table1_tabs.addTab(self.table1, "current")
-        self.table1_tabs.addTab(self.dists_view, "distributions")
-        self.table1_tabs.addTab(self.charge_tree, "charge distributions")
+        self.table1_tabs.addTab(self.lines_view, "lines")
+        self.table1_tabs.addTab(self._wrap_with_all(self.dists_view, self._reload_all_distributions),
+                                "distributions")
+        self.table1_tabs.addTab(self._wrap_with_all(self.charge_view, self._reload_all_charges),
+                                "charge distributions")
         self.table1_tabs.currentChanged.connect(self._on_table1_tab_changed)
         self._table1_loaded = set()  # which tabs have been populated for self.db
 
@@ -1831,10 +1848,31 @@ class MSViewerTab(QMainWindow):
         self._table1_loaded = set()
         if getattr(self, "dists_model", None) is not None:
             self.dists_model.set_rows([])
-            self.charge_model.removeRows(0, self.charge_model.rowCount())
-        # Re-populate whatever tab is currently visible.
+            self.charge_model.set_rows([])
+            self.lines_model.set_rows([])
         if getattr(self, "table1_tabs", None) is not None:
             self._on_table1_tab_changed(self.table1_tabs.currentIndex())
+
+    def _reload_all_distributions(self):
+        if self.db is not None:
+            self.dists_model.set_rows(self.db.all_distributions())
+            self._table1_loaded.add("distributions")
+
+    def _reload_all_charges(self):
+        if self.db is not None:
+            self.charge_model.set_rows(self.db.all_analytes_multicharge())
+            self._table1_loaded.add("charge distributions")
+
+    def _load_lines_for_distribution(self, distribution_id):
+        """Fill the 'lines' tab with this distribution's lines (members) + charge."""
+        if self.db is None:
+            return
+        dist = self.db.distribution(distribution_id)
+        charge = dist.get("charge") if dist else 0
+        rows = self.db.distribution_members(distribution_id)
+        for r in rows:
+            r["charge"] = charge
+        self.lines_model.set_rows(rows)
 
     def _on_table1_tab_changed(self, index):
         if getattr(self, "table1_tabs", None) is None or self.db is None:
@@ -1845,57 +1883,10 @@ class MSViewerTab(QMainWindow):
         if name == "distributions":
             self.dists_model.set_rows(self.db.all_distributions())
         elif name == "charge distributions":
-            self._load_charge_tree()
+            self.charge_model.set_rows(self.db.all_analytes_multicharge())
         else:
             return
         self._table1_loaded.add(name)
-
-    def _load_charge_tree(self):
-        # Build ONLY the top-level analyte rows; children (member distributions)
-        # are loaded lazily on expand. A single placeholder child gives each row
-        # an expand arrow without querying anything up front. Sorting/updates are
-        # disabled during the bulk build for speed.
-        self.charge_tree.setSortingEnabled(False)
-        self.charge_tree.setUpdatesEnabled(False)
-        self.charge_model.removeRows(0, self.charge_model.rowCount())
-        self.charge_model.setHorizontalHeaderLabels([h for _, h, _ in CHARGE_TAB_COLUMNS])
-        for analyte in self.db.all_analytes_multicharge():
-            top = [QStandardItem(_fmt(analyte.get(f), k)) for f, _, k in CHARGE_TAB_COLUMNS]
-            for col, (f, _, k) in enumerate(CHARGE_TAB_COLUMNS):
-                top[col].setData(analyte.get(f), Qt.EditRole)
-            top[0].setData(analyte, Qt.UserRole)        # analyte dict (has analyte_id)
-            top[0].setData(False, Qt.UserRole + 1)      # children-loaded flag
-            top[0].setData(analyte.get("rep_distribution_id"), Qt.UserRole + 2)
-            top[0].appendRow(QStandardItem(""))          # single placeholder -> expand arrow
-            self.charge_model.appendRow(top)
-        self.charge_tree.setUpdatesEnabled(True)
-        self.charge_tree.setSortingEnabled(True)
-
-    def _on_charge_expanded(self, index):
-        item0 = self.charge_model.itemFromIndex(index.sibling(index.row(), 0))
-        if item0 is None or item0.data(Qt.UserRole + 1):
-            return
-        analyte = item0.data(Qt.UserRole)
-        if not isinstance(analyte, dict) or "analyte_id" not in analyte:
-            return
-        item0.setData(True, Qt.UserRole + 1)
-        item0.removeRows(0, item0.rowCount())  # drop placeholder
-        for d in self.db.analyte_distributions(analyte["analyte_id"]):
-            mapped = {
-                "neutral_mass": d.get("neutral_mass"),
-                "charge_min": d.get("charge"),
-                "charge_max": d.get("charge"),
-                "n_distributions": d.get("n_members"),
-                "rt_apex": d.get("rt_apex"),
-                "rt_start": d.get("rt_start"),
-                "rt_end": d.get("rt_end"),
-                "score": d.get("quality"),
-            }
-            child = [QStandardItem(_fmt(mapped.get(f), k)) for f, _, k in CHARGE_TAB_COLUMNS]
-            for col, (f, _, k) in enumerate(CHARGE_TAB_COLUMNS):
-                child[col].setData(mapped.get(f), Qt.EditRole)
-            child[0].setData(d, Qt.UserRole)  # distribution dict, for jump
-            item0.appendRow(child)
 
     def _jump_to(self, mz_center, rt, distribution_id=None):
         """Centre panels 1 & 2 on (m/z, RT) and optionally select a distribution."""
@@ -1927,30 +1918,40 @@ class MSViewerTab(QMainWindow):
             self.draw_panel3_ms1(self.current, getattr(self, "_last_scan_mz", None),
                                  getattr(self, "_last_scan_int", None))
 
+    def _tab_index(self, name):
+        for i in range(self.table1_tabs.count()):
+            if self.table1_tabs.tabText(i) == name:
+                return i
+        return -1
+
     def _on_line_activated(self, row):
+        # double-click a line -> jump panels 1/2 to it
         if row:
             self._jump_to(row.get("mz_mean"), row.get("rt_apex"))
 
     def _on_distribution_activated(self, row):
+        # double-click a distribution -> show its lines (lines tab) and jump
         if not row:
             return
-        # bring up its lines in the 'current' tab and jump there
-        self.table1_tabs.setCurrentIndex(0)
+        self._load_lines_for_distribution(row.get("distribution_id"))
+        self.table1_tabs.setCurrentIndex(self._tab_index("lines"))
         self._jump_to(row.get("mono_mz"), row.get("rt_apex"), row.get("distribution_id"))
 
-    def _on_charge_tree_activated(self, index):
-        item0 = self.charge_model.itemFromIndex(index.sibling(index.row(), 0))
-        if item0 is None:
+    def _on_charge_activated(self, row):
+        # double-click a charge distribution -> open ALL its member distributions
+        # in the distributions tab and jump panels 1/2 to the analyte.
+        if not row or self.db is None:
             return
-        data = item0.data(Qt.UserRole)
-        if isinstance(data, dict) and "distribution_id" in data:
-            self.table1_tabs.setCurrentIndex(0)
-            self._jump_to(data.get("mono_mz"), data.get("rt_apex"), data.get("distribution_id"))
-        else:
-            self.charge_tree.setExpanded(index, not self.charge_tree.isExpanded(index))
+        members = self.db.analyte_distributions(row.get("analyte_id"))
+        self.dists_model.set_rows(members)
+        self.table1_tabs.setCurrentIndex(self._tab_index("distributions"))
+        # jump to a representative member (highest n_members, else first)
+        rep = max(members, key=lambda d: d.get("n_members", 0)) if members else None
+        if rep is not None:
+            self._jump_to(rep.get("mono_mz"), rep.get("rt_apex"), rep.get("distribution_id"))
 
-    # single click in either list -> load that distribution into panel 3 (no
-    # window move; double-click still jumps panels 1/2).
+    # single click in a list -> load that distribution into panel 3 (no window
+    # move; double-click still jumps panels 1/2).
     def _ensure_current_for_file(self):
         if not self.current_file:
             return False
@@ -1980,17 +1981,14 @@ class MSViewerTab(QMainWindow):
     def _on_dist_clicked(self, index):
         row = self.dists_model.row_dict(self.dists_view.model().mapToSource(index).row())
         if row:
-            self._show_distribution_in_panel3(row.get("distribution_id"))
+            did = row.get("distribution_id")
+            self._load_lines_for_distribution(did)   # open its lines in the lines tab
+            self._show_distribution_in_panel3(did)
 
     def _on_charge_clicked(self, index):
-        item0 = self.charge_model.itemFromIndex(index.sibling(index.row(), 0))
-        if item0 is None:
-            return
-        data = item0.data(Qt.UserRole)
-        if isinstance(data, dict) and "distribution_id" in data:
-            self._show_distribution_in_panel3(data.get("distribution_id"))
-        else:
-            self._show_distribution_in_panel3(item0.data(Qt.UserRole + 2))
+        row = self.charge_model.row_dict(self.charge_view.model().mapToSource(index).row())
+        if row:
+            self._show_distribution_in_panel3(row.get("rep_distribution_id"))
 
     # ---- panel 3 charge-comparison grid ----------------------------------
 
@@ -2253,6 +2251,12 @@ class MSViewerTab(QMainWindow):
         # Fit synchronously from the items' data (no deferred pass), so the grid
         # opens directly in the right state -- the deferred reset was causing a
         # one-frame flicker through the wrong auto-fit.
+        # Remove the outline border on every bar and force full opacity so the
+        # true colour reads cleanly at any zoom.
+        for p in self._grid_cells.values():
+            for it in p.items:
+                if isinstance(it, pg.BarGraphItem):
+                    it.setOpts(pen=None)
         self._fit_grid_cols()
         self._fit_grid_rows()
         for p in self._grid_cells.values():
