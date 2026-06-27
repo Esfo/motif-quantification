@@ -380,9 +380,10 @@ class MSViewerTab(QMainWindow):
         _hb = QHBoxLayout(p1_2d_row)
         _hb.setContentsMargins(0, 0, 0, 0)
         _hb.setSpacing(0)
-        _p1_spacer = QWidget()
-        _p1_spacer.setFixedWidth(MS2_STRIP_W)
-        _hb.addWidget(_p1_spacer)
+        self._p1_2d_spacer = QWidget()
+        self._p1_2d_spacer.setFixedWidth(MS2_STRIP_W)
+        self._p1_2d_spacer.setAutoFillBackground(True)
+        _hb.addWidget(self._p1_2d_spacer)
         _hb.addWidget(self.p1_2d, stretch=1)
 
         self.p1_stack = QStackedWidget()
@@ -652,6 +653,10 @@ class MSViewerTab(QMainWindow):
             self.p3_grid.setBackground(pal["bg"])
         except Exception:
             pass
+        # Fill the panel-1 2D left spacer with the same plot background so it
+        # blends in (instead of an awkward blank gap next to panel 2's strip).
+        if getattr(self, "_p1_2d_spacer", None) is not None:
+            self._p1_2d_spacer.setStyleSheet(f"background-color: {pal['bg']};")
         self._recolor_gl(pal)   # 3D side labels (exist with or without GL)
         if HAVE_GL:
             style_gl(self.p1_3d, pal)
