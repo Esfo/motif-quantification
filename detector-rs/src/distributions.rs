@@ -233,6 +233,7 @@ fn coherent_rt_path(f: &Features, cfg: &Config, path: &[usize]) -> bool {
 
 #[derive(Clone)]
 pub struct DistRow {
+    pub distribution_id: i64,
     pub charge: i64,
     pub neutral_mass: f64,
     pub mono_mz: f64,
@@ -338,6 +339,7 @@ fn dist_worker_for_charge(f: &Features, cfg: &Config, charge: i64, edges: &[&Edg
             .collect();
 
         rows.push(DistRow {
+            distribution_id: -1,
             charge,
             neutral_mass: (f.mz[mono] - PROTON) * charge as f64,
             mono_mz: f.mz[mono],
@@ -400,5 +402,153 @@ pub fn build_distributions(f: &Features, cfg: &Config, edges: &[Edge]) -> Vec<Di
             .then(a.rt_apex.partial_cmp(&b.rt_apex).unwrap())
             .then(a.mono_mz.partial_cmp(&b.mono_mz).unwrap())
     });
+    for (i, d) in kept.iter_mut().enumerate() {
+        d.distribution_id = i as i64;
+    }
     kept
+}
+
+#[derive(Clone)]
+pub struct AnalyteRow {
+    pub analyte_id: i64,
+    pub neutral_mass: f64,
+    pub rt_start: f64,
+    pub rt_apex: f64,
+    pub rt_end: f64,
+    pub ms1_start: i64,
+    pub ms1_apex: i64,
+    pub ms1_end: i64,
+    pub charge_min: i64,
+    pub charge_max: i64,
+    pub n_distributions: i64,
+    pub score: f64,
+    pub members: Vec<(i64, i64)>, // (distribution_id, charge)
+}
+
+struct UnionFind {
+    parent: Vec<usize>,
+}
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        UnionFind { parent: (0..n).collect() }
+    }
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.parent[rb] = ra;
+        }
+    }
+}
+
+fn distribution_rt_score(a: &DistRow, b: &DistRow) -> f64 {
+    let overlap = a.rt_end.min(b.rt_end) - a.rt_start.max(b.rt_start);
+    let union = a.rt_end.max(b.rt_end) - a.rt_start.min(b.rt_start);
+    let raw = if union <= 0.0 { 0.0 } else { (overlap / union).max(0.0) };
+    let apex_gap = (a.rt_apex - b.rt_apex).abs();
+    let width = (a.rt_end - a.rt_start).max(b.rt_end - b.rt_start).max(1e-9);
+    let apex_score = (1.0 - apex_gap / width).max(0.0);
+    (raw * 0.4 + apex_score * 0.6).clamp(0.0, 1.0)
+}
+
+pub fn build_analytes(cfg: &Config, dists: &[DistRow]) -> Vec<AnalyteRow> {
+    if dists.is_empty() {
+        return vec![];
+    }
+    // sort distributions by neutral_mass (stable, matching Python's sorted)
+    let mut order: Vec<usize> = (0..dists.len()).collect();
+    order.sort_by(|&a, &b| dists[a].neutral_mass.partial_cmp(&dists[b].neutral_mass).unwrap());
+    let sorted: Vec<&DistRow> = order.iter().map(|&i| &dists[i]).collect();
+    let masses: Vec<f64> = sorted.iter().map(|d| d.neutral_mass).collect();
+
+    let mut uf = UnionFind::new(sorted.len());
+    for i in 0..sorted.len() {
+        let nm = sorted[i].neutral_mass;
+        let tol = 0.002_f64.max(nm * cfg.charge_mass_ppm / 1_000_000.0);
+        let start = lower_bound(&masses, nm - tol);
+        let end = upper_bound_le(&masses, nm + tol);
+        for j in start..end {
+            if i == j {
+                continue;
+            }
+            if sorted[j].charge == sorted[i].charge {
+                continue;
+            }
+            if distribution_rt_score(sorted[i], sorted[j]) >= cfg.min_charge_group_rt_score {
+                uf.union(i, j);
+            }
+        }
+    }
+
+    // Preserve Python's dict insertion order: a group is keyed by the first index
+    // that maps to its root, so analyte_id matches the reference.
+    use std::collections::HashMap;
+    let mut group_index: HashMap<usize, usize> = HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for i in 0..sorted.len() {
+        let root = uf.find(i);
+        match group_index.get(&root) {
+            Some(&g) => groups[g].push(i),
+            None => {
+                group_index.insert(root, groups.len());
+                groups.push(vec![i]);
+            }
+        }
+    }
+
+    let mut analytes = vec![];
+    for members in groups.iter() {
+        let mut wsum = 0.0;
+        let mut wmass = 0.0;
+        let mut score_sum = 0.0;
+        let mut charge_min = i64::MAX;
+        let mut charge_max = i64::MIN;
+        let mut rt_start = f64::INFINITY;
+        let mut rt_end = f64::NEG_INFINITY;
+        let mut ms1_start = i64::MAX;
+        let mut ms1_end = i64::MIN;
+        let mut apex_idx = members[0];
+        let mut best_quality = f64::NEG_INFINITY;
+        for &mi in members {
+            let d = sorted[mi];
+            let w = d.score.max(1e-6);
+            wsum += w;
+            wmass += d.neutral_mass * w;
+            score_sum += d.score;
+            charge_min = charge_min.min(d.charge);
+            charge_max = charge_max.max(d.charge);
+            rt_start = rt_start.min(d.rt_start);
+            rt_end = rt_end.max(d.rt_end);
+            ms1_start = ms1_start.min(d.ms1_start);
+            ms1_end = ms1_end.max(d.ms1_end);
+            if d.quality > best_quality {
+                best_quality = d.quality;
+                apex_idx = mi;
+            }
+        }
+        let apex = sorted[apex_idx];
+        analytes.push(AnalyteRow {
+            analyte_id: analytes.len() as i64,
+            neutral_mass: wmass / wsum,
+            rt_start,
+            rt_apex: apex.rt_apex,
+            rt_end,
+            ms1_start,
+            ms1_apex: apex.ms1_apex,
+            ms1_end,
+            charge_min,
+            charge_max,
+            n_distributions: members.len() as i64,
+            score: score_sum / members.len() as f64,
+            members: members.iter().map(|&mi| (sorted[mi].distribution_id, sorted[mi].charge)).collect(),
+        });
+    }
+    analytes
 }
