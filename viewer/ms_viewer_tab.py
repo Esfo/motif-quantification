@@ -62,6 +62,7 @@ try:
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     from . import isotopes
     from .theming import palette, style_plot, style_gl
+    from .distributions_db import DistributionsDB
 except ImportError:
     from mzml_store import MzmlStore, scan_arrays
     from plots import plot_points, plot_spectrum
@@ -69,6 +70,7 @@ except ImportError:
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     import isotopes
     from theming import palette, style_plot, style_gl
+    from distributions_db import DistributionsDB
 
 
 def plain_seq(peptide):
@@ -276,10 +278,12 @@ class MSViewerTab(QMainWindow):
 
         # Tab 1 is a single-file view: a file must be chosen first. Default to
         # the first file so the lists are never empty/ambiguous on open.
+        # Only files that have their OWN distributions sqlite are openable; a file
+        # without one is omitted rather than shown with another file's overlay.
         self.file_combo = QComboBox()
         for row in self.session.files():
             name = row.get("filename", "")
-            if name:
+            if name and self.session.distributions_db_for(name) is not None:
                 self.file_combo.addItem(name, name)
         self.file_combo.currentIndexChanged.connect(self.on_file_changed)
         layout.addWidget(QLabel("file"))
@@ -300,10 +304,22 @@ class MSViewerTab(QMainWindow):
         self.dock_lists = dock
 
         self.current_file = self.file_combo.currentData()
+        self._set_db_for_current_file()
         self.repopulate_active_list()
+
+    def _set_db_for_current_file(self):
+        """Bind self.db to the sqlite for the currently selected file (or None)."""
+        if getattr(self, "db", None) is not None:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+        db_path = self.session.distributions_db_for(self.current_file or "")
+        self.db = DistributionsDB(db_path) if db_path is not None else None
 
     def on_file_changed(self):
         self.current_file = self.file_combo.currentData()
+        self._set_db_for_current_file()
         self.search.clear()
         self.repopulate_active_list()
 
