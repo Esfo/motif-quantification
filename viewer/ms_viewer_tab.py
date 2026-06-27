@@ -978,19 +978,18 @@ class MSViewerTab(QMainWindow):
             (vrt0, vrt1) = self.p2.getViewBox().viewRange()[1]
         except Exception:
             return
-        clamp = lambda f: min(max(f, 1.0), 4.0)
-        fmz = clamp((lmz / max(vmz1 - vmz0, 1e-9)) ** 0.5)
-        frt = clamp((lrt / max(vrt1 - vrt0, 1e-9)) ** 0.5)
-        f2 = clamp((fmz * frt) ** 0.5)
+        # Keep point sizes pinned to their base (the "starting condition" look the
+        # user prefers). The previous zoom-upscaling keyed off _loaded_window,
+        # which grows when a zoom-out triggers a reload, so it was not reversible:
+        # zooming back in returned bigger dots than the pristine view.
         for scatter, base in self._p2_scatters:
             try:
-                scatter.setSize(base * f2)
+                scatter.setSize(base)
             except Exception:
                 pass
-        # Panel 1 is m/z (x) vs intensity (y); only the m/z zoom matters for dots.
         for scatter, base in getattr(self, "_p1_scatters", []):
             try:
-                scatter.setSize(base * fmz)
+                scatter.setSize(base)
             except Exception:
                 pass
 
