@@ -215,7 +215,7 @@ DIST_TAB_COLUMNS = [
     ("rt_start", "min t", "t"),
     ("rt_end", "max t", "t"),
     ("n_members", "n iso", "i"),
-    ("quality", "quality", "f"),
+    ("auc", "AUC", "f"),
 ]
 
 # 'charge distributions' tab (chargeregions): one row per analyte (expandable).
@@ -227,7 +227,7 @@ CHARGE_TAB_COLUMNS = [
     ("rt_apex", "RT", "t"),
     ("rt_start", "min t", "t"),
     ("rt_end", "max t", "t"),
-    ("score", "score", "f"),
+    ("auc", "AUC", "f"),
 ]
 
 
@@ -738,66 +738,70 @@ class MSViewerTab(QMainWindow):
         view.setSelectionBehavior(QAbstractItemView.SelectRows)
         view.verticalHeader().setVisible(False)
         view.setSortingEnabled(True)
+        view.setSelectionBehavior(QAbstractItemView.SelectRows)
         view.doubleClicked.connect(
             lambda proxy_index, m=model, p=proxy, cb=on_double_click:
             cb(m.row_dict(p.mapToSource(proxy_index).row()))
         )
+        self._install_row_copy(view)
         return view, model
 
-    def _wrap_with_all(self, view, on_all):
-        """Put an 'All' button (like the lists) above a view."""
-        container = QWidget()
-        lay = QVBoxLayout(container)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(2)
-        bar = QHBoxLayout()
-        bar.addStretch(1)
-        btn = QPushButton("All")
-        btn.setFixedWidth(48)
-        btn.clicked.connect(on_all)
-        bar.addWidget(btn)
-        lay.addLayout(bar)
-        lay.addWidget(view)
-        return container
+    def _install_row_copy(self, view):
+        """Ctrl+C copies the whole selected row(s) (tab-separated)."""
+        from PySide6.QtGui import QShortcut, QKeySequence
+        sc = QShortcut(QKeySequence.Copy, view)
+        sc.activated.connect(lambda v=view: self._copy_rows(v))
+
+    def _copy_rows(self, view):
+        from PySide6.QtWidgets import QApplication
+        sel = view.selectionModel()
+        model = view.model()
+        if sel is None or model is None:
+            return
+        rows = sorted({i.row() for i in sel.selectedIndexes()})
+        lines = []
+        for r in rows:
+            cells = [str(model.index(r, c).data() or "") for c in range(model.columnCount())]
+            lines.append("\t".join(cells))
+        if lines:
+            QApplication.clipboard().setText("\n".join(lines))
 
     def build_table1_dock(self):
-        # 'current' tab: the existing per-distribution line table.
+        # 'current' tab: the selected distribution's lines.
         self.table1 = QTableWidget()
         self.table1.setColumnCount(len(LINE_METRIC_COLUMNS))
         self.table1.setHorizontalHeaderLabels([h for _, h, _ in LINE_METRIC_COLUMNS])
         self.table1.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table1.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table1.verticalHeader().setVisible(False)
+        self._install_row_copy(self.table1)
 
-        # 'lines' tab: lines of the most-recently selected distribution (+charge).
-        self.lines_view, self.lines_model = self._make_table_view(
-            LINES_TAB_COLUMNS, self._on_line_activated)
-
-        # 'distributions' tab: all distributions (or one analyte's members after a
-        # charge-distribution double-click). Click loads panel 3 + its lines.
+        # 'distributions' tab.
         self.dists_view, self.dists_model = self._make_table_view(
             DIST_TAB_COLUMNS, self._on_distribution_activated)
         self.dists_view.clicked.connect(self._on_dist_clicked)
 
-        # 'charge distributions' tab: flat table of multi-charge analytes (single
-        # rows). Click loads panel 3; double-click opens its member distributions
-        # in the distributions tab and jumps panels 1/2.
+        # 'charge distributions' tab: flat multi-charge analytes (single rows).
         self.charge_view, self.charge_model = self._make_table_view(
             CHARGE_TAB_COLUMNS, self._on_charge_activated)
         self.charge_view.clicked.connect(self._on_charge_clicked)
 
         self.table1_tabs = QTabWidget()
         self.table1_tabs.addTab(self.table1, "current")
-        self.table1_tabs.addTab(self.lines_view, "lines")
-        self.table1_tabs.addTab(self._wrap_with_all(self.dists_view, self._reload_all_distributions),
-                                "distributions")
-        self.table1_tabs.addTab(self._wrap_with_all(self.charge_view, self._reload_all_charges),
-                                "charge distributions")
+        self.table1_tabs.addTab(self.dists_view, "distributions")
+        self.table1_tabs.addTab(self.charge_view, "charge distributions")
         self.table1_tabs.currentChanged.connect(self._on_table1_tab_changed)
-        self._table1_loaded = set()  # which tabs have been populated for self.db
+        self._table1_loaded = set()
 
-        dock = QDockWidget("Table 1 - distribution lines", self)
+        # 'All' button on the tab row (reloads whichever tab is active).
+        all_btn = QPushButton("All")
+        all_btn.setFixedWidth(44)
+        all_btn.clicked.connect(self._reload_current_tab)
+        self.table1_tabs.setCornerWidget(all_btn, Qt.TopRightCorner)
+
+        dock = QDockWidget("", self)
         dock.setObjectName("dock_table1")
+        dock.setTitleBarWidget(QWidget())   # reclaim the title-bar head space
         dock.setWidget(self.table1_tabs)
         self.dock_table1 = dock
 
@@ -1880,30 +1884,20 @@ class MSViewerTab(QMainWindow):
         if getattr(self, "dists_model", None) is not None:
             self.dists_model.set_rows([])
             self.charge_model.set_rows([])
-            self.lines_model.set_rows([])
         if getattr(self, "table1_tabs", None) is not None:
             self._on_table1_tab_changed(self.table1_tabs.currentIndex())
 
-    def _reload_all_distributions(self):
-        if self.db is not None:
+    def _reload_current_tab(self):
+        """'All' button: reload the full list for whichever tab is active."""
+        if self.db is None or getattr(self, "table1_tabs", None) is None:
+            return
+        name = self.table1_tabs.tabText(self.table1_tabs.currentIndex())
+        if name == "distributions":
             self.dists_model.set_rows(self.db.all_distributions())
             self._table1_loaded.add("distributions")
-
-    def _reload_all_charges(self):
-        if self.db is not None:
+        elif name == "charge distributions":
             self.charge_model.set_rows(self.db.all_analytes_multicharge())
             self._table1_loaded.add("charge distributions")
-
-    def _load_lines_for_distribution(self, distribution_id):
-        """Fill the 'lines' tab with this distribution's lines (members) + charge."""
-        if self.db is None:
-            return
-        dist = self.db.distribution(distribution_id)
-        charge = dist.get("charge") if dist else 0
-        rows = self.db.distribution_members(distribution_id)
-        for r in rows:
-            r["charge"] = charge
-        self.lines_model.set_rows(rows)
 
     def _on_table1_tab_changed(self, index):
         if getattr(self, "table1_tabs", None) is None or self.db is None:
@@ -1956,17 +1950,11 @@ class MSViewerTab(QMainWindow):
                 return i
         return -1
 
-    def _on_line_activated(self, row):
-        # double-click a line -> jump panels 1/2 to it
-        if row:
-            self._jump_to(row.get("mz_mean"), row.get("rt_apex"))
-
     def _on_distribution_activated(self, row):
-        # double-click a distribution -> show its lines (lines tab) and jump
+        # double-click a distribution -> show its lines (current tab) and jump
         if not row:
             return
-        self._load_lines_for_distribution(row.get("distribution_id"))
-        self.table1_tabs.setCurrentIndex(self._tab_index("lines"))
+        self.table1_tabs.setCurrentIndex(self._tab_index("current"))
         self._jump_to(row.get("mono_mz"), row.get("rt_apex"), row.get("distribution_id"))
 
     def _on_charge_activated(self, row):
@@ -2014,9 +2002,8 @@ class MSViewerTab(QMainWindow):
     def _on_dist_clicked(self, index):
         row = self.dists_model.row_dict(self.dists_view.model().mapToSource(index).row())
         if row:
-            did = row.get("distribution_id")
-            self._load_lines_for_distribution(did)   # open its lines in the lines tab
-            self._show_distribution_in_panel3(did)
+            # loads panel 3 + fills the 'current' tab with this distribution's lines
+            self._show_distribution_in_panel3(row.get("distribution_id"))
 
     def _on_charge_clicked(self, index):
         row = self.charge_model.row_dict(self.charge_view.model().mapToSource(index).row())

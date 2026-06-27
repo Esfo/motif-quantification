@@ -109,7 +109,20 @@ class DistributionsDB:
         return [dict(r) for r in rows]
 
     def all_distributions(self):
-        rows = self.connect().execute("SELECT * FROM distributions").fetchall()
+        # AUC = sum of member-feature areas = area under the combined isotope peak
+        # (integral of the summed per-timepoint signal across all lines).
+        rows = self.connect().execute(
+            """
+            SELECT d.*, IFNULL(a.auc, 0.0) AS auc
+            FROM distributions d
+            LEFT JOIN (
+                SELECT m.distribution_id, SUM(f.area) AS auc
+                FROM distribution_members m
+                JOIN features f ON f.feature_id = m.feature_id
+                GROUP BY m.distribution_id
+            ) a ON a.distribution_id = d.distribution_id
+            """
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def all_analytes(self):
@@ -118,13 +131,23 @@ class DistributionsDB:
 
     def all_analytes_multicharge(self):
         """Analytes that span more than one charge state, each with one
-        representative member distribution_id (for a one-click panel-3 load)."""
+        representative member distribution_id (for a one-click panel-3 load) and
+        an AUC = total area under the combined peak of every line of every member
+        distribution."""
         rows = self.connect().execute(
             """
             SELECT a.*,
                    (SELECT am.distribution_id FROM analyte_members am
-                    WHERE am.analyte_id = a.analyte_id LIMIT 1) AS rep_distribution_id
+                    WHERE am.analyte_id = a.analyte_id LIMIT 1) AS rep_distribution_id,
+                   IFNULL(s.auc, 0.0) AS auc
             FROM analytes a
+            LEFT JOIN (
+                SELECT am.analyte_id, SUM(f.area) AS auc
+                FROM analyte_members am
+                JOIN distribution_members m ON m.distribution_id = am.distribution_id
+                JOIN features f ON f.feature_id = m.feature_id
+                GROUP BY am.analyte_id
+            ) s ON s.analyte_id = a.analyte_id
             WHERE a.charge_max > a.charge_min
             ORDER BY a.analyte_id
             """
