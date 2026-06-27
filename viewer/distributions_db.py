@@ -86,6 +86,42 @@ class DistributionsDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def noise_features_in_window(self, mz_min=None, mz_max=None, rt_start=None,
+                                 rt_end=None, limit=40000):
+        """Features ("lines") overlapping the window that belong to NO distribution.
+
+        Returns each feature's bbox + n_points so the viewer can split unassigned
+        points into noise lines / small lines / single points. The LEFT JOIN ...
+        IS NULL keeps only features absent from distribution_members.
+        """
+        clauses = ["m.feature_id IS NULL"]
+        params = []
+        if mz_max is not None:
+            clauses.append("f.mz_min <= ?")
+            params.append(mz_max)
+        if mz_min is not None:
+            clauses.append("f.mz_max >= ?")
+            params.append(mz_min)
+        if rt_end is not None:
+            clauses.append("f.rt_start <= ?")
+            params.append(rt_end)
+        if rt_start is not None:
+            clauses.append("f.rt_end >= ?")
+            params.append(rt_start)
+        where = "WHERE " + " AND ".join(clauses)
+        params.append(limit)
+        rows = self.connect().execute(
+            f"""
+            SELECT f.feature_id, f.mz_min, f.mz_max, f.rt_start, f.rt_end, f.n_points
+            FROM features f
+            LEFT JOIN distribution_members m ON m.feature_id = f.feature_id
+            {where}
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def feature(self, feature_id):
         row = self.connect().execute(
             "SELECT * FROM features WHERE feature_id = ?", (feature_id,)

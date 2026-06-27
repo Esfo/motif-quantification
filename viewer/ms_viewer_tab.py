@@ -311,6 +311,56 @@ def fixed_toggle(off_text, on_text, width=70):
     return button
 
 
+class FlipButton(QPushButton):
+    """A mode button that cycles through labelled states on each press.
+
+    Unlike a checkable toggle (which reads as 'pressed' / 'not pressed'), this is
+    a plain push button: it always shows the label of the CURRENT mode, and each
+    click advances to the next mode and fires ``on_change``. Two states make it a
+    binary switch; more make it a cycle (e.g. the four noise levels). The width is
+    fixed to the widest label so cycling never resizes the button.
+    """
+
+    def __init__(self, states, on_change=None, extra_pad=24, parent=None):
+        super().__init__(parent)
+        self._states = list(states)          # [(key, label), ...]
+        self._idx = 0
+        self._on_change = on_change
+        fm = self.fontMetrics()
+        width = max(fm.horizontalAdvance(label) for _, label in self._states) + extra_pad
+        self.setFixedWidth(width)
+        self.setText(self._states[0][1])
+        self.clicked.connect(self._advance)
+
+    def _advance(self):
+        self._idx = (self._idx + 1) % len(self._states)
+        self.setText(self._states[self._idx][1])
+        if self._on_change is not None:
+            self._on_change()
+
+    def key(self):
+        return self._states[self._idx][0]
+
+    def index(self):
+        return self._idx
+
+    def set_index(self, i):
+        self._idx = i % len(self._states)
+        self.setText(self._states[self._idx][1])
+
+
+# Per-class noise rendering: brighter/larger for substantial noise lines, fainter
+# and smaller down to lone stray points. Keys match the _noise_class values.
+#   1 = noise line (a feature/line with >=5 points, in no distribution)
+#   2 = small line (a feature with 2..4 points, in no distribution)
+#   3 = single point (a 1-point feature, or a stray datapoint in no feature)
+NOISE_STYLE = {
+    1: ((205, 205, 205, 215), 2.5),
+    2: ((170, 180, 205, 180), 2.0),
+    3: ((150, 150, 150, 140), 1.5),
+}
+
+
 class MSViewerTab(QMainWindow):
     def __init__(self, session, distributions_db=None, xics_ppm=10.0, xics_rt_window=0.8, theme="dark"):
         super().__init__()
@@ -334,6 +384,7 @@ class MSViewerTab(QMainWindow):
         self._p1_scatter_item = None  # panel-1 2D centroid scatter (for rescaling)
         self._assigned = None     # bool mask: which raw points are in a distribution
         self._groups = []         # [(distribution_id, colour, point_mask)]
+        self._noise_class = None  # int8 per point: 0 assigned, 1 line, 2 small, 3 single
         self._last_region = None
         self.center = None        # (mz_center, rt_center) for the ± controls
         self._guard = False       # suppress range-change handling during programmatic set
@@ -535,20 +586,19 @@ class MSViewerTab(QMainWindow):
         self.p1_stack.addWidget(p1_2d_row)           # index 0 = 2D
         self.p1_stack.addWidget(self.p1_3d_widget)   # index 1 = 3D
 
-        self.dim_toggle = fixed_toggle("3D", "2D")     # shows what it will switch TO
-        self.dim_toggle.clicked.connect(self.toggle_dimension)
-        self.source_toggle = fixed_toggle("profile", "centroid")
-        self.source_toggle.clicked.connect(self.refresh)
-        # Noise = points not in any distribution. Default shows noise; pressing
-        # hides it (label flips to what the next press does, like the others).
-        self.noise_toggle = fixed_toggle("noise off", "noise on", width=80)
-        # Default: noise OFF (checked == hide noise; label shows what a press does).
-        self.noise_toggle.setChecked(True)
-        self.noise_toggle.setText("noise on")
-        self.noise_toggle.clicked.connect(self._toggle_noise)
-        # Log/linear colour scale for the 3D intensity colouring.
-        self.logcolor_toggle = fixed_toggle("log color", "lin color", width=80)
-        self.logcolor_toggle.clicked.connect(self._toggle_logcolor)
+        # Plain mode buttons (FlipButton): each shows the current mode and cycles
+        # on press -- no sunken 'pressed' look. dim/source/colour are binary; noise
+        # cycles through four levels of progressively finer noise.
+        self.dim_toggle = FlipButton([("2D", "2D"), ("3D", "3D")], on_change=self.toggle_dimension)
+        self.source_toggle = FlipButton([("centroid", "centroid"), ("profile", "profile")],
+                                        on_change=self.refresh)
+        # Noise levels: none -> noise lines -> + small lines -> + single points.
+        self.noise_toggle = FlipButton(
+            [("none", "no noise"), ("line", "line noise"),
+             ("small", "small line noise"), ("single", "single point noise")],
+            on_change=self._on_noise_changed)
+        self.logcolor_toggle = FlipButton([("lin", "lin color"), ("log", "log color")],
+                                          on_change=self._on_logcolor)
         # Snap the 3D view to the aligned top-down (2D-like) orientation.
         self.reset3d_button = QPushButton("align 3D")
         self.reset3d_button.setFixedWidth(70)
@@ -1124,22 +1174,29 @@ class MSViewerTab(QMainWindow):
                         set_view=True)
 
     def use_profile(self):
-        return self.source_toggle.isChecked()
+        return self.source_toggle.key() == "profile"
 
-    def use_noise(self):
-        # Noise shown by default; the toggle (when checked) hides it.
-        return not self.noise_toggle.isChecked()
+    def noise_mode(self):
+        """Current noise level: 0 none, 1 lines, 2 +small lines, 3 +single points."""
+        return self.noise_toggle.index()
 
-    def _toggle_noise(self):
-        self.noise_toggle.setText("noise on" if self.noise_toggle.isChecked() else "noise off")
+    def noise_visible_mask(self, n):
+        """Boolean over the loaded points: which noise points the current level
+        reveals. A point is shown if its class is between 1 and the active mode."""
+        mode = self.noise_mode()
+        cls = getattr(self, "_noise_class", None)
+        if mode <= 0 or cls is None or cls.size != n:
+            return np.zeros(n, dtype=bool)
+        return (cls >= 1) & (cls <= mode)
+
+    def _on_noise_changed(self):
         # Pure redraw from cached data -- no re-extraction needed.
         self._redraw_from_cache()
 
     def use_logcolor(self):
-        return self.logcolor_toggle.isChecked()
+        return self.logcolor_toggle.key() == "log"
 
-    def _toggle_logcolor(self):
-        self.logcolor_toggle.setText("lin color" if self.logcolor_toggle.isChecked() else "log color")
+    def _on_logcolor(self):
         # Recolour the cached 3D points without re-extraction.
         if HAVE_GL and getattr(self, "_p1_3d_inputs", None) is not None:
             self.draw_panel1_3d(*self._p1_3d_inputs)
@@ -1328,6 +1385,7 @@ class MSViewerTab(QMainWindow):
             self._assigned, self._groups = self._assignment_profile(points, win)
         else:
             self._assigned, self._groups = self._assignment(points, win)
+        self._noise_class = self._compute_noise_class(points, win, self._assigned)
 
         self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end)
         self.draw_panel2(points, (mz_min, mz_max, rt_start, rt_end))
@@ -1374,14 +1432,17 @@ class MSViewerTab(QMainWindow):
                     self.p1_2d.addItem(sc)
                     self._p1_scatters.append((sc, 3))
                     shown_max = max(shown_max, float(inten[idx].max()))
-            if self.use_noise():
-                un = (~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)) & vm
-                if un.any():
-                    sc = pg.ScatterPlotItem(x=mz[un], y=inten[un], size=2, pen=None,
-                                            brush=pg.mkBrush(225, 225, 225, 200))
-                    self.p1_2d.addItem(sc)
-                    self._p1_scatters.append((sc, 2))
-                    shown_max = max(shown_max, float(inten[un].max()))
+            noise_vis = self.noise_visible_mask(mz.size) & vm
+            if noise_vis.any():
+                # One scatter per noise class so the levels are visually distinct.
+                for cls, (color, size) in NOISE_STYLE.items():
+                    nm = noise_vis & (self._noise_class == cls)
+                    if nm.any():
+                        sc = pg.ScatterPlotItem(x=mz[nm], y=inten[nm], size=size, pen=None,
+                                                brush=pg.mkBrush(*color))
+                        self.p1_2d.addItem(sc)
+                        self._p1_scatters.append((sc, size))
+                        shown_max = max(shown_max, float(inten[nm].max()))
             if self._p1_scatters:
                 self.p1_2d.getViewBox().setYRange(0, (shown_max or 1.0) * 1.05, padding=0)
         # No title on panel 1 (per the user).
@@ -1390,7 +1451,7 @@ class MSViewerTab(QMainWindow):
         # The 3D scatter is expensive; only build it when 3D is actually shown.
         # Cache the inputs so toggling to 3D can render without a reload.
         self._p1_3d_inputs = (points, region, mz_min, mz_max, rt_start, rt_end)
-        if HAVE_GL and self.dim_toggle.isChecked():
+        if HAVE_GL and self.dim_toggle.key() == "3D":
             self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
 
     def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
@@ -1416,9 +1477,10 @@ class MSViewerTab(QMainWindow):
         if self.window is not None:
             mz_min, mz_max, rt_start, rt_end = self.window
         view = (mz >= mz_min) & (mz <= mz_max) & (rt >= rt_start) & (rt <= rt_end)
-        # Honour the noise toggle: drop points not in any distribution when off.
-        if not self.use_noise() and self._assigned is not None and self._assigned.any():
-            view &= self._assigned
+        # Honour the noise level: keep assigned points plus only the noise classes
+        # the current mode reveals.
+        if self._assigned is not None:
+            view &= self._assigned | self.noise_visible_mask(mz.size)
         mz, rt, inten, base = mz[view], rt[view], inten[view], base[view]
         if mz.size == 0:
             self.p1_scatter.setVisible(False)
@@ -1535,6 +1597,39 @@ class MSViewerTab(QMainWindow):
                 groups.append((did, self.distribution_color(did), feat_masks))
         return assigned, groups
 
+    def _compute_noise_class(self, points, window, assigned):
+        """Classify every loaded raw point into a noise level.
+
+        0 = assigned (belongs to a distribution; always shown);
+        1 = noise line   (a feature/line with >=5 points, in no distribution);
+        2 = small line   (a feature with 2..4 points, in no distribution);
+        3 = single point (a 1-point feature, or a stray datapoint in no feature).
+
+        Unassigned points default to 3 (lone/stray) and are promoted to a stronger
+        (lower) class when they fall inside a larger noise feature's box; a point
+        in overlapping noise features takes the strongest (largest-line) class.
+        """
+        if not isinstance(points, dict) or points["mz"].size == 0:
+            return None
+        mz = points["mz"]; rt = points["rt"]
+        cls = np.where(assigned if assigned is not None else False, 0, 3).astype(np.int8)
+        if self.db is None or assigned is None:
+            return cls
+        unassigned = ~assigned
+        if not unassigned.any():
+            return cls
+        for feat in self.db.noise_features_in_window(*window):
+            npoints = feat["n_points"]
+            c = 1 if npoints >= 5 else (2 if npoints >= 2 else 3)
+            if c == 3:
+                continue  # already the default for unassigned points
+            m = (unassigned
+                 & (mz >= feat["mz_min"]) & (mz <= feat["mz_max"])
+                 & (rt >= feat["rt_start"]) & (rt <= feat["rt_end"]))
+            if m.any():
+                cls[m] = np.minimum(cls[m], np.int8(c))
+        return cls
+
     def _assignment_profile(self, points, window):
         """Profile-mode membership via peak finding (roadmap 1.9): run the same
         centroiding peak-detection (``axis_peaks``) per scan, take each peak's
@@ -1625,15 +1720,16 @@ class MSViewerTab(QMainWindow):
             self.p2.addItem(scatter)
             self._p2_scatters.append((scatter, 3))
 
-        # points not in any distribution -> faint gray dots, unless noise is off.
-        if self.use_noise():
-            unassigned = ~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)
-            if unassigned.any():
-                grey = pg.ScatterPlotItem(
-                    x=mz[unassigned], y=rt[unassigned], size=1.5, pen=None,
-                    brush=pg.mkBrush(225, 225, 225, 130))
-                self.p2.addItem(grey)
-                self._p2_scatters.append((grey, 1.5))
+        # Noise points -> one scatter per visible noise class (level-dependent).
+        noise_vis = self.noise_visible_mask(mz.size)
+        if noise_vis.any():
+            for cls, (color, size) in NOISE_STYLE.items():
+                nm = noise_vis & (self._noise_class == cls)
+                if nm.any():
+                    sc = pg.ScatterPlotItem(x=mz[nm], y=rt[nm], size=size, pen=None,
+                                            brush=pg.mkBrush(*color))
+                    self.p2.addItem(sc)
+                    self._p2_scatters.append((sc, size))
 
         self._rescale_points()
 
@@ -2500,8 +2596,7 @@ class MSViewerTab(QMainWindow):
     # ---- toggles + sync --------------------------------------------------
 
     def toggle_dimension(self):
-        to_3d = self.dim_toggle.isChecked()
-        self.dim_toggle.setText("2D" if to_3d else "3D")
+        to_3d = self.dim_toggle.key() == "3D"
         self.p1_stack.setCurrentIndex(1 if to_3d else 0)
         self.reset3d_button.setEnabled(to_3d and HAVE_GL)
         # Build the 3D view lazily on first switch (it's skipped while 2D shows).
