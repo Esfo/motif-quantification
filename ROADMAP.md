@@ -162,8 +162,8 @@ data the pipeline produces. The four founding goals:
 - ⬜ When Panel 1 switches to **profile**, Table 1 **adjusts accordingly** (profile-mode metrics, see 1.9).
 
 ## 1.9 Profile ↔ centroid peak linking ("SUPER important")
-- ⬜ When Panel 1 switches to **profile**, all the **peak-finding processes from `centroid-mzml.py` run in the background** and **link the output centroid point** of the matched distributions/lines **to EVERY profile datapoint that that specific centroided point came from**.
-- ⬜ So **all profile datapoints are accounted for** this way, in Table 1 and the visualizations, and their **colors are assigned based on the centroid data** that each peak-finding process assigns the profile data to.
+- 🟡 When Panel 1 is in **profile**, the **peak-finding (`axis_peaks`, the same centroiding peak-detection from `peaks.py`) runs per scan**; each peak's **apex is the centroid**, matched to a sqlite feature, and **every profile datapoint under that peak (left..right) is assigned to that feature's distribution** — so profile points are linked back to the centroid they'd reduce to and **coloured to match the lines/distributions** (in Panel 1 2D, Panel 2, and the 3D), instead of all reading as noise (`_assignment_profile`).
+- 🟡 Profile points under a matched peak are accounted for and coloured by the centroid's distribution; ⬜ still to: surface this in **Table 1** (profile-mode metrics), run it **off the UI thread** for big windows, and tie the peak boundaries to the actual `centroid-mzml.py` output rather than re-detecting.
 
 ## 1.10 Panel 3 — MS1 view (charge-comparison grid)
 - 🟡 When an **MS1 distribution** is clicked, Panel 3 shows the plot from `examples/panel-3-plot.py`: the **charge-state-determination grid** that **links multiple distributions (charge states of one analyte) into one plot of many comparisons** — columns = charge states, **8 rows**: retention time / peak area / charge distances / cross-charge / intensity sum % / adjacency / ppm-to-mean / ppm-error.

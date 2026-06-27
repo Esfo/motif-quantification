@@ -1020,8 +1020,14 @@ class MSViewerTab(QMainWindow):
         self._last_scan_mz = scan_mz
         self._last_scan_int = scan_int
         # Compute distribution membership once (shared by panels 1 and 2, and the
-        # noise toggle), so we don't query the sqlite twice per draw.
-        self._assigned, self._groups = self._assignment(points, (mz_min, mz_max, rt_start, rt_end))
+        # noise toggle). In profile mode use peak-finding so profile points are
+        # linked to the centroid they'd reduce to (roadmap 1.9); otherwise match
+        # centroid points directly.
+        win = (mz_min, mz_max, rt_start, rt_end)
+        if self.use_profile() and cur.get("profile"):
+            self._assigned, self._groups = self._assignment_profile(points, win)
+        else:
+            self._assigned, self._groups = self._assignment(points, win)
 
         self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end)
         self.draw_panel2(points, (mz_min, mz_max, rt_start, rt_end))
@@ -1223,6 +1229,59 @@ class MSViewerTab(QMainWindow):
                     feat_masks.append(m)
             if feat_masks:
                 groups.append((did, self.distribution_color(did), feat_masks))
+        return assigned, groups
+
+    def _assignment_profile(self, points, window):
+        """Profile-mode membership via peak finding (roadmap 1.9): run the same
+        centroiding peak-detection (``axis_peaks``) per scan, take each peak's
+        apex as the centroid, match THAT centroid to a sqlite feature, and assign
+        EVERY profile datapoint under the peak (left..right) to that feature's
+        distribution -- so profile points are linked back to the centroid they'd
+        be reduced to and coloured to match, instead of all reading as noise."""
+        try:
+            from .peaks import axis_peaks
+        except ImportError:
+            from peaks import axis_peaks
+        if not isinstance(points, dict) or points["mz"].size == 0 or self.db is None:
+            return None, []
+        mz = points["mz"]; rt = points["rt"]; inten = points["intensity"]
+        n = mz.size
+        mz_min, mz_max, rt_start, rt_end = window
+        # Flatten the features into arrays for vectorised apex->feature matching.
+        flist = []
+        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
+            did = dist["distribution_id"]
+            color = self.distribution_color(did)
+            for feat in self.db.distribution_members(did):
+                flist.append((did, color, feat))
+        assigned = np.zeros(n, dtype=bool)
+        if not flist:
+            return assigned, []
+        fmzlo = np.array([f["mz_min"] for _, _, f in flist])
+        fmzhi = np.array([f["mz_max"] for _, _, f in flist])
+        frtlo = np.array([f["rt_start"] for _, _, f in flist])
+        frthi = np.array([f["rt_end"] for _, _, f in flist])
+        feat_pt = [np.zeros(n, dtype=bool) for _ in flist]
+        for r in np.unique(rt):
+            si = np.where(rt == r)[0]
+            si = si[np.argsort(mz[si])]
+            smz = mz[si]; sint = inten[si]
+            for l, m, rg in axis_peaks(sint):
+                if m < 0 or m >= smz.size:
+                    continue
+                apex = smz[m]
+                cand = np.where((fmzlo <= apex) & (apex <= fmzhi)
+                                & (frtlo <= r) & (r <= frthi))[0]
+                if cand.size == 0:
+                    continue
+                pts = si[l:rg + 1]
+                feat_pt[cand[0]][pts] = True
+                assigned[pts] = True
+        by_did = {}
+        for fi, (did, color, _f) in enumerate(flist):
+            if feat_pt[fi].any():
+                by_did.setdefault(did, (color, []))[1].append(feat_pt[fi])
+        groups = [(did, color, masks) for did, (color, masks) in by_did.items()]
         return assigned, groups
 
     def draw_panel2(self, points, window):
