@@ -301,15 +301,20 @@ class MSViewerTab(QMainWindow):
         # direction as panel 2's x axis (azimuth -90). "align 3D" tips it to a
         # near-top-down 2D-like view. We deliberately avoid elevation == 90 (a
         # camera singularity in pyqtgraph that can crash when orbited through it).
-        self._p1_3d_default_cam = dict(distance=3.4, elevation=28, azimuth=-90)
-        self._p1_3d_aligned_cam = dict(distance=3.4, elevation=89.0, azimuth=-90)
+        # m/z is mapped to GL-x and time to GL-y, so azimuth 0 keeps m/z running
+        # left->right (aligned with panel 2's x). Default is a perspective; align
+        # tips it to near-top-down (89, not 90 -- 90 is a pyqtgraph singularity).
+        self._p1_3d_default_cam = dict(distance=3.4, elevation=28, azimuth=0)
+        self._p1_3d_aligned_cam = dict(distance=3.4, elevation=89.0, azimuth=0)
         self.p1_3d_mz_label = QLabel("m/z")
         self.p1_3d_time_label = QLabel("time (min)")
         for lbl in (self.p1_3d_mz_label, self.p1_3d_time_label):
             lbl.setAlignment(Qt.AlignCenter)
         if HAVE_GL:
             self.p1_3d = gl.GLViewWidget()
-            self.p1_3d.setCameraPosition(**self._p1_3d_default_cam)
+            # Load already aligned (top-down, panel-2-aligned) so the initial view
+            # and the "align 3D" button produce the SAME correct orientation.
+            self.p1_3d.setCameraPosition(**self._p1_3d_aligned_cam)
             self.p1_surface = gl.GLSurfacePlotItem(
                 x=np.array([0.0, 1.0], dtype=np.float32),
                 y=np.array([0.0, 1.0], dtype=np.float32),
@@ -328,9 +333,9 @@ class MSViewerTab(QMainWindow):
             grid = QGridLayout(gl_container)
             grid.setContentsMargins(0, 0, 0, 0)
             grid.setSpacing(1)
-            grid.addWidget(self.p1_3d_mz_label, 0, 0)    # left side = m/z
+            grid.addWidget(self.p1_3d_time_label, 0, 0)  # left side = time
             grid.addWidget(self.p1_3d, 0, 1)
-            grid.addWidget(self.p1_3d_time_label, 1, 1)  # bottom = time
+            grid.addWidget(self.p1_3d_mz_label, 1, 1)    # bottom = m/z (horizontal)
             grid.setColumnStretch(1, 1)
             grid.setRowStretch(0, 1)
             self.p1_3d_widget = gl_container
@@ -995,67 +1000,60 @@ class MSViewerTab(QMainWindow):
     def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
         if not HAVE_GL:
             return
+        # Surface removed entirely (per the user): the 3D view is just the
+        # individual datapoints, for both centroid and profile.
+        self.p1_surface.setVisible(False)
+        if not (isinstance(points, dict) and points["mz"].size):
+            self.p1_scatter.setVisible(False)
+            return
+
+        mz = points["mz"]; rt = points["rt"]; inten = points["intensity"]
+        n = mz.size
+
+        # Per-point base colour = the panel-2 distribution colour (grey if the
+        # point isn't in any distribution), so the 3D dots match panel 2.
+        base = np.full((n, 3), 0.5, dtype=np.float32)
+        for _did, color, feat_masks in (self._groups or []):
+            c = np.array(color, dtype=np.float32) / 255.0
+            for fm in feat_masks:
+                base[fm] = c
+
+        # Cap the scatter (intensity-priority so the peaks survive) to keep orbit
+        # smooth.
+        MAX_3D_POINTS = 5000
+        if n > MAX_3D_POINTS:
+            keep = np.argpartition(inten, -MAX_3D_POINTS)[-MAX_3D_POINTS:]
+            mz, rt, inten, base = mz[keep], rt[keep], inten[keep], base[keep]
+
+        zmax = float(inten.max()) or 1.0
+        z = (inten / zmax).astype(np.float32)
+        # White-tip gradient: low intensity keeps the distribution colour, high
+        # intensity blends to white, so peak tips are white. Log option supported.
+        if self.use_logcolor():
+            t = np.log1p(inten); t = (t / (t.max() or 1.0)).astype(np.float32)
+        else:
+            t = z
+        t = t[:, None]
+        rgb = base * (1.0 - t) + np.float32(1.0) * t
+        colors = np.column_stack([rgb, np.ones(rgb.shape[0], dtype=np.float32)]).astype(np.float32)
+
+        # Axes: m/z -> GL-x (horizontal, aligned with panel 2), time -> GL-y,
+        # intensity -> GL-z. x is aspect-scaled so the footprint fills the
+        # (rectangular) pane rather than a forced square.
         mz_span = max(mz_max - mz_min, 1e-6)
         rt_span = max(rt_end - rt_start, 1e-6)
-        profile = bool(self.use_profile() and self.current and self.current.get("profile"))
-
-        # Shared intensity scale so the surface and the scatter sit at the SAME
-        # height (they used to be normalised independently, leaving the surface
-        # in a "subterranean" layer below the dots).
-        zmax = 1.0
-        if isinstance(points, dict) and points["mz"].size:
-            zmax = float(points["intensity"].max()) or 1.0
-        elif isinstance(region, dict) and region.get("z") is not None and region["z"].size:
-            zmax = float(region["z"].max()) or 1.0
-
-        # The interpolated surface only makes sense for continuous PROFILE data;
-        # for sparse centroid peaks it collapses to a spiky floor under the dots,
-        # so hide it there.
-        show_surface = profile and isinstance(region, dict) and \
-            region.get("z") is not None and region["z"].size
-        if show_surface:
-            z = region["z"]
-            rts = region["rts"]
-            mz_grid = region["mz_grid"]
-            zr = (z / zmax).astype(np.float32)            # (n_rt, n_mz), shared scale
-            xs = ((rts - rt_start) / rt_span * 2 - 1).astype(np.float32)
-            ys = ((mz_grid - mz_min) / mz_span * 2 - 1).astype(np.float32)
-            try:
-                self.p1_surface.setData(x=xs, y=ys, z=zr)
-                self.p1_surface.setColor((0.30, 0.45, 0.70, 0.45))
-                self.p1_surface.setVisible(True)
-            except Exception:
-                pass
-        else:
-            self.p1_surface.setVisible(False)
-
-        if isinstance(points, dict) and points["mz"].size:
-            mz = points["mz"]; rt = points["rt"]; inten = points["intensity"]
-            # Cap the scatter hard so rotating the 3D view stays smooth (a dense
-            # window was lagging the GL view badly on orbit).
-            MAX_3D_POINTS = 5000
-            if mz.size > MAX_3D_POINTS:
-                keep = np.argpartition(inten, -MAX_3D_POINTS)[-MAX_3D_POINTS:]
-                mz, rt, inten = mz[keep], rt[keep], inten[keep]
-            x = ((rt - rt_start) / rt_span * 2 - 1).astype(np.float32)
-            y = ((mz - mz_min) / mz_span * 2 - 1).astype(np.float32)
-            z = (inten / zmax).astype(np.float32)         # same scale as surface
-            pos = np.column_stack([x, y, z])
-            # Colour by intensity, log or linear per the colour toggle.
-            if self.use_logcolor():
-                cval = np.log1p(inten)
-                cval = (cval / (cval.max() or 1.0)).astype(np.float32)
-            else:
-                cval = z
-            if self._cmap is not None:
-                colors = self._cmap.map(cval, mode="float")
-            else:
-                colors = np.tile(np.array([1, 1, 1, 1], dtype=np.float32), (cval.size, 1))
-            try:
-                self.p1_scatter.setData(pos=pos, color=colors, size=4.0)
-                self.p1_scatter.setVisible(True)
-            except Exception:
-                pass
+        try:
+            aspect = max(self.p1_3d.width() / max(self.p1_3d.height(), 1), 0.2)
+        except Exception:
+            aspect = 1.0
+        x = (((mz - mz_min) / mz_span * 2 - 1) * aspect).astype(np.float32)
+        y = ((rt - rt_start) / rt_span * 2 - 1).astype(np.float32)
+        pos = np.column_stack([x, y, z]).astype(np.float32)
+        try:
+            self.p1_scatter.setData(pos=pos, color=colors, size=4.0)
+            self.p1_scatter.setVisible(True)
+        except Exception:
+            pass
 
     def _features_points(self, feats, cur):
         """Raw points covering a set of features (one charge state's lines),
@@ -1533,9 +1531,9 @@ class MSViewerTab(QMainWindow):
                         if m.any():
                             o = np.argsort(cpoints["rt"][m])
                             p0.plot(cpoints["mz"][m][o], cpoints["rt"][m][o],
-                                    pen=pg.mkPen(*color, 200, width=1))
+                                    pen=pg.mkPen(*color, width=1))
                             p0.addItem(pg.ScatterPlotItem(x=cpoints["mz"][m], y=cpoints["rt"][m],
-                                                          size=3, pen=None, brush=pg.mkBrush(*color, 200)))
+                                                          size=3, pen=None, brush=pg.mkBrush(*color)))
 
                 # Row 1: peak area (log).
                 p1 = cell(1, ci)
@@ -1560,10 +1558,10 @@ class MSViewerTab(QMainWindow):
                     ratio = np.divide(intens[nc][bi:bi + size], denom,
                                       out=np.ones(size), where=denom > 0)
                     bx = cmz[ai:ai + size] + 0.004 * cols[nc]
+                    # Use THIS charge's colour for all its bars (full opacity), so
+                    # the column reads as one colour matching its row-0 plot.
                     p3.addItem(pg.BarGraphItem(x=bx, height=np.maximum(ratio, 1e-9),
-                                               width=0.004, brush=self.distribution_color(
-                                                   group[nc]["distribution"]["distribution_id"])
-                                               if group[nc].get("distribution") else color))
+                                               width=0.004, brush=pg.mkBrush(*color)))
 
                 # Row 4: intensity sum % (log).
                 p4 = cell(4, ci)
@@ -1606,9 +1604,7 @@ class MSViewerTab(QMainWindow):
                     other = bases[nc][bi:bi + size]
                     ppm = (other - base) / np.where(other == 0, 1, other) * 1e6
                     p7.addItem(pg.BarGraphItem(x=cmz[ai:ai + size] + bn, height=ppm, width=0.003,
-                                               brush=self.distribution_color(
-                                                   group[nc]["distribution"]["distribution_id"])
-                                               if group[nc].get("distribution") else color))
+                                               brush=pg.mkBrush(*color)))
                     bn += 0.004
             except Exception as exc:
                 # one bad column shouldn't blank the whole grid
