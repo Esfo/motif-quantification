@@ -61,7 +61,8 @@ class Config:
     # mean + line_split_sigma * sigma (over all line spans) is run through the
     # peak finder and split into separate features. This splits the occasional
     # too-long line (really two distributions) without chopping up normal lines.
-    line_split_sigma: float = 3.0
+    # The actual cutoff is printed as split_threshold_rt during the run.
+    line_split_sigma: float = 2.0
     # Optional post-merge of peaks that axis_peaks resolved (only used when a line
     # IS split): combine two apices when no real valley separates them. DEFAULT
     # 0.0 = disabled, so axis_peaks is authoritative.
@@ -1754,6 +1755,24 @@ def run(args):
         )
     )
 
+    # Charge histogram + the ready-to-run query, printed after charge handling so
+    # it can be eyeballed immediately and copy-pasted.
+    charge_counts = {}
+    for distribution in distributions:
+        charge_counts[distribution.charge] = charge_counts.get(distribution.charge, 0) + 1
+
+    total = len(distributions) or 1
+    print("distributions by charge:", file=sys.stderr)
+    for charge in sorted(charge_counts):
+        n = charge_counts[charge]
+        print(f"  z={charge:<3d} {n:>8d}  ({100.0 * n / total:.1f}%)", file=sys.stderr)
+    print(
+        f'sqlite3 {args.out} "SELECT charge, COUNT(*) AS n FROM distributions '
+        f'GROUP BY charge ORDER BY charge;"',
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -1778,7 +1797,7 @@ def parse_args():
     parser.add_argument("--line-merge-mz-ppm", type=float, default=10.0)
     parser.add_argument("--line-merge-mz-abs", type=float, default=0.004)
     parser.add_argument("--line-merge-gap-scans", type=int, default=6)
-    parser.add_argument("--line-split-sigma", type=float, default=3.0)
+    parser.add_argument("--line-split-sigma", type=float, default=2.0)
     parser.add_argument("--min-split-valley-fraction", type=float, default=0.0)
 
     parser.add_argument("--min-trace-points", type=int, default=4)

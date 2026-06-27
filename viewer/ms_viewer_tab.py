@@ -1127,7 +1127,7 @@ class MSViewerTab(QMainWindow):
                 un = (~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)) & vm
                 if un.any():
                     sc = pg.ScatterPlotItem(x=mz[un], y=inten[un], size=2, pen=None,
-                                            brush=pg.mkBrush(150, 150, 150, 150))
+                                            brush=pg.mkBrush(225, 225, 225, 200))
                     self.p1_2d.addItem(sc)
                     self._p1_scatters.append((sc, 2))
                     shown_max = max(shown_max, float(inten[un].max()))
@@ -1380,7 +1380,7 @@ class MSViewerTab(QMainWindow):
             if unassigned.any():
                 grey = pg.ScatterPlotItem(
                     x=mz[unassigned], y=rt[unassigned], size=1.5, pen=None,
-                    brush=pg.mkBrush(160, 160, 160, 70))
+                    brush=pg.mkBrush(225, 225, 225, 130))
                 self.p2.addItem(grey)
                 self._p2_scatters.append((grey, 1.5))
 
