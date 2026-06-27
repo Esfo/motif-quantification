@@ -131,10 +131,21 @@ class DistributionsDB:
             (analyte_id,),
         ).fetchall()
 
+        # An analyte can hold more than one distribution at the same charge. The
+        # grid shows one per charge, so make sure the explicitly requested
+        # distribution wins its own charge slot (otherwise panel 3 would render a
+        # same-charge sibling -- a different colour/size than the one clicked).
         group = {}
         for row in rows:
             did = row["distribution_id"]
-            group[row["charge"]] = {
+            charge = row["charge"]
+            existing = group.get(charge)
+            if existing is not None:
+                if existing["distribution"]["distribution_id"] == distribution_id:
+                    continue  # never displace the clicked distribution
+                if did != distribution_id:
+                    continue  # keep first-seen unless this row IS the clicked one
+            group[charge] = {
                 "distribution": self.distribution(did),
                 "features": self.distribution_members(did),
             }

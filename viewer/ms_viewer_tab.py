@@ -1115,8 +1115,12 @@ class MSViewerTab(QMainWindow):
                     idx |= fm
                 idx &= vm
                 if idx.any():
+                    # data=did + sigClicked makes a distribution clickable in
+                    # panel 1 too, opening it in panel 3 exactly like panel 2.
                     sc = pg.ScatterPlotItem(x=mz[idx], y=inten[idx], size=3, pen=None,
-                                            brush=pg.mkBrush(*color))
+                                            brush=pg.mkBrush(*color),
+                                            data=[_did] * int(idx.sum()))
+                    sc.sigClicked.connect(self.on_panel2_dist_clicked)
                     self.p1_2d.addItem(sc)
                     self._p1_scatters.append((sc, 3))
                     shown_max = max(shown_max, float(inten[idx].max()))
@@ -1758,6 +1762,7 @@ class MSViewerTab(QMainWindow):
 
         points = getattr(self, "_last_points", None)
         self._grid_cells = {}
+        row_first = {}   # row index -> leftmost cell (owns the shared y-axis labels)
         fg = palette(self.theme)["fg"]
 
         def cell(ri, ci):
@@ -1776,19 +1781,31 @@ class MSViewerTab(QMainWindow):
                 ax.enableAutoSIPrefix(False)   # no "1e6"-style SI prefixes
             if ri == 0:
                 p.setTitle(f"z={charges[ci]}", color=fg)
-            if ci == 0:
-                p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
             left.setWidth(54)
-            # Every cell shows exactly 3 y ticks (bottom / middle / top of its
-            # current range), updated live as the range changes.
-            def _ticks(*_args, ax=left, vb=vb):
-                # NB: sigYRangeChanged passes (viewbox, range) positionally, so
-                # swallow all positional args and keep ax/vb as keyword defaults.
-                (y0, y1) = vb.viewRange()[1]
-                mid = (y0 + y1) / 2.0
-                ax.setTicks([[(y0, f"{y0:.3g}"), (mid, f"{mid:.3g}"), (y1, f"{y1:.3g}")]])
-            vb.sigYRangeChanged.connect(_ticks)
-            p._tick_updater = _ticks
+            # Columns in a row share one y-axis: the leftmost cell owns the tick
+            # labels and every other column links its y-range to it and hides its
+            # own tick values. Labels: top + middle always, bottom only when the
+            # baseline is non-zero.
+            if ci == 0:
+                row_first[ri] = p
+                p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
+
+                def _ticks(*_args, ax=left, vb=vb):
+                    # NB: sigYRangeChanged passes (viewbox, range) positionally, so
+                    # swallow all positional args and keep ax/vb as keyword defaults.
+                    (y0, y1) = vb.viewRange()[1]
+                    mid = (y0 + y1) / 2.0
+                    ticks = [(y1, f"{y1:.3g}"), (mid, f"{mid:.3g}")]
+                    if abs(y0) > 1e-12:
+                        ticks.append((y0, f"{y0:.3g}"))
+                    ax.setTicks([ticks])
+
+                vb.sigYRangeChanged.connect(_ticks)
+                p._tick_updater = _ticks
+            else:
+                if ri in row_first:
+                    p.setYLink(row_first[ri])
+                left.setStyle(showValues=False)
             self._grid_cells[(ri, ci)] = p
             return p
 
