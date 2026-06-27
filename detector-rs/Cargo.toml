@@ -1,0 +1,19 @@
+[package]
+name = "ms1_detector"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ms1-detector"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+mzdata = "0.65"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
