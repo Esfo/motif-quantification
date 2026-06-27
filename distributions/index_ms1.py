@@ -92,11 +92,23 @@ class Config:
     # are extremely common in a dense MS1 map. Require more isotope peaks for 1+
     # than for higher charges so random pairs do not become fake 1+ envelopes.
     min_members_charge_one: int = 3
+    # Charge is derived from a pair's spacing, so high charges (tiny spacing) are
+    # easy to fake from accidental coeluting pairs -- the z=14 spike. Require more
+    # isotope peaks as charge rises: a real high-charge species shows many peaks,
+    # an accidental one only two. (charge > high_charge_threshold needs
+    # high_charge_min_members; even higher needs +1 per extra band of 5.)
+    high_charge_threshold: int = 5
+    high_charge_min_members: int = 3
     # Global charge competition: candidate envelopes compete for features so a
     # feature belongs to at most one distribution. 1+ candidates are ranked with
     # a small penalty so that, all else equal, a 2+/3+ interpretation of the same
     # features wins (a strong 1+ with more peaks still beats a weak 2+).
     charge_one_score_penalty: float = 0.85
+    # Charge prior in competition: prefer lower charge so a real 2+ envelope wins
+    # the same features over a spurious higher-charge chain unless the higher
+    # charge has clearly stronger evidence. rank *= 1/(1 + strength*(charge-2)),
+    # so charge 2 is the peak; raise strength to push the distribution toward 2+.
+    charge_prior_strength: float = 0.15
     # Adjacent isotope peaks need not be equal in intensity (the envelope rises
     # then falls), but a real envelope does not jump by an extreme factor between
     # neighbours. Reject an edge whose adjacent heights differ by more than this
@@ -1170,13 +1182,7 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
             path = tentative
             current = next_feature_id
 
-        min_members = (
-            config_dict["min_members_charge_one"]
-            if charge == 1
-            else config_dict["min_distribution_members"]
-        )
-
-        if len(path) < min_members:
+        if len(path) < _min_members_for_charge(charge, config_dict):
             continue
 
         key = (charge, tuple(path))
@@ -1222,16 +1228,29 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
     return rows
 
 
+def _min_members_for_charge(charge, config_dict):
+    # Higher charges (tinier isotope spacing) are easy to fake from accidental
+    # pairs, so require more peaks as charge rises.
+    if charge == 1:
+        return config_dict["min_members_charge_one"]
+    if charge <= config_dict["high_charge_threshold"]:
+        return config_dict["min_distribution_members"]
+    extra = (charge - config_dict["high_charge_threshold"] - 1) // 5
+    return config_dict["high_charge_min_members"] + extra
+
+
+def _charge_prior(charge, config_dict):
+    # Prefer lower charge: peak at 2, gently down-weight higher charges; 1+ keeps
+    # its own penalty.
+    if charge == 1:
+        return config_dict["charge_one_score_penalty"]
+    return 1.0 / (1.0 + config_dict["charge_prior_strength"] * (charge - 2))
+
+
 def _candidate_rank(row, config_dict):
-    # Higher is stronger. quality already rewards member count and edge quality;
-    # 1+ is down-weighted so a competing higher-charge envelope of the same
-    # features wins on a tie, while a clearly stronger 1+ still survives.
-    rank = row["quality"]
-
-    if row["charge"] == 1:
-        rank *= config_dict["charge_one_score_penalty"]
-
-    return rank
+    # Higher is stronger. quality rewards member count + edge quality; the charge
+    # prior makes a real 2+ win the same features over a spurious higher charge.
+    return row["quality"] * _charge_prior(row["charge"], config_dict)
 
 
 def resolve_charge_competition(rows, config_dict):
@@ -1585,7 +1604,10 @@ def make_config(args):
         min_edge_score=args.min_edge_score,
         min_distribution_members=args.min_distribution_members,
         min_members_charge_one=args.min_members_charge_one,
+        high_charge_threshold=args.high_charge_threshold,
+        high_charge_min_members=args.high_charge_min_members,
         charge_one_score_penalty=args.charge_one_score_penalty,
+        charge_prior_strength=args.charge_prior_strength,
         max_adjacent_intensity_ratio=args.max_adjacent_intensity_ratio,
         charge_mass_ppm=args.charge_mass_ppm,
         min_charge_group_rt_score=args.min_charge_group_rt_score,
@@ -1840,7 +1862,10 @@ def parse_args():
     parser.add_argument("--min-edge-score", type=float, default=0.30)
     parser.add_argument("--min-distribution-members", type=int, default=2)
     parser.add_argument("--min-members-charge-one", type=int, default=3)
+    parser.add_argument("--high-charge-threshold", type=int, default=5)
+    parser.add_argument("--high-charge-min-members", type=int, default=3)
     parser.add_argument("--charge-one-score-penalty", type=float, default=0.85)
+    parser.add_argument("--charge-prior-strength", type=float, default=0.15)
     parser.add_argument("--max-adjacent-intensity-ratio", type=float, default=10.0)
 
     parser.add_argument("--charge-mass-ppm", type=float, default=12.0)

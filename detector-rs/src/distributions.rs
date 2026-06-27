@@ -270,11 +270,7 @@ fn dist_worker_for_charge(f: &Features, cfg: &Config, charge: i64, edges: &[&Edg
         .collect();
     starts.sort_unstable();
 
-    let min_members = if charge == 1 {
-        cfg.min_members_charge_one
-    } else {
-        cfg.min_distribution_members
-    };
+    let min_members = min_members_for_charge(charge, cfg);
 
     let mut rows = vec![];
     let mut used_paths: HashSet<Vec<usize>> = HashSet::new();
@@ -358,14 +354,27 @@ fn dist_worker_for_charge(f: &Features, cfg: &Config, charge: i64, edges: &[&Edg
     rows
 }
 
+fn min_members_for_charge(charge: i64, cfg: &Config) -> usize {
+    if charge == 1 {
+        cfg.min_members_charge_one
+    } else if charge <= cfg.high_charge_threshold {
+        cfg.min_distribution_members
+    } else {
+        let extra = ((charge - cfg.high_charge_threshold - 1) / 5).max(0) as usize;
+        cfg.high_charge_min_members + extra
+    }
+}
+
+fn charge_prior(charge: i64, cfg: &Config) -> f64 {
+    if charge == 1 {
+        cfg.charge_one_score_penalty
+    } else {
+        1.0 / (1.0 + cfg.charge_prior_strength * (charge - 2) as f64)
+    }
+}
+
 fn resolve_competition(cfg: &Config, rows: Vec<DistRow>) -> Vec<DistRow> {
-    let rank = |r: &DistRow| -> f64 {
-        if r.charge == 1 {
-            r.quality * cfg.charge_one_score_penalty
-        } else {
-            r.quality
-        }
-    };
+    let rank = |r: &DistRow| -> f64 { r.quality * charge_prior(r.charge, cfg) };
     let mut idx: Vec<usize> = (0..rows.len()).collect();
     idx.sort_by(|&a, &b| rank(&rows[b]).partial_cmp(&rank(&rows[a])).unwrap());
     let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
