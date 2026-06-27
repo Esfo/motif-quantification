@@ -422,15 +422,41 @@ def _compete(ctx, candidates):
     its features are already claimed. Because `total` is charge-neutral (no
     length reward), the winner for a shared feature set is the charge whose
     envelope genuinely fits best — not the one that formed the longest path.
+
+    A dropped candidate of a *different charge* that conflicts with a winner is
+    recorded as that winner's runner-up: when the two scores are within
+    ambiguity_margin the winner is marked 'ambiguous' instead of 'validated', so
+    a near-tie between charges is reported as ambiguity rather than a forced call.
     """
     candidates.sort(key=lambda c: c[0]["total"], reverse=True)
+    margin = ctx.cfg.get("ambiguity_margin", 0.05)
+    winner_of = {}        # feature_id -> index into `kept`
+    runner_up = {}        # kept index -> best conflicting different-charge total
     claimed = set()
-    rows = []
+    kept = []
     for ev, members, z in candidates:
         fids = [m["feature_id"] for m in members]
-        if any(f in claimed for f in fids):
+        conflict = [f for f in fids if f in claimed]
+        if conflict:
+            # record this as a runner-up for any winner it overlaps at a
+            # different charge (the ambiguity signal)
+            for f in conflict:
+                wi = winner_of.get(f)
+                if wi is not None and kept[wi][2] != z:
+                    runner_up[wi] = max(runner_up.get(wi, 0.0), ev["total"])
             continue
-        claimed.update(fids)
+        idx = len(kept)
+        kept.append((ev, members, z))
+        for f in fids:
+            claimed.add(f)
+            winner_of[f] = idx
+
+    rows = []
+    for idx, (ev, members, z) in enumerate(kept):
+        fids = [m["feature_id"] for m in members]
+        runner = runner_up.get(idx, 0.0)
+        ambiguity_score = float(runner / ev["total"]) if ev["total"] > 0 else 0.0
+        status = "ambiguous" if (ev["total"] - runner) < margin * ev["total"] and runner > 0 else "validated"
 
         path_array = np.asarray(fids, dtype=np.int64)
         apex_fid = int(path_array[np.argmax(ctx.height[path_array])])
@@ -452,8 +478,12 @@ def _compete(ctx, candidates):
                 "iso_score": ev["iso_score"],
                 "trace_score": ev["trace_score"],
                 "missing_score": ev["missing_score"],
+                "interloper_score": ev["interloper_score"],
                 "mono_offset": ev["mono_offset"],
                 "n_missing_interior": ev["n_missing_interior"],
+                "n_interlopers": ev["n_interlopers"],
+                "ambiguity_score": ambiguity_score,
+                "status": status,
                 "members": members,
             }
         )

@@ -216,6 +216,8 @@ DIST_TAB_COLUMNS = [
     ("rt_end", "max t", "t"),
     ("n_members", "n iso", "i"),
     ("auc", "AUC", "f"),
+    ("iso_score", "iso", "f"),
+    ("status", "status", "s"),
 ]
 
 # 'charge distributions' tab (chargeregions): one row per analyte (expandable).
@@ -2161,7 +2163,11 @@ class MSViewerTab(QMainWindow):
                 ax.setPen(pg.mkPen(fg)); ax.setTextPen(pg.mkPen(fg))
                 ax.enableAutoSIPrefix(False)   # no "1e6"-style SI prefixes
             if ri == 0:
-                p.setTitle(f"z={charges[ci]}", color=fg)
+                d = group[charges[ci]].get("distribution") or {}
+                badge = " ⚠" if d.get("status") == "ambiguous" else ""
+                iso = d.get("iso_score")
+                extra = f"  iso {iso:.2f}" if iso is not None else ""
+                p.setTitle(f"z={charges[ci]}{badge}{extra}", color=fg)
 
             # Y axis: only the leftmost column carries the axis (labels + values);
             # the other columns get a ZERO-width axis so there's no empty gap

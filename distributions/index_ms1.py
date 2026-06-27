@@ -213,6 +213,16 @@ class Distribution:
     n_members: int
     score: float
     quality: float
+    mz_score: float
+    iso_score: float
+    trace_score: float
+    missing_score: float
+    interloper_score: float
+    mono_offset: int
+    n_missing_interior: int
+    n_interlopers: int
+    ambiguity_score: float
+    status: str
     members: list
 
 
@@ -1347,6 +1357,16 @@ def build_distributions(features, traces, config, progress=False):
                 n_members=row["n_members"],
                 score=row["score"],
                 quality=row["quality"],
+                mz_score=row["mz_score"],
+                iso_score=row["iso_score"],
+                trace_score=row["trace_score"],
+                missing_score=row["missing_score"],
+                interloper_score=row["interloper_score"],
+                mono_offset=row["mono_offset"],
+                n_missing_interior=row["n_missing_interior"],
+                n_interlopers=row["n_interlopers"],
+                ambiguity_score=row["ambiguity_score"],
+                status=row["status"],
                 members=row["members"],
             )
         )
@@ -1608,6 +1628,16 @@ def distribution_rows(distributions):
             "n_members": distribution.n_members,
             "score": distribution.score,
             "quality": distribution.quality,
+            "mz_score": distribution.mz_score,
+            "iso_score": distribution.iso_score,
+            "trace_score": distribution.trace_score,
+            "missing_score": distribution.missing_score,
+            "interloper_score": distribution.interloper_score,
+            "mono_offset": distribution.mono_offset,
+            "n_missing_interior": distribution.n_missing_interior,
+            "n_interlopers": distribution.n_interlopers,
+            "ambiguity_score": distribution.ambiguity_score,
+            "status": distribution.status,
         }
 
 
@@ -1619,6 +1649,10 @@ def distribution_member_rows(distributions):
                 "feature_id": member["feature_id"],
                 "isotope_index": member["isotope_index"],
                 "member_score": member["member_score"],
+                "mz_residual": member.get("mz_residual", 0.0),
+                "intensity_observed": member.get("intensity_observed", 0.0),
+                "intensity_expected": member.get("intensity_expected", 0.0),
+                "trace_score": member.get("trace_score", 0.0),
             }
 
 
@@ -1880,6 +1914,16 @@ def run(args):
     for charge in sorted(charge_counts):
         n = charge_counts[charge]
         print(f"  z={charge:<3d} {n:>8d}  ({100.0 * n / total:.1f}%)", file=sys.stderr)
+
+    status_counts = {}
+    for distribution in distributions:
+        status_counts[distribution.status] = status_counts.get(distribution.status, 0) + 1
+    print(
+        "  status: "
+        + ", ".join(f"{status}={status_counts[status]}" for status in sorted(status_counts)),
+        file=sys.stderr,
+    )
+
     print(
         f'sqlite3 {args.out} "SELECT charge, COUNT(*) AS n FROM distributions '
         f'GROUP BY charge ORDER BY charge;"',
