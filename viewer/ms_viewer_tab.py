@@ -403,6 +403,11 @@ class MSViewerTab(QMainWindow):
         else:
             self._color_pool = list(DIST_PALETTE)
         self.assumed_charge = None
+        # Selected-distribution state: the dotted border + charge-search lock-on.
+        self._selected_dist_id = None
+        self._selected_charge_group = None   # {charge: {distribution, features}} for the analyte
+        self._selected_bbox = None           # (mz_min, mz_max, rt_start, rt_end) of the selection
+        self._sel_border_item = None         # the dotted-rectangle item on panel 2
         self._panel3_mode = "ms1"  # "ms1" (envelope/charge grid) or "ms2" (spectrum)
         self._ms2_scan = None      # the MS2 scan currently shown in panel 3
         self._nav = []            # navigation history of (window, charge)
@@ -1739,9 +1744,11 @@ class MSViewerTab(QMainWindow):
         # (instead of per feature) to keep it fast. Clicking a dot selects the
         # distribution and opens its MS1 panel 3.
         self.p2.clear()
+        self._sel_border_item = None   # cleared by p2.clear(); re-added below
         self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
         self.p2.addItem(self.p2_ms2_star)   # survives clear; empty until hover
         if not isinstance(points, dict) or points["mz"].size == 0:
+            self._render_selection_border()
             return
         mz = points["mz"]
         rt = points["rt"]
@@ -1799,6 +1806,7 @@ class MSViewerTab(QMainWindow):
                     self.p2.addItem(sc)
                     self._p2_scatters.append((sc, size))
 
+        self._render_selection_border()   # dotted rect around the selected distribution
         self._rescale_points()
 
     def on_panel2_dist_clicked(self, _scatter, points):
@@ -1809,7 +1817,8 @@ class MSViewerTab(QMainWindow):
         did = points[0].data()
         if did is None:
             return
-        self.current["distribution_id"] = did
+        # Select it: dotted border + charge-search anchor (no view move on click).
+        self._set_selected(did)
         # Selecting an MS1 distribution returns panel 3 to its MS1 view.
         self._panel3_mode = "ms1"
         self._ms2_scan = None
@@ -2154,6 +2163,12 @@ class MSViewerTab(QMainWindow):
         self.current["distribution_id"] = distribution_id
         self._panel3_mode = "ms1"
         self._ms2_scan = None
+        # Select it first so the dotted border + bbox are ready when panel 2
+        # redraws after the window move.
+        if distribution_id is not None:
+            self._set_selected(distribution_id)
+        else:
+            self._clear_selection()
         rt_start = max(0.0, rt - self.rt_half)
         rt_end = rt + self.rt_half
         self.set_window([mz_center - self.mz_half, mz_center + self.mz_half, rt_start, rt_end],
@@ -2211,7 +2226,7 @@ class MSViewerTab(QMainWindow):
     def _show_distribution_in_panel3(self, distribution_id):
         if distribution_id is None or self.db is None or not self._ensure_current_for_file():
             return
-        self.current["distribution_id"] = distribution_id
+        self._set_selected(distribution_id)
         self._panel3_mode = "ms1"
         self._ms2_scan = None
         try:
@@ -2687,6 +2702,77 @@ class MSViewerTab(QMainWindow):
         self.rt_half = float(value)
         self._recenter_window()
 
+    # ---- distribution selection + dotted border --------------------------
+
+    def _set_selected(self, distribution_id, keep_group=False):
+        """Mark a distribution as selected: update the charge-search anchor
+        (current charge/mass/RT) to it, cache its analyte's charge group, and
+        compute its bounding box for the dotted border. Does not move the view."""
+        if self.db is None or distribution_id is None:
+            return
+        dist = self.db.distribution(distribution_id)
+        if dist is None:
+            return
+        members = self.db.distribution_members(distribution_id)
+        if isinstance(self.current, dict):
+            self.current["distribution_id"] = distribution_id
+            self.current["charge"] = dist.get("charge")
+            self.current["neutral_mass"] = dist.get("neutral_mass")
+            self.current["rt"] = dist.get("rt_apex")
+        self.assumed_charge = dist.get("charge")
+        if members:
+            self._selected_bbox = (
+                min(m["mz_min"] for m in members),
+                max(m["mz_max"] for m in members),
+                min(m["rt_start"] for m in members),
+                max(m["rt_end"] for m in members),
+            )
+        else:
+            self._selected_bbox = None
+        if not keep_group:
+            self._selected_charge_group = self.db.charge_group(distribution_id)
+        self._selected_dist_id = distribution_id
+        self._render_selection_border()
+
+    def _clear_selection(self):
+        self._selected_bbox = None
+        self._render_selection_border()
+
+    def _render_selection_border(self):
+        """Draw (or refresh) the dotted rectangle around the selected
+        distribution on panel 2. A standalone item so it survives without a full
+        redraw; draw_panel2 re-adds it after its clear()."""
+        if getattr(self, "_sel_border_item", None) is not None:
+            try:
+                self.p2.removeItem(self._sel_border_item)
+            except Exception:
+                pass
+            self._sel_border_item = None
+        bbox = getattr(self, "_selected_bbox", None)
+        if bbox is None:
+            return
+        x0, x1, y0, y1 = bbox
+        px = (x1 - x0) * 0.04 + 1e-4
+        py = (y1 - y0) * 0.04 + 1e-4
+        xs = np.array([x0 - px, x1 + px, x1 + px, x0 - px, x0 - px])
+        ys = np.array([y0 - py, y0 - py, y1 + py, y1 + py, y0 - py])
+        pen = pg.mkPen(color=palette(self.theme)["fg"], width=1.4, style=Qt.DashLine)
+        item = pg.PlotCurveItem(xs, ys, pen=pen)
+        item.setZValue(50)
+        self.p2.addItem(item)
+        self._sel_border_item = item
+
+    def _fit_to_selected(self):
+        """Auto-fit panels 1 & 2 to the selected distribution's bounding box so it
+        sits centred and fully framed (the charge-search lock-on)."""
+        bbox = getattr(self, "_selected_bbox", None)
+        if bbox is None:
+            return
+        x0, x1, y0, y1 = bbox
+        mzpad = (x1 - x0) * 0.18 + 0.05
+        rtpad = (y1 - y0) * 0.30 + 0.02
+        self.set_window([x0 - mzpad, x1 + mzpad, max(0.0, y0 - rtpad), y1 + rtpad], set_view=True)
+
     # ---- charge search + navigation history ------------------------------
 
     def _recenter_for_charge(self):
@@ -2709,7 +2795,23 @@ class MSViewerTab(QMainWindow):
     def charge_step(self, delta):
         if self.current is None:
             return
-        self.assumed_charge = max(1, (self.assumed_charge or self.current.get("charge") or 1) + delta)
+        step = 1 if delta > 0 else -1
+        base = self.current.get("charge") or self.assumed_charge or 1
+        target = max(1, base + step)
+        grp = getattr(self, "_selected_charge_group", None)
+        # If the selected distribution's analyte has a distribution at the target
+        # charge, lock onto it: transfer the dotted border and auto-fit to it.
+        if grp and target in grp and grp[target].get("distribution"):
+            did = grp[target]["distribution"]["distribution_id"]
+            self._set_selected(did, keep_group=True)
+            self._fit_to_selected()
+            return
+        # Otherwise keep the free theoretical search (recentre where that charge
+        # would be) and drop the border -- no distribution exists there.
+        self.assumed_charge = target
+        if isinstance(self.current, dict):
+            self.current["charge"] = target
+        self._clear_selection()
         self._recenter_for_charge()
 
     def set_charge(self, z):
