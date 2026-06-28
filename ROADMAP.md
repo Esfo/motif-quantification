@@ -17,7 +17,7 @@ Status legend: ✅ done · 🟡 partial · ⬜ todo.
 | `examples/chargehandling.py` | Distribution generation — **stage 3**, charge-state grouping into analytes |
 | `examples/peptidefragmentscoring.py` | **MS2** fragment isotopic distributions (b/y ion compositions, fragment descending-products, ion scoring) |
 | `examples/libraryadditions.py` | **MS1** peptide isotopic distributions (`descending_partial_products`) |
-| `examples/sequencecoverageconcept.py` | **Panel 3 MS2 sequence coverage** + **Table 2** coverage concept (which residues each matched ion covers, the coverage/divider-string logic). **NOT Tab 2's protein coverage — that is a different concept.** ⬜ *file to be added by the user* |
+| `examples/sequencecoverageconcept.py` | **Panel 3 MS2 sequence coverage** + **Table 2** coverage concept (which residues each matched ion covers, the coverage/divider-string logic). **NOT Tab 2's protein coverage — that is a different concept.** ✅ *file provided; ported to `viewer/coverage.py`* |
 
 The faithful reference algorithm is the authority for the pipeline; the active
 `distributions/index_ms1.py` must be made to reproduce it (keeping the sqlite output).
@@ -198,9 +198,12 @@ data the pipeline produces. The four founding goals:
   could have matched to** (the other candidate PSMs) **with their relevant sequence coverage**, so
   the user can judge whether one peptide is distinguishable from another. Optional panel. 🟡 dock +
   candidate listing exists, and **Table 2 now only appears when Panel 3 is in MS2 mode** (hidden for
-  MS1 so the MS1 view takes the full space); ⬜ "could-have-matched" candidate logic; ⬜ the **coverage
-  column** per **`examples/sequencecoverageconcept.py`** (reference to be added by the user) — the MS2
-  fragment coverage concept, **distinct from Tab 2's protein coverage**.
+  MS1 so the MS1 view takes the full space); ⬜ "could-have-matched" candidate logic; ✅ the **coverage
+  column** per **`examples/sequencecoverageconcept.py`** — ported to `viewer/coverage.py`: each
+  candidate peptide's theoretical b/y fragment ions are matched (±ppm, charges 1–2) against the MS2
+  spectrum and rendered as the divider string (`PEP|T|I|DER`) with matched-ion count and residue
+  coverage. The MS2 fragment coverage concept, **distinct from Tab 2's protein coverage**. ⬜ modified
+  residues are matched on their plain (unmodified) mass for now.
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).

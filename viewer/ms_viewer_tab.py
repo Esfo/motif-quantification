@@ -71,6 +71,7 @@ try:
     from .region_view import HAVE_GL, gl
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     from . import isotopes
+    from . import coverage as seqcoverage
     from .theming import palette, style_plot, style_gl
     from .distributions_db import DistributionsDB
     from .points_store import PointsStore
@@ -80,6 +81,7 @@ except ImportError:
     from region_view import HAVE_GL, gl
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     import isotopes
+    import coverage as seqcoverage
     from theming import palette, style_plot, style_gl
     from distributions_db import DistributionsDB
     from points_store import PointsStore
@@ -939,8 +941,9 @@ class MSViewerTab(QMainWindow):
         self.dock_table1 = dock
 
     def build_table2_dock(self):
-        # Shown for MS2: candidate PSMs for the sampled precursor (+ sequence
-        # coverage, staged). Lives under panel 3.
+        # Shown for MS2: candidate PSMs for the sampled precursor + the b/y
+        # fragment sequence coverage each gets against the MS2 spectrum (the
+        # coverage concept from sequencecoverageconcept.py). Lives under panel 3.
         self.table2 = QTableWidget()
         cols = ["peptide", "protein", "q", "coverage"]
         self.table2.setColumnCount(len(cols))
@@ -1966,14 +1969,17 @@ class MSViewerTab(QMainWindow):
             self.p3.getViewBox().setYRange(0.0, top, padding=0)
             self.p3_title.setText(
                 f"MS2 scan {scan.get('number','')}  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
-            self.populate_table2(scan)
+            self.populate_table2(scan, mz)
         except Exception as exc:
             self.p3_title.setText(f"MS2 load error: {exc}")
 
-    def populate_table2(self, scan):
-        # Candidate PSMs near this precursor m/z in the current file (sequence
-        # coverage column is staged).
+    def populate_table2(self, scan, peak_mz=None):
+        # Candidate PSMs near this precursor m/z in the current file, each shown
+        # with the sequence coverage its b/y fragment ions get against THIS MS2
+        # spectrum -- so the user can judge how distinguishable the candidates
+        # are (the coverage concept from sequencecoverageconcept.py).
         prec = scan.get("mz")
+        peaks = np.asarray(peak_mz, dtype=float) if peak_mz is not None else None
         rows = []
         for r in self.file_psms():
             try:
@@ -1988,7 +1994,12 @@ class MSViewerTab(QMainWindow):
         for i, r in enumerate(rows):
             for j, key in enumerate(("peptide", "proteins", "percolator_q")):
                 self.table2.setItem(i, j, QTableWidgetItem(str(r.get(key, ""))))
-            self.table2.setItem(i, 3, QTableWidgetItem("(staged)"))
+            if peaks is not None and peaks.size:
+                cell = seqcoverage.coverage_summary(
+                    plain_seq(r.get("peptide", "")), peaks, ppm=self.xics_ppm)
+            else:
+                cell = ""
+            self.table2.setItem(i, 3, QTableWidgetItem(cell))
 
     # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
