@@ -6,6 +6,7 @@ import math
 import multiprocessing as mp
 import os
 import sys
+import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -41,6 +42,32 @@ class Config:
     line_mz_ppm: float = 8.0
     line_mz_abs: float = 0.002
     max_gap_scans: int = 2
+    # History-weighted death counter (ported from the reference line model's
+    # `linedeletioncounter`/`deadsignal`): a line's miss counter halves on every
+    # match and the line is closed only after it exceeds `deadsignal`, so an
+    # established trace survives brief dropouts instead of dying on a fixed gap.
+    deadsignal: int = 3
+
+    # Fragment merge — restores the reference line model's line-correction stage
+    # (examples/linemodel.py:358-500). After streaming, closed traces that agree
+    # in m/z and have NON-OVERLAPPING (time-non-redundant) scan ranges within
+    # `line_merge_gap_scans` are stitched back into one continuous line. The
+    # non-redundancy guard is what prevents merging two genuinely coeluting
+    # neighbours (which would share scan indices).
+    line_merge_mz_ppm: float = 10.0
+    line_merge_mz_abs: float = 0.004
+    line_merge_gap_scans: int = 6
+
+    # Lines are emitted whole by default; only a line whose RT span exceeds
+    # mean + line_split_sigma * sigma (over all line spans) is run through the
+    # peak finder and split into separate features. This splits the occasional
+    # too-long line (really two distributions) without chopping up normal lines.
+    # The actual cutoff is printed as split_threshold_rt during the run.
+    line_split_sigma: float = 2.0
+    # Optional post-merge of peaks that axis_peaks resolved (only used when a line
+    # IS split): combine two apices when no real valley separates them. DEFAULT
+    # 0.0 = disabled, so axis_peaks is authoritative.
+    min_split_valley_fraction: float = 0.0
 
     min_trace_points: int = 4
     peak_mindist: int = 2
@@ -54,7 +81,6 @@ class Config:
     min_peak_prominence_fraction: float = 0.02
     max_trace_peaks: int = 0
 
-    max_charge: int = 6
     isotope_mz_ppm: float = 10.0
     isotope_mz_abs: float = 0.004
     max_neutral_mass: float = 8000.0
@@ -63,9 +89,49 @@ class Config:
     max_apex_shift_width_fraction: float = 0.50
     min_edge_score: float = 0.30
     min_distribution_members: int = 2
+    # A 1+ distribution is weak evidence: two coeluting traces ~1.0033 m/z apart
+    # are extremely common in a dense MS1 map. Require more isotope peaks for 1+
+    # than for higher charges so random pairs do not become fake 1+ envelopes.
+    min_members_charge_one: int = 3
+    # Charge is derived from a pair's spacing, so high charges (tiny spacing) are
+    # easy to fake from accidental coeluting pairs -- the z=14 spike. Require more
+    # isotope peaks as charge rises: a real high-charge species shows many peaks,
+    # an accidental one only two. (charge > high_charge_threshold needs
+    # high_charge_min_members; even higher needs +1 per extra band of 5.)
+    high_charge_threshold: int = 5
+    high_charge_min_members: int = 3
+    # Global charge competition: candidate envelopes compete for features so a
+    # feature belongs to at most one distribution. Ranking is pure envelope-fit
+    # evidence (quality) -- no charge prior; the winning charge comes only from
+    # which envelope actually fits the data best.
+    # Adjacent isotope peaks need not be equal in intensity (the envelope rises
+    # then falls), but a real envelope does not jump by an extreme factor between
+    # neighbours. Reject an edge whose adjacent heights differ by more than this
+    # ratio in either direction -- this kills weak noise peaks bridging two strong
+    # unrelated traces. Replaces the old /2 + step_limit gate that accepted nearly
+    # everything. (step_limit / new_inc_limit are kept for CLI compatibility but
+    # are no longer used by the gate.)
+    max_adjacent_intensity_ratio: float = 10.0
 
     charge_mass_ppm: float = 12.0
-    min_charge_group_rt_score: float = 0.10
+    min_charge_group_rt_score: float = 0.55
+
+    # Envelope-first builder (envelope.py). Charge is decided by fitting the whole
+    # isotope lattice, not from a single adjacent spacing. min_trace_similarity
+    # gates which coeluting features may join a lattice (chromatographic-shape
+    # cosine); min_envelope_score is the floor on the combined evidence score
+    # (m/z lattice + averagine + trace shape + missing-peak).
+    min_trace_similarity: float = 0.5
+    min_envelope_score: float = 0.45
+    # Recovery pass: after the strict primary pass, re-run the builder on the
+    # features no distribution claimed, with relaxed gates + a short-trace
+    # coelution fallback, to catch weaker/shorter envelopes. Recovered rows are
+    # tagged status='recovered' (a separate, opt-in confidence tier).
+    enable_recovery: bool = True
+    recover_min_trace_similarity: float = 0.3
+    recover_min_envelope_score: float = 0.30
+    short_trace_len: int = 5
+    short_trace_fallback: bool = False
 
     # Reference (distributionassembly.py) isotope-edge acceptance, ported faithfully:
     # asymmetric acdiff tolerance around proton-spacing, plus intensity-step gating.
@@ -156,6 +222,16 @@ class Distribution:
     n_members: int
     score: float
     quality: float
+    mz_score: float
+    iso_score: float
+    trace_score: float
+    missing_score: float
+    interloper_score: float
+    mono_offset: int
+    n_missing_interior: int
+    n_interlopers: int
+    ambiguity_score: float
+    status: str
     members: list
 
 
@@ -179,11 +255,30 @@ class Analyte:
 class LineModel:
     def __init__(self, config):
         self.config = config
+        self.progress = 0
         self.active = {}
+        self.misses = {}
+        self.closed_traces = []
         self.next_line_id = 0
         self.next_feature_id = 0
         self.lines = []
         self.features = []
+        # Per-feature chromatographic traces, indexed by feature_id (dense,
+        # zero-based). Each entry is a dict of float arrays {scans, rts, mzs,
+        # intensities}. The envelope-first distribution builder needs the real
+        # elution shape of every isotope member, not just rt_start/apex/end, so
+        # the trace is retained here instead of being discarded at emit time.
+        self.feature_traces = []
+
+    def _record_trace(self, scans, rts, mzs, intensities):
+        self.feature_traces.append(
+            {
+                "scans": np.asarray(scans, dtype=np.int64),
+                "rts": np.asarray(rts, dtype=np.float64),
+                "mzs": np.asarray(mzs, dtype=np.float64),
+                "intensities": np.asarray(intensities, dtype=np.float64),
+            }
+        )
 
     def mz_tolerance(self, mz_value):
         return max(
@@ -196,6 +291,8 @@ class LineModel:
         intensities = np.asarray(intensities, dtype=np.float64).reshape(-1)
 
         if mzs.size == 0:
+            for line_id in self.active:
+                self.misses[line_id] = self.misses.get(line_id, 0) + 1
             self.close_dead_lines(ms1_index)
             return
 
@@ -216,6 +313,8 @@ class LineModel:
         else:
             active_mz = np.empty(0, dtype=np.float64)
 
+        active_at_start = set(int(line_id) for line_id in active_ids.tolist())
+        matched_existing = set()
         used_lines = set()
 
         for mz_value, intensity in zip(mzs, intensities):
@@ -239,7 +338,7 @@ class LineModel:
                     trace = self.active[line_id]
                     gap = ms1_index - trace.last_scan
 
-                    if gap < 1 or gap > self.config.max_gap_scans + 1:
+                    if gap < 1 or gap > self.config.deadsignal + 1:
                         continue
 
                     score = abs(trace.mean_mz - mz_value) / tolerance + gap * 0.03
@@ -252,42 +351,222 @@ class LineModel:
                 line_id = self.next_line_id
                 self.next_line_id += 1
                 self.active[line_id] = Trace.create(line_id, ms1_index, rt, mz_value, intensity)
+                self.misses[line_id] = 0
                 used_lines.add(line_id)
             else:
                 self.active[best_line_id].append(ms1_index, rt, mz_value, intensity)
+                matched_existing.add(best_line_id)
                 used_lines.add(best_line_id)
+
+        # History-weighted death: halve the miss counter on a match, increment it
+        # on a miss. Lines created this scan are excluded (not in active_at_start).
+        for line_id in active_at_start:
+            if line_id in matched_existing:
+                self.misses[line_id] //= 2
+            else:
+                self.misses[line_id] = self.misses.get(line_id, 0) + 1
 
         self.close_dead_lines(ms1_index)
 
     def close_dead_lines(self, ms1_index):
-        dead = []
-
-        for line_id, trace in self.active.items():
-            if ms1_index - trace.last_scan > self.config.max_gap_scans:
-                dead.append(line_id)
+        # Close on the history-weighted miss counter rather than a fixed gap.
+        # Closed traces are buffered (not emitted) so the fragment-merge pass can
+        # see them all together.
+        dead = [
+            line_id
+            for line_id, trace in self.active.items()
+            if self.misses.get(line_id, 0) > self.config.deadsignal
+        ]
 
         for line_id in dead:
             trace = self.active.pop(line_id)
-            self.finalize_trace(trace)
+            self.misses.pop(line_id, None)
+            self.closed_traces.append(trace)
 
     def close_all(self):
         for line_id in sorted(self.active):
-            self.finalize_trace(self.active[line_id])
+            self.closed_traces.append(self.active[line_id])
 
         self.active.clear()
+        self.misses.clear()
+        self.merge_and_emit()
 
-    def finalize_trace(self, trace):
-        if len(trace.scans) < self.config.min_trace_points:
-            return
+    def merge_and_emit(self):
+        # Restores the reference line model's line-correction stage: stitch
+        # fragments of the same line back together, then emit continuous lines.
+        fragments = []
 
-        scans = np.asarray(trace.scans, dtype=np.int32)
-        rts = np.asarray(trace.rts, dtype=np.float64)
-        mzs = np.asarray(trace.mzs, dtype=np.float64)
-        intensities = np.asarray(trace.intensities, dtype=np.float64)
+        for trace in self.closed_traces:
+            scans = np.asarray(trace.scans, dtype=np.int64)
 
+            if scans.size == 0:
+                continue
+
+            order = np.argsort(scans)
+            scans = scans[order]
+
+            fragments.append(
+                {
+                    "scans": scans,
+                    "rts": np.asarray(trace.rts, dtype=np.float64)[order],
+                    "mzs": np.asarray(trace.mzs, dtype=np.float64)[order],
+                    "intensities": np.asarray(trace.intensities, dtype=np.float64)[order],
+                    "mean_mz": float(trace.mean_mz),
+                    "start": int(scans[0]),
+                    "end": int(scans[-1]),
+                }
+            )
+
+        if self.progress:
+            print(
+                f"merge_stage fragments={len(fragments)} (chaining...)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        fragments.sort(key=lambda f: (f["start"], f["mean_mz"]))
+        chains = self.chain_fragments(fragments)
+
+        if self.progress:
+            print(
+                f"merge_stage chains={len(chains)} merged_fragments={len(fragments) - len(chains)} (emitting...)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        # Materialise the merged lines, then emit each WHOLE (one line -> one
+        # feature) -- the peak finder is NOT run on every line. Only an
+        # abnormally long line (RT span beyond mean + line_split_sigma * sigma of
+        # all line spans) is run through axis_peaks and split into separate
+        # features, which is how a single too-long line that is really two
+        # distributions gets separated before distributions are built.
+        materialised = []
+
+        for chain in chains:
+            scans = np.concatenate([f["scans"] for f in chain])
+            rts = np.concatenate([f["rts"] for f in chain])
+            mzs = np.concatenate([f["mzs"] for f in chain])
+            intensities = np.concatenate([f["intensities"] for f in chain])
+
+            order = np.argsort(scans)
+            scans, rts, mzs, intensities = scans[order], rts[order], mzs[order], intensities[order]
+
+            if scans.size < self.config.min_trace_points:
+                continue
+
+            materialised.append((scans, rts, mzs, intensities))
+
+        if materialised:
+            spans = np.array([rts[-1] - rts[0] for (_, rts, _, _) in materialised])
+            split_threshold = float(spans.mean() + self.config.line_split_sigma * spans.std())
+        else:
+            split_threshold = math.inf
+
+        if self.progress:
+            print(
+                f"merge_stage lines={len(materialised)} split_threshold_rt={split_threshold:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        for line_id, (scans, rts, mzs, intensities) in enumerate(materialised):
+            span = float(rts[-1] - rts[0])
+            self.emit_line(line_id, scans, rts, mzs, intensities, do_split=span > split_threshold)
+
+            if self.progress and line_id > 0 and line_id % 20000 == 0:
+                print(
+                    f"emit lines={line_id}/{len(materialised)} features={len(self.features)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    def chain_fragments(self, fragments):
+        # A second nearest-neighbour pass over whole fragments: link a fragment
+        # to an open chain when their m/z agree within tolerance, their scan
+        # ranges do not overlap (time-non-redundant), and the gap between them is
+        # within line_merge_gap_scans. Fragments are processed in start-scan order
+        # so a fragment can only ever append to the END of a chain — meaning a
+        # plain `start <= chain.end` test is an exact non-redundancy guard (no
+        # per-scan set needed). Chains are bucketed by m/z so each fragment only
+        # compares against the handful of chains near its own m/z, keeping the
+        # pass near-linear on dense maps with millions of fragments.
+        gap = self.config.line_merge_gap_scans
+        bin_width = 0.05
+        active_by_bin = {}
+        chains = []
+
+        def bin_of(mz_value):
+            return int(mz_value / bin_width)
+
+        for fragment in fragments:
+            f_start = fragment["start"]
+            f_mz = fragment["mean_mz"]
+            tolerance = max(
+                self.config.line_merge_mz_abs,
+                f_mz * self.config.line_merge_mz_ppm / 1_000_000.0,
+            )
+            home_bin = bin_of(f_mz)
+
+            best_chain = None
+            best_distance = math.inf
+
+            for bin_id in (home_bin - 1, home_bin, home_bin + 1):
+                bucket = active_by_bin.get(bin_id)
+
+                if not bucket:
+                    continue
+
+                kept = []
+
+                for chain in bucket:
+                    if f_start - chain["end"] > gap:
+                        continue  # stale: can never be extended again, drop it
+
+                    kept.append(chain)
+
+                    if f_start <= chain["end"]:
+                        continue  # scan ranges overlap -> not a continuation
+
+                    distance = abs(chain["mean_mz"] - f_mz)
+
+                    if distance <= tolerance and distance < best_distance:
+                        best_distance = distance
+                        best_chain = chain
+
+                active_by_bin[bin_id] = kept
+
+            if best_chain is None:
+                chain = {
+                    "mean_mz": f_mz,
+                    "end": fragment["end"],
+                    "n": int(fragment["scans"].size),
+                    "fragments": [fragment],
+                }
+                chains.append(chain)
+                active_by_bin.setdefault(home_bin, []).append(chain)
+            else:
+                old_bin = bin_of(best_chain["mean_mz"])
+                n0 = best_chain["n"]
+                n1 = int(fragment["scans"].size)
+                best_chain["mean_mz"] = (best_chain["mean_mz"] * n0 + f_mz * n1) / (n0 + n1)
+                best_chain["n"] = n0 + n1
+                best_chain["end"] = max(best_chain["end"], fragment["end"])
+                best_chain["fragments"].append(fragment)
+
+                new_bin = bin_of(best_chain["mean_mz"])
+
+                if new_bin != old_bin:
+                    bucket = active_by_bin.get(old_bin)
+                    if bucket and best_chain in bucket:
+                        bucket.remove(best_chain)
+                    active_by_bin.setdefault(new_bin, []).append(best_chain)
+
+        return [chain["fragments"] for chain in chains]
+
+    def emit_line(self, line_id, scans, rts, mzs, intensities, do_split=False):
         self.lines.append(
             {
-                "line_id": trace.line_id,
+                "line_id": int(line_id),
                 "mz_mean": float(mzs.mean()),
                 "mz_min": float(mzs.min()),
                 "mz_max": float(mzs.max()),
@@ -299,7 +578,52 @@ class LineModel:
             }
         )
 
-        self.split_trace(trace.line_id, scans, rts, mzs, intensities)
+        if do_split:
+            # Abnormally long line: let the peak finder break it into pieces.
+            self.split_trace(int(line_id), scans, rts, mzs, intensities)
+        else:
+            # Normal line: emit it whole as a single feature.
+            self.emit_whole_feature(int(line_id), scans, rts, mzs, intensities)
+
+    def emit_whole_feature(self, line_id, scans, rts, mzs, intensities):
+        if rts.size > 1:
+            area = float(np.trapezoid(intensities, rts))
+        else:
+            area = float(intensities[0])
+
+        height = float(intensities.max())
+        local_apex = int(intensities.argmax())
+        total_intensity = float(intensities.sum())
+
+        if total_intensity > 0:
+            mz_mean = float((mzs * intensities).sum() / total_intensity)
+        else:
+            mz_mean = float(mzs.mean())
+
+        quality = float(np.log1p(max(area, 0.0)) * math.sqrt(scans.size))
+
+        self.features.append(
+            Feature(
+                feature_id=self.next_feature_id,
+                line_id=int(line_id),
+                mz_mean=mz_mean,
+                mz_min=float(mzs.min()),
+                mz_max=float(mzs.max()),
+                rt_start=float(rts.min()),
+                rt_apex=float(rts[local_apex]),
+                rt_end=float(rts.max()),
+                ms1_start=int(scans.min()),
+                ms1_apex=int(scans[local_apex]),
+                ms1_end=int(scans.max()),
+                height=height,
+                area=area,
+                n_points=int(scans.size),
+                quality=quality,
+            )
+        )
+        self._record_trace(scans, rts, mzs, intensities)
+
+        self.next_feature_id += 1
 
     def split_trace(self, line_id, scans, rts, mzs, intensities):
         if intensities.size < self.config.min_trace_points:
@@ -352,6 +676,31 @@ class LineModel:
             candidate_peaks = candidate_peaks[: self.config.max_trace_peaks]
 
         candidate_peaks.sort(key=lambda x: x[1])
+
+        # Merge adjacent candidate peaks that are not separated by a real valley.
+        # Two apices stay split only if the lowest point between them drops below
+        # min_split_valley_fraction * the smaller apex; otherwise the dip is noise
+        # on one continuous elution peak and they become a single feature.
+        if self.config.min_split_valley_fraction > 0 and len(candidate_peaks) > 1:
+            merged_peaks = [list(candidate_peaks[0])]
+
+            for apex_height, left, apex, right in candidate_peaks[1:]:
+                prev_height, prev_left, prev_apex, prev_right = merged_peaks[-1]
+                lo = min(prev_apex, apex)
+                hi = max(prev_apex, apex)
+                valley = float(intensities[lo:hi + 1].min()) if hi > lo else min(prev_height, apex_height)
+                threshold = self.config.min_split_valley_fraction * min(prev_height, apex_height)
+
+                if valley >= threshold:
+                    if apex_height >= prev_height:
+                        keep_height, keep_apex = apex_height, apex
+                    else:
+                        keep_height, keep_apex = prev_height, prev_apex
+                    merged_peaks[-1] = [keep_height, prev_left, keep_apex, max(prev_right, right)]
+                else:
+                    merged_peaks.append([apex_height, left, apex, right])
+
+            candidate_peaks = [tuple(peak) for peak in merged_peaks]
 
         for _, left, apex, right in candidate_peaks:
             sub_scans = scans[left:right]
@@ -412,6 +761,7 @@ class LineModel:
                     quality=quality,
                 )
             )
+            self._record_trace(sub_scans, sub_rts, sub_mzs, sub_intensities)
 
             self.next_feature_id += 1
 
@@ -489,6 +839,26 @@ def feature_rows(features):
             "area": feature.area,
             "n_points": feature.n_points,
             "quality": feature.quality,
+        }
+
+
+def feature_trace_rows(traces):
+    # Persist each feature's chromatographic trace as zlib-compressed
+    # little-endian arrays (scans int32, rts/mzs/intensities f32) — same on-disk
+    # convention as scan_points — so the GUI and the Rust engine can read elution
+    # shapes without re-decoding the mzML.
+    for feature_id, trace in enumerate(traces):
+        scans = np.asarray(trace["scans"], dtype="<i4")
+        rts = np.asarray(trace["rts"], dtype="<f4")
+        mzs = np.asarray(trace["mzs"], dtype="<f4")
+        intensities = np.asarray(trace["intensities"], dtype="<f4")
+        yield {
+            "feature_id": int(feature_id),
+            "n": int(scans.size),
+            "scans": zlib.compress(scans.tobytes()),
+            "rts": zlib.compress(rts.tobytes()),
+            "mzs": zlib.compress(mzs.tobytes()),
+            "intensities": zlib.compress(intensities.tobytes()),
         }
 
 
@@ -581,17 +951,15 @@ def _score_edge(left_i, right_i, charge):
     if neutral_mass <= 0 or neutral_mass > cfg["max_neutral_mass"]:
         return None
 
-    # Reference intensity-step gating (distributionassembly.py:240-278): the
-    # fractional intensity difference between adjacent isotopes is gated more
-    # strictly when intensity is increasing (new_inc_limit) than decreasing
-    # (step_limit).
+    # Adjacent-isotope intensity gate: allow rises and falls, reject only extreme
+    # jumps (a weak noise peak bridging two strong unrelated traces). The old
+    # `abs(diff)/(sum)/2` form maxed out at 0.5 so step_limit=0.5 accepted nearly
+    # every decreasing edge.
     left_h = _EDGE["height"][left_i]
     right_h = _EDGE["height"][right_i]
-    denom = left_h + right_h
-    if denom > 0:
-        intensitypercdiff = abs(right_h - left_h) / denom / 2.0
-        ratiocheck = cfg["new_inc_limit"] if right_h > left_h else cfg["step_limit"]
-        if intensitypercdiff > ratiocheck:
+    if left_h > 0 and right_h > 0:
+        ratio = max(left_h, right_h) / min(left_h, right_h)
+        if ratio > cfg["max_adjacent_intensity_ratio"]:
             return None
 
     left_width = rt_end[left_i] - rt_start[left_i]
@@ -650,44 +1018,56 @@ def _edge_worker(start, end, store_edges):
         left_i = int(order[sorted_left])
         left_mz = mz[left_i]
 
-        for charge in range(1, cfg["max_charge"] + 1):
-            target = left_mz + C13_DELTA / charge
+        # Charge is DERIVED from the data, not enumerated against a cap. The
+        # widest possible adjacent-isotope spacing is the C13-C12 gap (charge 1);
+        # higher charges sit proportionally closer. So scan every feature just
+        # above the seed out to one isotope gap and read the charge off the
+        # spacing: charge = round(C13 / spacing). No min/max charge, no flag --
+        # the only bound is what the peak spacing in the data implies.
+        tolerance = max(
+            cfg["isotope_mz_abs"],
+            (left_mz + C13_DELTA) * cfg["isotope_mz_ppm"] / 1_000_000.0,
+        )
 
-            tolerance = max(
-                cfg["isotope_mz_abs"],
-                target * cfg["isotope_mz_ppm"] / 1_000_000.0,
-            )
+        lo = np.searchsorted(sorted_mz, left_mz, side="right")
+        hi = np.searchsorted(sorted_mz, left_mz + C13_DELTA + tolerance, side="right")
 
-            left = np.searchsorted(sorted_mz, target - tolerance, side="left")
-            right = np.searchsorted(sorted_mz, target + tolerance, side="right")
+        best_by_charge = {}
 
-            best = None
+        for sorted_right in range(lo, hi):
+            right_i = int(order[sorted_right])
 
-            for sorted_right in range(left, right):
-                right_i = int(order[sorted_right])
+            if right_i == left_i:
+                continue
 
-                if right_i == left_i:
-                    continue
+            spacing = mz[right_i] - left_mz
 
-                if mz[right_i] <= left_mz:
-                    continue
+            if spacing <= 0:
+                continue
 
-                edge = _score_edge(left_i, right_i, charge)
+            charge = int(round(C13_DELTA / spacing))
 
-                if edge is None:
-                    continue
+            if charge < 1:
+                continue
 
-                if store_edges == "all":
-                    stored_edges.append(edge)
+            edge = _score_edge(left_i, right_i, charge)
 
-                if best is None or edge["score"] > best["score"]:
-                    best = edge
+            if edge is None:
+                continue
 
-            if best is not None:
-                best_edges.append(best)
+            if store_edges == "all":
+                stored_edges.append(edge)
 
-                if store_edges == "best":
-                    stored_edges.append(best)
+            current = best_by_charge.get(charge)
+
+            if current is None or edge["score"] > current["score"]:
+                best_by_charge[charge] = edge
+
+        for edge in best_by_charge.values():
+            best_edges.append(edge)
+
+            if store_edges == "best":
+                stored_edges.append(edge)
 
     return best_edges, stored_edges
 
@@ -787,6 +1167,24 @@ def _coherent_rt_path_ids(path, config_dict):
     return residual <= allowed
 
 
+def _envelope_shape_score(heights):
+    # A real isotope envelope is essentially unimodal: it rises to an apex and
+    # falls. Each deep interior valley (a weak peak sitting between two stronger
+    # ones) is the signature of an accidental envelope and is penalised. Returns
+    # 1.0 for a clean rise/fall, lower as interior valleys accumulate.
+    if heights.size < 3:
+        return 1.0
+
+    valleys = 0
+
+    for i in range(1, heights.size - 1):
+        lower_neighbour = min(heights[i - 1], heights[i + 1])
+        if heights[i] < heights[i - 1] and heights[i] < heights[i + 1] and heights[i] < 0.7 * lower_neighbour:
+            valleys += 1
+
+    return 1.0 / (1.0 + valleys)
+
+
 def _distribution_worker_for_charge(charge, edges, config_dict):
     mz_mean = _EDGE["mz_mean"]
     rt_start = _EDGE["rt_start"]
@@ -844,7 +1242,7 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
             path = tentative
             current = next_feature_id
 
-        if len(path) < config_dict["min_distribution_members"]:
+        if len(path) < _min_members_for_charge(charge, config_dict):
             continue
 
         key = (charge, tuple(path))
@@ -859,7 +1257,8 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
         mono_feature_id = int(path_array[0])
 
         score = float(np.mean([edge["score"] for edge in path_edges])) if path_edges else 0.0
-        quality = float(score * math.sqrt(len(path)))
+        shape = _envelope_shape_score(height[path_array])
+        quality = float(score * math.sqrt(len(path)) * shape)
 
         rows.append(
             {
@@ -889,7 +1288,101 @@ def _distribution_worker_for_charge(charge, edges, config_dict):
     return rows
 
 
-def build_distributions(features, best_edges, config, workers=1, progress=False):
+def _min_members_for_charge(charge, config_dict):
+    # Higher charges (tinier isotope spacing) are easy to fake from accidental
+    # pairs, so require more peaks as charge rises.
+    if charge == 1:
+        return config_dict["min_members_charge_one"]
+    if charge <= config_dict["high_charge_threshold"]:
+        return config_dict["min_distribution_members"]
+    extra = (charge - config_dict["high_charge_threshold"] - 1) // 5
+    return config_dict["high_charge_min_members"] + extra
+
+
+def _candidate_rank(row, config_dict):
+    # Pure evidence: the envelope quality (mean edge fit x sqrt(n) x shape). No
+    # charge prior -- the charge that wins the shared features is the one whose
+    # isotope envelope actually fits best.
+    return row["quality"]
+
+
+def resolve_charge_competition(rows, config_dict):
+    """Make candidate envelopes compete for features.
+
+    A feature may belong to at most one distribution. Candidates are taken in
+    descending rank; a candidate is kept only if none of its features are already
+    claimed by a stronger one. This removes the duplicate low-charge envelopes
+    that reuse features already explained by a stronger 2+/3+ envelope.
+    """
+    ranked = sorted(rows, key=lambda row: _candidate_rank(row, config_dict), reverse=True)
+
+    claimed = set()
+    kept = []
+
+    for row in ranked:
+        feature_ids = [member["feature_id"] for member in row["members"]]
+
+        if any(feature_id in claimed for feature_id in feature_ids):
+            continue
+
+        claimed.update(feature_ids)
+        kept.append(row)
+
+    return kept
+
+
+def build_distributions(features, traces, config, progress=False):
+    """Envelope-first distribution builder (see distributions/envelope.py).
+
+    Charge is decided by fitting the whole isotope lattice per local cluster
+    (averagine + trace-shape + missing-peak evidence, no path-length reward),
+    not read off a single adjacent spacing. Isotope edges are still produced
+    upstream but only as a diagnostic table, not as the charge authority.
+    """
+    try:
+        from .envelope import build_distributions_two_pass
+    except ImportError:
+        from envelope import build_distributions_two_pass
+
+    config_dict = asdict(config)
+    rows = build_distributions_two_pass(features, traces, config_dict, progress=progress)
+
+    rows.sort(key=lambda row: (row["charge"], row["neutral_mass"], row["rt_apex"], row["mono_mz"]))
+
+    distributions = []
+    for distribution_id, row in enumerate(rows):
+        distributions.append(
+            Distribution(
+                distribution_id=distribution_id,
+                charge=row["charge"],
+                neutral_mass=row["neutral_mass"],
+                mono_mz=row["mono_mz"],
+                rt_start=row["rt_start"],
+                rt_apex=row["rt_apex"],
+                rt_end=row["rt_end"],
+                ms1_start=row["ms1_start"],
+                ms1_apex=row["ms1_apex"],
+                ms1_end=row["ms1_end"],
+                n_members=row["n_members"],
+                score=row["score"],
+                quality=row["quality"],
+                mz_score=row["mz_score"],
+                iso_score=row["iso_score"],
+                trace_score=row["trace_score"],
+                missing_score=row["missing_score"],
+                interloper_score=row["interloper_score"],
+                mono_offset=row["mono_offset"],
+                n_missing_interior=row["n_missing_interior"],
+                n_interlopers=row["n_interlopers"],
+                ambiguity_score=row["ambiguity_score"],
+                status=row["status"],
+                members=row["members"],
+            )
+        )
+    return distributions
+
+
+def _build_distributions_edge_first(features, best_edges, config, workers=1, progress=False):
     if not best_edges:
         return []
 
@@ -920,7 +1413,7 @@ def build_distributions(features, best_edges, config, workers=1, progress=False)
             context = None
 
         if context is None:
-            return build_distributions(
+            return _build_distributions_edge_first(
                 features=features,
                 best_edges=best_edges,
                 config=config,
@@ -948,7 +1441,17 @@ def build_distributions(features, best_edges, config, workers=1, progress=False)
                         flush=True,
                     )
 
-    all_rows.sort(
+    kept_rows = resolve_charge_competition(all_rows, config_dict)
+
+    if progress:
+        print(
+            f"charge_competition candidates={len(all_rows)} kept={len(kept_rows)} "
+            f"dropped={len(all_rows) - len(kept_rows)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    kept_rows.sort(
         key=lambda row: (
             row["charge"],
             row["neutral_mass"],
@@ -959,7 +1462,7 @@ def build_distributions(features, best_edges, config, workers=1, progress=False)
 
     distributions = []
 
-    for distribution_id, row in enumerate(all_rows):
+    for distribution_id, row in enumerate(kept_rows):
         distributions.append(
             Distribution(
                 distribution_id=distribution_id,
@@ -1021,35 +1524,54 @@ def build_analytes(distributions, config):
     if not distributions:
         return []
 
+    # Seed-based grouping (replaces transitive UnionFind, which chained distinct
+    # RT peaks into giant analytes). Process distributions best-quality first;
+    # each unclaimed one seeds an analyte and pulls in the single best-coeluting
+    # distribution at each OTHER charge within neutral-mass tolerance -- so an
+    # analyte holds at most one distribution per charge and stays tight in RT.
     sorted_dists = sorted(distributions, key=lambda x: x.neutral_mass)
     masses = np.asarray([dist.neutral_mass for dist in sorted_dists], dtype=np.float64)
-    uf = UnionFind(len(sorted_dists))
+    order = sorted(range(len(sorted_dists)), key=lambda i: -sorted_dists[i].quality)
+    claimed = [False] * len(sorted_dists)
+    grouped = []
 
-    for i, dist in enumerate(sorted_dists):
-        tolerance = max(0.002, dist.neutral_mass * config.charge_mass_ppm / 1_000_000.0)
-        start = np.searchsorted(masses, dist.neutral_mass - tolerance, side="left")
-        end = np.searchsorted(masses, dist.neutral_mass + tolerance, side="right")
+    for idx in order:
+        if claimed[idx]:
+            continue
 
+        seed = sorted_dists[idx]
+        claimed[idx] = True
+        members = [seed]
+        charges_used = {seed.charge}
+
+        tolerance = max(0.002, seed.neutral_mass * config.charge_mass_ppm / 1_000_000.0)
+        start = np.searchsorted(masses, seed.neutral_mass - tolerance, side="left")
+        end = np.searchsorted(masses, seed.neutral_mass + tolerance, side="right")
+
+        candidates = []
         for j in range(start, end):
-            if i == j:
+            if claimed[j] or j == idx:
                 continue
-
             other = sorted_dists[j]
-
-            if other.charge == dist.charge:
+            if other.charge in charges_used:
                 continue
+            rt_score = distribution_rt_score(seed, other)
+            if rt_score >= config.min_charge_group_rt_score:
+                candidates.append((rt_score, j, other))
 
-            if distribution_rt_score(dist, other) >= config.min_charge_group_rt_score:
-                uf.union(i, j)
+        candidates.sort(key=lambda item: -item[0])
+        for _, j, other in candidates:
+            if claimed[j] or other.charge in charges_used:
+                continue
+            claimed[j] = True
+            charges_used.add(other.charge)
+            members.append(other)
 
-    groups = {}
-
-    for i, dist in enumerate(sorted_dists):
-        groups.setdefault(uf.find(i), []).append(dist)
+        grouped.append(members)
 
     analytes = []
 
-    for members in groups.values():
+    for members in grouped:
         weights = np.asarray([max(member.score, 1e-6) for member in members], dtype=np.float64)
         masses = np.asarray([member.neutral_mass for member in members], dtype=np.float64)
         charges = [member.charge for member in members]
@@ -1115,6 +1637,16 @@ def distribution_rows(distributions):
             "n_members": distribution.n_members,
             "score": distribution.score,
             "quality": distribution.quality,
+            "mz_score": distribution.mz_score,
+            "iso_score": distribution.iso_score,
+            "trace_score": distribution.trace_score,
+            "missing_score": distribution.missing_score,
+            "interloper_score": distribution.interloper_score,
+            "mono_offset": distribution.mono_offset,
+            "n_missing_interior": distribution.n_missing_interior,
+            "n_interlopers": distribution.n_interlopers,
+            "ambiguity_score": distribution.ambiguity_score,
+            "status": distribution.status,
         }
 
 
@@ -1126,6 +1658,10 @@ def distribution_member_rows(distributions):
                 "feature_id": member["feature_id"],
                 "isotope_index": member["isotope_index"],
                 "member_score": member["member_score"],
+                "mz_residual": member.get("mz_residual", 0.0),
+                "intensity_observed": member.get("intensity_observed", 0.0),
+                "intensity_expected": member.get("intensity_expected", 0.0),
+                "trace_score": member.get("trace_score", 0.0),
             }
 
 
@@ -1162,6 +1698,12 @@ def make_config(args):
         line_mz_ppm=args.line_mz_ppm,
         line_mz_abs=args.line_mz_abs,
         max_gap_scans=args.max_gap_scans,
+        deadsignal=args.deadsignal,
+        line_merge_mz_ppm=args.line_merge_mz_ppm,
+        line_merge_mz_abs=args.line_merge_mz_abs,
+        line_merge_gap_scans=args.line_merge_gap_scans,
+        line_split_sigma=args.line_split_sigma,
+        min_split_valley_fraction=args.min_split_valley_fraction,
         min_trace_points=args.min_trace_points,
         peak_mindist=args.peak_mindist,
         smooth_points=args.smooth_points,
@@ -1172,7 +1714,6 @@ def make_config(args):
         max_peak_width=args.max_peak_width,
         min_peak_prominence_fraction=args.min_peak_prominence_fraction,
         max_trace_peaks=args.max_trace_peaks,
-        max_charge=args.max_charge,
         isotope_mz_ppm=args.isotope_mz_ppm,
         isotope_mz_abs=args.isotope_mz_abs,
         max_neutral_mass=args.max_neutral_mass,
@@ -1180,6 +1721,10 @@ def make_config(args):
         max_apex_shift_width_fraction=args.max_apex_shift_width_fraction,
         min_edge_score=args.min_edge_score,
         min_distribution_members=args.min_distribution_members,
+        min_members_charge_one=args.min_members_charge_one,
+        high_charge_threshold=args.high_charge_threshold,
+        high_charge_min_members=args.high_charge_min_members,
+        max_adjacent_intensity_ratio=args.max_adjacent_intensity_ratio,
         charge_mass_ppm=args.charge_mass_ppm,
         min_charge_group_rt_score=args.min_charge_group_rt_score,
         charge_tolerance=args.charge_tolerance,
@@ -1205,6 +1750,7 @@ def run(args):
     workers = resolve_workers(args.workers)
 
     model = LineModel(config)
+    model.progress = bool(args.progress)
     scans = []
 
     for scan in stream_ms1(args.mzml, args.min_intensity):
@@ -1227,9 +1773,11 @@ def run(args):
         )
 
         if args.progress and scan["ms1_index"] > 0 and scan["ms1_index"] % args.progress == 0:
+            # lines/features are emitted only after streaming (in the merge pass),
+            # so during streaming we report active + closed traces instead.
             print(
                 f"scans={scan['ms1_index']} active_lines={len(model.active)} "
-                f"lines={len(model.lines)} features={len(model.features)}",
+                f"closed_traces={len(model.closed_traces)}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -1265,9 +1813,8 @@ def run(args):
 
     distributions = build_distributions(
         features=model.features,
-        best_edges=best_edges,
+        traces=model.feature_traces,
         config=config,
-        workers=workers,
         progress=bool(args.progress),
     )
 
@@ -1321,6 +1868,7 @@ def run(args):
         write_rows(conn, "scans", scans)
         write_rows(conn, "lines", model.lines)
         write_rows(conn, "features", feature_rows(model.features))
+        write_rows(conn, "feature_traces", feature_trace_rows(model.feature_traces))
 
         if store_edges:
             write_rows(conn, "isotope_edges", edge_rows(stored_edges))
@@ -1364,6 +1912,34 @@ def run(args):
         )
     )
 
+    # Charge histogram + the ready-to-run query, printed after charge handling so
+    # it can be eyeballed immediately and copy-pasted.
+    charge_counts = {}
+    for distribution in distributions:
+        charge_counts[distribution.charge] = charge_counts.get(distribution.charge, 0) + 1
+
+    total = len(distributions) or 1
+    print("distributions by charge:", file=sys.stderr)
+    for charge in sorted(charge_counts):
+        n = charge_counts[charge]
+        print(f"  z={charge:<3d} {n:>8d}  ({100.0 * n / total:.1f}%)", file=sys.stderr)
+
+    status_counts = {}
+    for distribution in distributions:
+        status_counts[distribution.status] = status_counts.get(distribution.status, 0) + 1
+    print(
+        "  status: "
+        + ", ".join(f"{status}={status_counts[status]}" for status in sorted(status_counts)),
+        file=sys.stderr,
+    )
+
+    print(
+        f'sqlite3 {args.out} "SELECT charge, COUNT(*) AS n FROM distributions '
+        f'GROUP BY charge ORDER BY charge;"',
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -1384,6 +1960,12 @@ def parse_args():
     parser.add_argument("--line-mz-ppm", type=float, default=8.0)
     parser.add_argument("--line-mz-abs", type=float, default=0.002)
     parser.add_argument("--max-gap-scans", type=int, default=2)
+    parser.add_argument("--deadsignal", type=int, default=3)
+    parser.add_argument("--line-merge-mz-ppm", type=float, default=10.0)
+    parser.add_argument("--line-merge-mz-abs", type=float, default=0.004)
+    parser.add_argument("--line-merge-gap-scans", type=int, default=6)
+    parser.add_argument("--line-split-sigma", type=float, default=2.0)
+    parser.add_argument("--min-split-valley-fraction", type=float, default=0.0)
 
     parser.add_argument("--min-trace-points", type=int, default=4)
     parser.add_argument("--peak-mindist", type=int, default=2)
@@ -1397,7 +1979,6 @@ def parse_args():
     parser.add_argument("--min-peak-prominence-fraction", type=float, default=0.02)
     parser.add_argument("--max-trace-peaks", type=int, default=0)
 
-    parser.add_argument("--max-charge", type=int, default=6)
     parser.add_argument("--isotope-mz-ppm", type=float, default=10.0)
     parser.add_argument("--isotope-mz-abs", type=float, default=0.004)
     parser.add_argument("--max-neutral-mass", type=float, default=8000.0)
@@ -1406,9 +1987,13 @@ def parse_args():
     parser.add_argument("--max-apex-shift-width-fraction", type=float, default=0.50)
     parser.add_argument("--min-edge-score", type=float, default=0.30)
     parser.add_argument("--min-distribution-members", type=int, default=2)
+    parser.add_argument("--min-members-charge-one", type=int, default=3)
+    parser.add_argument("--high-charge-threshold", type=int, default=5)
+    parser.add_argument("--high-charge-min-members", type=int, default=3)
+    parser.add_argument("--max-adjacent-intensity-ratio", type=float, default=10.0)
 
     parser.add_argument("--charge-mass-ppm", type=float, default=12.0)
-    parser.add_argument("--min-charge-group-rt-score", type=float, default=0.10)
+    parser.add_argument("--min-charge-group-rt-score", type=float, default=0.55)
 
     # reference isotope-edge acceptance (acdiff + intensity-step gating)
     parser.add_argument("--charge-tolerance", type=float, default=0.1)

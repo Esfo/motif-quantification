@@ -36,11 +36,31 @@ class DistributionsDB:
         rows = self.connect().execute("SELECT key, value FROM parameters").fetchall()
         return {r["key"]: r["value"] for r in rows}
 
+    def has_status(self):
+        """Whether the distributions table carries the status column (older
+        sqlites, written before the evidence/recovery work, do not)."""
+        cached = getattr(self, "_has_status_cache", None)
+        if cached is None:
+            cols = self.connect().execute("PRAGMA table_info(distributions)").fetchall()
+            cached = any(c["name"] == "status" for c in cols)
+            self._has_status_cache = cached
+        return cached
+
     def distributions_in_window(self, mz_min=None, mz_max=None, rt_start=None,
-                                rt_end=None, charge=None, limit=2000):
-        """Distributions whose mono m/z and RT apex fall in the window."""
+                                rt_end=None, charge=None, limit=2000, status=None):
+        """Distributions whose mono m/z and RT apex fall in the window.
+
+        status: None = all; 'primary' = validated/ambiguous (status != recovered);
+        'recovered' = only the recovery-pass tier. On older sqlites without a
+        status column, 'primary' returns all and 'recovered' returns nothing.
+        """
         clauses = []
         params = []
+
+        if status == "recovered":
+            clauses.append("status = 'recovered'" if self.has_status() else "0")
+        elif status == "primary" and self.has_status():
+            clauses.append("status != 'recovered'")
 
         if mz_min is not None:
             clauses.append("mono_mz >= ?")
@@ -86,11 +106,129 @@ class DistributionsDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def noise_features_in_window(self, mz_min=None, mz_max=None, rt_start=None,
+                                 rt_end=None, limit=40000):
+        """Features ("lines") overlapping the window that belong to NO distribution.
+
+        Returns each feature's bbox + n_points so the viewer can split unassigned
+        points into noise lines / small lines / single points. The LEFT JOIN ...
+        IS NULL keeps only features absent from distribution_members.
+        """
+        clauses = ["m.feature_id IS NULL"]
+        params = []
+        if mz_max is not None:
+            clauses.append("f.mz_min <= ?")
+            params.append(mz_max)
+        if mz_min is not None:
+            clauses.append("f.mz_max >= ?")
+            params.append(mz_min)
+        if rt_end is not None:
+            clauses.append("f.rt_start <= ?")
+            params.append(rt_end)
+        if rt_start is not None:
+            clauses.append("f.rt_end >= ?")
+            params.append(rt_start)
+        where = "WHERE " + " AND ".join(clauses)
+        params.append(limit)
+        rows = self.connect().execute(
+            f"""
+            SELECT f.feature_id, f.mz_min, f.mz_max, f.rt_start, f.rt_end, f.n_points
+            FROM features f
+            LEFT JOIN distribution_members m ON m.feature_id = f.feature_id
+            {where}
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def feature(self, feature_id):
         row = self.connect().execute(
             "SELECT * FROM features WHERE feature_id = ?", (feature_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def all_lines(self):
+        """Every feature ("line") with the charge of the distribution it belongs
+        to (0 when it is in none). Used by the table-1 'lines' tab."""
+        rows = self.connect().execute(
+            """
+            SELECT f.feature_id, f.mz_mean, f.mz_min, f.mz_max, f.rt_apex,
+                   f.rt_start, f.rt_end, f.n_points, f.area, f.height,
+                   COALESCE(d.charge, 0) AS charge
+            FROM features f
+            LEFT JOIN distribution_members m ON m.feature_id = f.feature_id
+            LEFT JOIN distributions d ON d.distribution_id = m.distribution_id
+            ORDER BY f.feature_id
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_distributions(self):
+        # AUC = sum of member-feature areas = area under the combined isotope peak
+        # (integral of the summed per-timepoint signal across all lines).
+        rows = self.connect().execute(
+            """
+            SELECT d.*, IFNULL(a.auc, 0.0) AS auc
+            FROM distributions d
+            LEFT JOIN (
+                SELECT m.distribution_id, SUM(f.area) AS auc
+                FROM distribution_members m
+                JOIN features f ON f.feature_id = m.feature_id
+                GROUP BY m.distribution_id
+            ) a ON a.distribution_id = d.distribution_id
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_analytes(self):
+        rows = self.connect().execute("SELECT * FROM analytes").fetchall()
+        return [dict(r) for r in rows]
+
+    def all_analytes_multicharge(self):
+        """Analytes that span more than one charge state, each with one
+        representative member distribution_id (for a one-click panel-3 load) and
+        an AUC = total area under the combined peak of every line of every member
+        distribution."""
+        rows = self.connect().execute(
+            """
+            SELECT a.*,
+                   (SELECT am.distribution_id FROM analyte_members am
+                    WHERE am.analyte_id = a.analyte_id LIMIT 1) AS rep_distribution_id,
+                   IFNULL(s.auc, 0.0) AS auc
+            FROM analytes a
+            LEFT JOIN (
+                SELECT am.analyte_id, SUM(f.area) AS auc
+                FROM analyte_members am
+                JOIN distribution_members m ON m.distribution_id = am.distribution_id
+                JOIN features f ON f.feature_id = m.feature_id
+                GROUP BY am.analyte_id
+            ) s ON s.analyte_id = a.analyte_id
+            WHERE a.charge_max > a.charge_min
+            ORDER BY a.analyte_id
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def analyte_distributions(self, analyte_id):
+        """The member distributions of an analyte (charge region)."""
+        rows = self.connect().execute(
+            """
+            SELECT d.*, IFNULL(a.auc, 0.0) AS auc
+            FROM analyte_members am
+            JOIN distributions d ON d.distribution_id = am.distribution_id
+            LEFT JOIN (
+                SELECT m.distribution_id, SUM(f.area) AS auc
+                FROM distribution_members m
+                JOIN features f ON f.feature_id = m.feature_id
+                GROUP BY m.distribution_id
+            ) a ON a.distribution_id = d.distribution_id
+            WHERE am.analyte_id = ?
+            ORDER BY d.charge
+            """,
+            (analyte_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def line(self, line_id):
         row = self.connect().execute(
@@ -131,10 +269,21 @@ class DistributionsDB:
             (analyte_id,),
         ).fetchall()
 
+        # An analyte can hold more than one distribution at the same charge. The
+        # grid shows one per charge, so make sure the explicitly requested
+        # distribution wins its own charge slot (otherwise panel 3 would render a
+        # same-charge sibling -- a different colour/size than the one clicked).
         group = {}
         for row in rows:
             did = row["distribution_id"]
-            group[row["charge"]] = {
+            charge = row["charge"]
+            existing = group.get(charge)
+            if existing is not None:
+                if existing["distribution"]["distribution_id"] == distribution_id:
+                    continue  # never displace the clicked distribution
+                if did != distribution_id:
+                    continue  # keep first-seen unless this row IS the clicked one
+            group[charge] = {
                 "distribution": self.distribution(did),
                 "features": self.distribution_members(did),
             }

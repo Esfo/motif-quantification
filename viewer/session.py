@@ -188,6 +188,42 @@ class ViewerSession:
     def files(self):
         return self.file_rows
 
+    @property
+    def distributions_dir(self):
+        # Mirrors viewer.main_window.find_distributions_db: <project>/distributions,
+        # where <project> is the parent of searches/reorganized.
+        if self.reorganized is None:
+            return None
+        return self.reorganized.parent.parent / "distributions"
+
+    def distributions_db_for(self, filename):
+        """Path to the distributions sqlite produced for THIS file, or None.
+
+        index-distributions.py names each sqlite ``<stem>.distributions.sqlite``
+        where ``stem`` strips a ``.centroid.mzML`` suffix; the viewer's file names
+        may or may not carry that suffix, so try the exact name first and then a
+        stem glob. Returns None when no sqlite matches (the file has no
+        distributions of its own — we must not fall back to another file's).
+        """
+        dist_dir = self.distributions_dir
+        if not filename or dist_dir is None or not dist_dir.is_dir():
+            return None
+
+        name = Path(filename).name
+        for suffix in (".centroid.mzML", ".centroid.mzml", ".mzML", ".mzml"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+        else:
+            name = Path(name).stem
+
+        exact = dist_dir / f"{name}.distributions.sqlite"
+        if exact.exists():
+            return exact
+
+        matches = sorted(dist_dir.glob(f"{name}*.distributions.sqlite"))
+        return matches[0] if matches else None
+
     def summary(self):
         return self.manifest
 

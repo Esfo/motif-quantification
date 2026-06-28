@@ -67,6 +67,15 @@ def init_schema(conn, store_edges=False):
             quality REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS feature_traces (
+            feature_id INTEGER PRIMARY KEY,
+            n INTEGER NOT NULL,
+            scans BLOB NOT NULL,
+            rts BLOB NOT NULL,
+            mzs BLOB NOT NULL,
+            intensities BLOB NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS distributions (
             distribution_id INTEGER PRIMARY KEY,
             charge INTEGER NOT NULL,
@@ -80,7 +89,17 @@ def init_schema(conn, store_edges=False):
             ms1_end INTEGER NOT NULL,
             n_members INTEGER NOT NULL,
             score REAL NOT NULL,
-            quality REAL NOT NULL
+            quality REAL NOT NULL,
+            mz_score REAL NOT NULL DEFAULT 0,
+            iso_score REAL NOT NULL DEFAULT 0,
+            trace_score REAL NOT NULL DEFAULT 0,
+            missing_score REAL NOT NULL DEFAULT 0,
+            interloper_score REAL NOT NULL DEFAULT 0,
+            mono_offset INTEGER NOT NULL DEFAULT 0,
+            n_missing_interior INTEGER NOT NULL DEFAULT 0,
+            n_interlopers INTEGER NOT NULL DEFAULT 0,
+            ambiguity_score REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'validated'
         );
 
         CREATE TABLE IF NOT EXISTS distribution_members (
@@ -88,6 +107,10 @@ def init_schema(conn, store_edges=False):
             feature_id INTEGER NOT NULL,
             isotope_index INTEGER NOT NULL,
             member_score REAL NOT NULL,
+            mz_residual REAL NOT NULL DEFAULT 0,
+            intensity_observed REAL NOT NULL DEFAULT 0,
+            intensity_expected REAL NOT NULL DEFAULT 0,
+            trace_score REAL NOT NULL DEFAULT 0,
             PRIMARY KEY (distribution_id, feature_id)
         );
 

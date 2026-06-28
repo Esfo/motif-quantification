@@ -26,7 +26,15 @@ import re
 import traceback
 
 import numpy as np
-from PySide6.QtCore import QEvent, Qt, QThread, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QEvent,
+    QModelIndex,
+    QSortFilterProxyModel,
+    Qt,
+    QThread,
+    Signal,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -40,8 +48,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QStackedWidget,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -62,6 +72,8 @@ try:
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     from . import isotopes
     from .theming import palette, style_plot, style_gl
+    from .distributions_db import DistributionsDB
+    from .points_store import PointsStore
 except ImportError:
     from mzml_store import MzmlStore, scan_arrays
     from plots import plot_points, plot_spectrum
@@ -69,6 +81,8 @@ except ImportError:
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     import isotopes
     from theming import palette, style_plot, style_gl
+    from distributions_db import DistributionsDB
+    from points_store import PointsStore
 
 
 def plain_seq(peptide):
@@ -116,10 +130,18 @@ class EvidenceWorker(QThread):
                 ms1 = self.centroid.preceding_ms1_for_scan(self.scan)
 
             scan_mz = scan_int = None
-            ms1_number = None
-            if ms1 is not None:
-                ms1_number = ms1.number
-                scan_mz, scan_int = self.store.scan_window_by_number(ms1.number, self.mz_min, self.mz_max)
+            ms1_number = ms1.number if ms1 is not None else None
+            if self.rt is not None:
+                # Overlay scan must come from the SAME store as the points (its
+                # scan numbering matches); the points store keys by ms1_index, not
+                # the centroid's scan numbers.
+                src_ms1 = self.store.nearest_ms1_by_rt(self.rt)
+                if src_ms1 is not None:
+                    scan_mz, scan_int = self.store.scan_window_by_number(
+                        src_ms1.number, self.mz_min, self.mz_max)
+            elif ms1 is not None:
+                scan_mz, scan_int = self.centroid.scan_window_by_number(
+                    ms1.number, self.mz_min, self.mz_max)
 
             points = None
             region = None
@@ -160,18 +182,123 @@ DIST_PALETTE = [
 ]
 
 
+# (field, header, kind) where kind: "f"=float 4g, "t"=time 2f, "i"=int, "s"=str.
 LINE_METRIC_COLUMNS = [
-    ("isotope_index", "iso"),
-    ("area", "AUC"),
-    ("height", "max I"),
-    ("n_points", "n pts"),
-    ("rt_start", "min t"),
-    ("rt_end", "max t"),
-    ("mz_min", "min m/z"),
-    ("mz_max", "max m/z"),
-    ("mz_mean", "mean m/z"),
-    ("rt_apex", "RT"),
+    ("isotope_index", "iso", "i"),
+    ("mz_mean", "mean m/z", "f"),
+    ("mz_min", "min m/z", "f"),
+    ("mz_max", "max m/z", "f"),
+    ("rt_apex", "RT", "t"),
+    ("rt_start", "min t", "t"),
+    ("rt_end", "max t", "t"),
+    ("n_points", "n pts", "i"),
 ]
+
+# 'lines' tab: every line (feature) + the charge of its distribution (0 if none).
+LINES_TAB_COLUMNS = [
+    ("mz_mean", "mean m/z", "f"),
+    ("mz_min", "min m/z", "f"),
+    ("mz_max", "max m/z", "f"),
+    ("rt_apex", "RT", "t"),
+    ("rt_start", "min t", "t"),
+    ("rt_end", "max t", "t"),
+    ("n_points", "n pts", "i"),
+    ("charge", "charge", "i"),
+]
+
+# 'distributions' tab (distributionregions): one row per distribution.
+DIST_TAB_COLUMNS = [
+    ("charge", "z", "i"),
+    ("neutral_mass", "neutral mass", "f"),
+    ("mono_mz", "mono m/z", "f"),
+    ("rt_apex", "RT", "t"),
+    ("rt_start", "min t", "t"),
+    ("rt_end", "max t", "t"),
+    ("n_members", "n iso", "i"),
+    ("auc", "AUC", "f"),
+    ("iso_score", "iso", "f"),
+    ("status", "status", "s"),
+]
+
+# 'charge distributions' tab (chargeregions): one row per analyte (expandable).
+CHARGE_TAB_COLUMNS = [
+    ("neutral_mass", "neutral mass", "f"),
+    ("charge_min", "z min", "i"),
+    ("charge_max", "z max", "i"),
+    ("n_distributions", "n dist", "i"),
+    ("rt_apex", "RT", "t"),
+    ("rt_start", "min t", "t"),
+    ("rt_end", "max t", "t"),
+    ("auc", "AUC", "f"),
+]
+
+
+def _gtick(value):
+    """Compact y-tick label so values stay narrow (no overlap with the row
+    label): drop the exponent's '+'/leading zero, e.g. 1.98e+05 -> 1.98e5."""
+    if value == 0:
+        return "0"
+    a = abs(value)
+    if a >= 1e4 or a < 1e-2:
+        s = f"{value:.2e}"
+        return s.replace("e+0", "e").replace("e+", "e").replace("e-0", "e-")
+    return f"{value:.3g}"
+
+
+def _fmt(value, kind):
+    if value is None:
+        return ""
+    if kind == "f":
+        return f"{value:.4f}"
+    if kind == "t":
+        return f"{value:.2f}"
+    if kind == "i":
+        return str(int(value))
+    return str(value)
+
+
+class SimpleTableModel(QAbstractTableModel):
+    """Read-only table over a list of dicts. DisplayRole is formatted text;
+    EditRole returns the raw value so a QSortFilterProxyModel sorts numerically."""
+
+    def __init__(self, columns, rows=None, parent=None):
+        super().__init__(parent)
+        self._columns = columns
+        self._rows = rows or []
+
+    def set_rows(self, rows):
+        self.beginResetModel()
+        self._rows = rows or []
+        self.endResetModel()
+
+    def row_dict(self, source_row):
+        if 0 <= source_row < len(self._rows):
+            return self._rows[source_row]
+        return None
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        field, _, kind = self._columns[index.column()]
+        value = self._rows[index.row()].get(field)
+        if role == Qt.DisplayRole:
+            return _fmt(value, kind)
+        if role == Qt.EditRole:
+            return value
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            return self._columns[section][1]
+        return None
 
 
 def fixed_toggle(off_text, on_text, width=70):
@@ -182,6 +309,56 @@ def fixed_toggle(off_text, on_text, width=70):
     button._off = off_text
     button._on = on_text
     return button
+
+
+class FlipButton(QPushButton):
+    """A mode button that cycles through labelled states on each press.
+
+    Unlike a checkable toggle (which reads as 'pressed' / 'not pressed'), this is
+    a plain push button: it always shows the label of the CURRENT mode, and each
+    click advances to the next mode and fires ``on_change``. Two states make it a
+    binary switch; more make it a cycle (e.g. the four noise levels). The width is
+    fixed to the widest label so cycling never resizes the button.
+    """
+
+    def __init__(self, states, on_change=None, extra_pad=24, parent=None):
+        super().__init__(parent)
+        self._states = list(states)          # [(key, label), ...]
+        self._idx = 0
+        self._on_change = on_change
+        fm = self.fontMetrics()
+        width = max(fm.horizontalAdvance(label) for _, label in self._states) + extra_pad
+        self.setFixedWidth(width)
+        self.setText(self._states[0][1])
+        self.clicked.connect(self._advance)
+
+    def _advance(self):
+        self._idx = (self._idx + 1) % len(self._states)
+        self.setText(self._states[self._idx][1])
+        if self._on_change is not None:
+            self._on_change()
+
+    def key(self):
+        return self._states[self._idx][0]
+
+    def index(self):
+        return self._idx
+
+    def set_index(self, i):
+        self._idx = i % len(self._states)
+        self.setText(self._states[self._idx][1])
+
+
+# Per-class noise rendering: brighter/larger for substantial noise lines, fainter
+# and smaller down to lone stray points. Keys match the _noise_class values.
+#   1 = noise line (a feature/line with >=5 points, in no distribution)
+#   2 = small line (a feature with 2..4 points, in no distribution)
+#   3 = single point (a 1-point feature, or a stray datapoint in no feature)
+NOISE_STYLE = {
+    1: ((205, 205, 205, 215), 2.5),
+    2: ((170, 180, 205, 180), 2.0),
+    3: ((150, 150, 150, 140), 1.5),
+}
 
 
 class MSViewerTab(QMainWindow):
@@ -205,8 +382,11 @@ class MSViewerTab(QMainWindow):
         self._loaded_window = None # the padded region actually extracted/cached
         self._p2_scatters = []    # (ScatterPlotItem, base_size) for zoom rescaling
         self._p1_scatter_item = None  # panel-1 2D centroid scatter (for rescaling)
-        self._assigned = None     # bool mask: which raw points are in a distribution
+        self._assigned = None     # bool mask: raw points in a validated/ambiguous distribution
         self._groups = []         # [(distribution_id, colour, point_mask)]
+        self._rec_assigned = None # bool mask: raw points in a recovered (less-confident) distribution
+        self._rec_groups = []     # recovered distribution groups (shown at noise mode >= 1)
+        self._noise_class = None  # int8 per point: 0 assigned, 1 line, 2 small, 3 single
         self._last_region = None
         self.center = None        # (mz_center, rt_center) for the ± controls
         self._guard = False       # suppress range-change handling during programmatic set
@@ -223,6 +403,14 @@ class MSViewerTab(QMainWindow):
         else:
             self._color_pool = list(DIST_PALETTE)
         self.assumed_charge = None
+        # Selected-distribution state: the dotted border + charge-search lock-on.
+        self._selected_dist_id = None
+        self._selected_charge_group = None   # {charge: {distribution, features}} for the analyte
+        self._selected_bbox = None           # (mz_min, mz_max, rt_start, rt_end) of the selection
+        self._sel_border_item = None         # the dotted-rectangle item on panel 2
+        self._border_color = None            # None = normal (fg); "red" = hypothetical box
+        self._selected_rt_band = None        # (rt_start, rt_end) of the analyte, for hypotheticals
+        self._selected_n_members = None      # isotope count of the selection, for hypothetical width
         self._panel3_mode = "ms1"  # "ms1" (envelope/charge grid) or "ms2" (spectrum)
         self._ms2_scan = None      # the MS2 scan currently shown in panel 3
         self._nav = []            # navigation history of (window, charge)
@@ -276,19 +464,16 @@ class MSViewerTab(QMainWindow):
 
         # Tab 1 is a single-file view: a file must be chosen first. Default to
         # the first file so the lists are never empty/ambiguous on open.
+        # Only files that have their OWN distributions sqlite are openable; a file
+        # without one is omitted rather than shown with another file's overlay.
         self.file_combo = QComboBox()
         for row in self.session.files():
             name = row.get("filename", "")
-            if name:
+            if name and self.session.distributions_db_for(name) is not None:
                 self.file_combo.addItem(name, name)
         self.file_combo.currentIndexChanged.connect(self.on_file_changed)
         layout.addWidget(QLabel("file"))
         layout.addWidget(self.file_combo)
-
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("filter…")
-        self.search.textChanged.connect(self.repopulate_active_list)
-        layout.addWidget(self.search)
 
         self.protein_list = self._titled_list(layout, "proteins", self.on_protein_selected, self.show_all_proteins)
         self.peptide_list = self._titled_list(layout, "peptides", self.on_peptide_selected, self.show_all_peptides)
@@ -300,11 +485,24 @@ class MSViewerTab(QMainWindow):
         self.dock_lists = dock
 
         self.current_file = self.file_combo.currentData()
+        self._set_db_for_current_file()
         self.repopulate_active_list()
+
+    def _set_db_for_current_file(self):
+        """Bind self.db to the sqlite for the currently selected file (or None)."""
+        if getattr(self, "db", None) is not None:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+        db_path = self.session.distributions_db_for(self.current_file or "")
+        self.db = DistributionsDB(db_path) if db_path is not None else None
+        if hasattr(self, "table1_tabs"):
+            self.reset_table1_tabs()
 
     def on_file_changed(self):
         self.current_file = self.file_combo.currentData()
-        self.search.clear()
+        self._set_db_for_current_file()
         self.repopulate_active_list()
 
     def _titled_list(self, layout, title, on_select, on_all):
@@ -319,6 +517,14 @@ class MSViewerTab(QMainWindow):
 
         listw = QListWidget()
         listw.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Keep the selection highlighted even when the list loses focus (Qt
+        # otherwise renders the inactive selection in a muted grey, so the blue
+        # "selected" cue disappeared when you clicked a panel/table).
+        listw.setStyleSheet(
+            "QListWidget::item:selected,"
+            "QListWidget::item:selected:!active"
+            " { background-color: #2f6fb3; color: white; }"
+        )
         listw.itemSelectionChanged.connect(on_select)
         layout.addWidget(listw, stretch=1)
         return listw
@@ -390,20 +596,22 @@ class MSViewerTab(QMainWindow):
         self.p1_stack.addWidget(p1_2d_row)           # index 0 = 2D
         self.p1_stack.addWidget(self.p1_3d_widget)   # index 1 = 3D
 
-        self.dim_toggle = fixed_toggle("3D", "2D")     # shows what it will switch TO
-        self.dim_toggle.clicked.connect(self.toggle_dimension)
-        self.source_toggle = fixed_toggle("profile", "centroid")
-        self.source_toggle.clicked.connect(self.refresh)
-        # Noise = points not in any distribution. Default shows noise; pressing
-        # hides it (label flips to what the next press does, like the others).
-        self.noise_toggle = fixed_toggle("noise off", "noise on", width=80)
-        # Default: noise OFF (checked == hide noise; label shows what a press does).
-        self.noise_toggle.setChecked(True)
-        self.noise_toggle.setText("noise on")
-        self.noise_toggle.clicked.connect(self._toggle_noise)
-        # Log/linear colour scale for the 3D intensity colouring.
-        self.logcolor_toggle = fixed_toggle("log color", "lin color", width=80)
-        self.logcolor_toggle.clicked.connect(self._toggle_logcolor)
+        # Plain mode buttons (FlipButton): each shows the current mode and cycles
+        # on press -- no sunken 'pressed' look. dim/source/colour are binary; noise
+        # cycles through four levels of progressively finer noise.
+        self.dim_toggle = FlipButton([("2D", "2D"), ("3D", "3D")], on_change=self.toggle_dimension)
+        self.source_toggle = FlipButton([("centroid", "centroid"), ("profile", "profile")],
+                                        on_change=self.refresh)
+        # Noise levels: none -> noise lines -> + small lines -> + single points.
+        # Levels: none -> recovered (less confident) distributions -> noise lines
+        # -> + small lines -> + single points. Each level is cumulative.
+        self.noise_toggle = FlipButton(
+            [("none", "no noise"), ("recovered", "less confident distributions"),
+             ("line", "line noise"), ("small", "small line noise"),
+             ("single", "single point noise")],
+            on_change=self._on_noise_changed)
+        self.logcolor_toggle = FlipButton([("lin", "lin color"), ("log", "log color")],
+                                          on_change=self._on_logcolor)
         # Snap the 3D view to the aligned top-down (2D-like) orientation.
         self.reset3d_button = QPushButton("align 3D")
         self.reset3d_button.setFixedWidth(70)
@@ -411,9 +619,26 @@ class MSViewerTab(QMainWindow):
         self.reset3d_button.clicked.connect(self.reset_3d_view)
         self.reset3d_button.setEnabled(False)
 
+        # Theme toggle, to the right of "align 3D". main_window wires
+        # on_theme_toggle; the label tracks the current theme.
+        self.on_theme_toggle = None
+        self.theme_btn = QPushButton("Light mode" if self.theme == "dark" else "Dark mode")
+        self.theme_btn.setFixedWidth(80)
+        self.theme_btn.clicked.connect(lambda: self.on_theme_toggle and self.on_theme_toggle())
+
         # "loading… <context>" shown above panel 1 while its worker runs.
         self.p1_loading = QLabel("")
         self.p1_loading.setStyleSheet("color: black;")
+
+        # Charge-search arrows: right-aligned, to the right of "align 3D".
+        self.charge_prev_btn = QPushButton("◀")
+        self.charge_prev_btn.setFixedWidth(28)
+        self.charge_prev_btn.setToolTip("charge search: one charge higher at the same RT")
+        self.charge_prev_btn.clicked.connect(lambda: self.charge_step(1))
+        self.charge_next_btn = QPushButton("▶")
+        self.charge_next_btn.setFixedWidth(28)
+        self.charge_next_btn.setToolTip("charge search: one charge lower at the same RT")
+        self.charge_next_btn.clicked.connect(lambda: self.charge_step(-1))
 
         bar = QHBoxLayout()
         bar.addWidget(self.dim_toggle)
@@ -421,9 +646,13 @@ class MSViewerTab(QMainWindow):
         bar.addWidget(self.noise_toggle)
         bar.addWidget(self.logcolor_toggle)
         bar.addWidget(self.reset3d_button)
+        bar.addWidget(self.theme_btn)
         bar.addSpacing(8)
         bar.addWidget(self.p1_loading)
         bar.addStretch(1)
+        bar.addWidget(QLabel("charge"))
+        bar.addWidget(self.charge_prev_btn)
+        bar.addWidget(self.charge_next_btn)
 
         # Hide pyqtgraph's in-plot auto-range "A" button: fit-to-data makes no
         # sense for the window-driven panels and it kept overlapping the data.
@@ -437,6 +666,7 @@ class MSViewerTab(QMainWindow):
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_panel1")
+        dock.setTitleBarWidget(QWidget())   # drop the empty title bar (dead space)
         dock.setWidget(container)
         self.dock_panel1 = dock
 
@@ -554,11 +784,14 @@ class MSViewerTab(QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 0, 2, 2)
-        layout.addWidget(self.p2_loading)
+        # p2_loading is intentionally NOT added to the layout: its row was the
+        # dead-space border between panel 1 and panel 2. The loading state still
+        # shows in panel 1's bar (and panel 3).
         layout.addWidget(row_widget, stretch=1)
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_panel2")
+        dock.setTitleBarWidget(QWidget())   # drop the empty title bar (dead space)
         dock.setWidget(container)
         self.dock_panel2 = dock
 
@@ -589,31 +822,101 @@ class MSViewerTab(QMainWindow):
         # shown -- the user wants no descriptive caption above panel 3.
         self.p3_title = QLabel("")
         self.p3_title.setVisible(False)
+        # p3_loading is intentionally NOT added to the layout: its row was the
+        # dead-space border above panel 3. The loading state still updates this
+        # label (harmless) but it no longer occupies a row, so the plot fills the
+        # space.
         self.p3_loading = QLabel("")
         self.p3_loading.setStyleSheet("color: black;")
 
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
-        layout.addWidget(self.p3_loading)
         layout.addWidget(self.p3_stack, stretch=1)
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_panel3")
+        dock.setTitleBarWidget(QWidget())   # drop the empty title bar (dead space)
         dock.setWidget(container)
         self.dock_panel3 = dock
 
+    def _make_table_view(self, columns, on_double_click):
+        """A sortable QTableView over a SimpleTableModel (via a sort proxy)."""
+        view = QTableView()
+        model = SimpleTableModel(columns, parent=view)
+        proxy = QSortFilterProxyModel(view)
+        proxy.setSortRole(Qt.EditRole)
+        proxy.setSourceModel(model)
+        view.setModel(proxy)
+        view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        view.verticalHeader().setVisible(False)
+        view.setSortingEnabled(True)
+        view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        view.doubleClicked.connect(
+            lambda proxy_index, m=model, p=proxy, cb=on_double_click:
+            cb(m.row_dict(p.mapToSource(proxy_index).row()))
+        )
+        self._install_row_copy(view)
+        return view, model
+
+    def _install_row_copy(self, view):
+        """Ctrl+C copies the whole selected row(s) (tab-separated)."""
+        from PySide6.QtGui import QShortcut, QKeySequence
+        sc = QShortcut(QKeySequence.Copy, view)
+        sc.activated.connect(lambda v=view: self._copy_rows(v))
+
+    def _copy_rows(self, view):
+        from PySide6.QtWidgets import QApplication
+        sel = view.selectionModel()
+        model = view.model()
+        if sel is None or model is None:
+            return
+        rows = sorted({i.row() for i in sel.selectedIndexes()})
+        lines = []
+        for r in rows:
+            cells = [str(model.index(r, c).data() or "") for c in range(model.columnCount())]
+            lines.append("\t".join(cells))
+        if lines:
+            QApplication.clipboard().setText("\n".join(lines))
+
     def build_table1_dock(self):
+        # 'current' tab: the selected distribution's lines.
         self.table1 = QTableWidget()
         self.table1.setColumnCount(len(LINE_METRIC_COLUMNS))
-        self.table1.setHorizontalHeaderLabels([h for _, h in LINE_METRIC_COLUMNS])
+        self.table1.setHorizontalHeaderLabels([h for _, h, _ in LINE_METRIC_COLUMNS])
         self.table1.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table1.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table1.verticalHeader().setVisible(False)   # no 1,2,3 index column
+        self.table1.verticalHeader().setVisible(False)
+        self._install_row_copy(self.table1)
 
-        dock = QDockWidget("Table 1 - distribution lines", self)
+        # 'distributions' tab.
+        self.dists_view, self.dists_model = self._make_table_view(
+            DIST_TAB_COLUMNS, self._on_distribution_activated)
+        self.dists_view.clicked.connect(self._on_dist_clicked)
+
+        # 'charge distributions' tab: flat multi-charge analytes (single rows).
+        self.charge_view, self.charge_model = self._make_table_view(
+            CHARGE_TAB_COLUMNS, self._on_charge_activated)
+        self.charge_view.clicked.connect(self._on_charge_clicked)
+
+        self.table1_tabs = QTabWidget()
+        self.table1_tabs.addTab(self.table1, "current")
+        self.table1_tabs.addTab(self.dists_view, "distributions")
+        self.table1_tabs.addTab(self.charge_view, "charge distributions")
+        self.table1_tabs.currentChanged.connect(self._on_table1_tab_changed)
+        self._table1_loaded = set()
+
+        # 'All' button on the tab row (reloads whichever tab is active).
+        all_btn = QPushButton("All")
+        all_btn.setFixedWidth(44)
+        all_btn.clicked.connect(self._reload_current_tab)
+        self.table1_tabs.setCornerWidget(all_btn, Qt.TopRightCorner)
+
+        dock = QDockWidget("", self)
         dock.setObjectName("dock_table1")
-        dock.setWidget(self.table1)
+        dock.setTitleBarWidget(QWidget())   # reclaim the title-bar head space
+        dock.setWidget(self.table1_tabs)
         self.dock_table1 = dock
 
     def build_table2_dock(self):
@@ -640,6 +943,9 @@ class MSViewerTab(QMainWindow):
         self.splitDockWidget(self.dock_panel3, self.dock_table2, Qt.Vertical)
         self.resizeDocks([self.dock_lists], [320], Qt.Horizontal)
         self.resizeDocks([self.dock_panel1, self.dock_panel3], [600, 460], Qt.Horizontal)
+        # Give panel 2 the most vertical space (it was leaving dead space).
+        self.resizeDocks([self.dock_panel1, self.dock_panel2, self.dock_table1],
+                         [300, 460, 240], Qt.Vertical)
 
     def reset_layout(self):
         self.restoreState(self._default_state)
@@ -647,12 +953,18 @@ class MSViewerTab(QMainWindow):
     def apply_theme(self, theme):
         self.theme = theme
         pal = palette(theme)
+        if getattr(self, "theme_btn", None) is not None:
+            self.theme_btn.setText("Light mode" if theme == "dark" else "Dark mode")
         for plot in (self.p1_2d, self.p2, self.p3, self.ms2_plot):
             style_plot(plot, pal)
         try:
             self.p3_grid.setBackground(pal["bg"])
         except Exception:
             pass
+        # Force the charge grid to rebuild on a theme change (its axis pens, tick
+        # text and titles are coloured at build time, and the rebuild is otherwise
+        # skipped when the same distribution is showing).
+        self._grid_dist_id = None
         # Fill the panel-1 2D left spacer with the same plot background so it
         # blends in (instead of an awkward blank gap next to panel 2's strip).
         if getattr(self, "_p1_2d_spacer", None) is not None:
@@ -662,9 +974,10 @@ class MSViewerTab(QMainWindow):
             style_gl(self.p1_3d, pal)
         # Re-render the data-bearing panels so theme-coloured bits (panel 1/3
         # titles, the MS2 spectrum data, the charge-grid axes) follow the theme.
-        if self.current is not None and isinstance(getattr(self, "_last_points", None), dict):
-            self._redraw_from_cache()
-            self._redraw_panel3()
+        if self.current is not None:
+            if isinstance(getattr(self, "_last_points", None), dict):
+                self._redraw_from_cache()
+            self._redraw_panel3()   # rebuilds the charge grid with the new theme
 
     def _redraw_panel3(self):
         """Re-draw whatever panel 3 is currently showing (MS2 spectrum / MS1
@@ -703,8 +1016,7 @@ class MSViewerTab(QMainWindow):
             listw.verticalScrollBar().setValue(scroll)
 
     def _filter(self, text):
-        t = self.search.text().strip().lower()
-        return (not t) or (t in text.lower())
+        return True  # filter box removed; lists show everything for the file
 
     # All list content is scoped to the selected file (single-file view).
     def file_psms(self):
@@ -832,6 +1144,21 @@ class MSViewerTab(QMainWindow):
             self._profile[key] = MzmlStore(path)
         return self._profile[key]
 
+    def points_store(self, filename):
+        """Option B: a store that serves raw centroids from the file's
+        distributions sqlite (scan_points), avoiding mzML re-decode on zoom.
+        Returns None when the sqlite has no scan_points (falls back to mzML)."""
+        sqlite_path = self.session.distributions_db_for(filename) if self.session else None
+        if sqlite_path is None:
+            return None
+        key = str(sqlite_path)
+        cache = getattr(self, "_points", None)
+        if cache is None:
+            cache = self._points = {}
+        if key not in cache:
+            cache[key] = PointsStore(key) if PointsStore.has_points(key) else None
+        return cache[key]
+
     # ---- the selected match -> panels ------------------------------------
 
     def update_evidence(self, row):
@@ -847,6 +1174,7 @@ class MSViewerTab(QMainWindow):
             "charge": charge, "neutral_mass": neutral_mass, "rt": rt,
             "targets": targets, "mz_center": mz_center,
             "centroid": self.centroid_store(filename), "profile": self.profile_store(filename),
+            "points": self.points_store(filename),
         }
         self.center = (mz_center, rt)
         self.assumed_charge = charge or 1
@@ -862,22 +1190,35 @@ class MSViewerTab(QMainWindow):
                         set_view=True)
 
     def use_profile(self):
-        return self.source_toggle.isChecked()
+        return self.source_toggle.key() == "profile"
 
-    def use_noise(self):
-        # Noise shown by default; the toggle (when checked) hides it.
-        return not self.noise_toggle.isChecked()
+    def noise_mode(self):
+        """Current level: 0 none, 1 recovered distributions, 2 lines, 3 +small
+        lines, 4 +single points (cumulative)."""
+        return self.noise_toggle.index()
 
-    def _toggle_noise(self):
-        self.noise_toggle.setText("noise on" if self.noise_toggle.isChecked() else "noise off")
+    def recovered_visible(self):
+        """Recovered (less-confident) distributions show from level 1 onward."""
+        return self.noise_mode() >= 1
+
+    def noise_visible_mask(self, n):
+        """Boolean over the loaded points: which raw noise points the current
+        level reveals. Noise classes start at level 2 (level 1 is recovered
+        distributions), so class c (1 line, 2 small, 3 single) shows at mode>=c+1."""
+        mode = self.noise_mode()
+        cls = getattr(self, "_noise_class", None)
+        if mode <= 1 or cls is None or cls.size != n:
+            return np.zeros(n, dtype=bool)
+        return (cls >= 1) & (cls <= mode - 1)
+
+    def _on_noise_changed(self):
         # Pure redraw from cached data -- no re-extraction needed.
         self._redraw_from_cache()
 
     def use_logcolor(self):
-        return self.logcolor_toggle.isChecked()
+        return self.logcolor_toggle.key() == "log"
 
-    def _toggle_logcolor(self):
-        self.logcolor_toggle.setText("lin color" if self.logcolor_toggle.isChecked() else "log color")
+    def _on_logcolor(self):
         # Recolour the cached 3D points without re-extraction.
         if HAVE_GL and getattr(self, "_p1_3d_inputs", None) is not None:
             self.draw_panel1_3d(*self._p1_3d_inputs)
@@ -962,19 +1303,18 @@ class MSViewerTab(QMainWindow):
             (vrt0, vrt1) = self.p2.getViewBox().viewRange()[1]
         except Exception:
             return
-        clamp = lambda f: min(max(f, 1.0), 4.0)
-        fmz = clamp((lmz / max(vmz1 - vmz0, 1e-9)) ** 0.5)
-        frt = clamp((lrt / max(vrt1 - vrt0, 1e-9)) ** 0.5)
-        f2 = clamp((fmz * frt) ** 0.5)
+        # Keep point sizes pinned to their base (the "starting condition" look the
+        # user prefers). The previous zoom-upscaling keyed off _loaded_window,
+        # which grows when a zoom-out triggers a reload, so it was not reversible:
+        # zooming back in returned bigger dots than the pristine view.
         for scatter, base in self._p2_scatters:
             try:
-                scatter.setSize(base * f2)
+                scatter.setSize(base)
             except Exception:
                 pass
-        # Panel 1 is m/z (x) vs intensity (y); only the m/z zoom matters for dots.
         for scatter, base in getattr(self, "_p1_scatters", []):
             try:
-                scatter.setSize(base * fmz)
+                scatter.setSize(base)
             except Exception:
                 pass
 
@@ -1001,7 +1341,12 @@ class MSViewerTab(QMainWindow):
         load = self._padded(self.window)
         self._loaded_window = load
         mz_min, mz_max, rt_start, rt_end = load
-        store = cur["profile"] if (self.use_profile() and cur["profile"]) else centroid
+        if self.use_profile() and cur["profile"]:
+            store = cur["profile"]
+        else:
+            # Option B: read centroids from the sqlite points store when present,
+            # else fall back to decoding the centroid mzML.
+            store = cur.get("points") or centroid
         self._win = (mz_min, mz_max, rt_start, rt_end)
         self._pending = dict(
             centroid=centroid, store=store, scan=cur["scan"], rt=cur["rt"],
@@ -1011,9 +1356,9 @@ class MSViewerTab(QMainWindow):
         self._start_evidence()
 
     def _set_loading(self, on, context=""):
-        """Show/clear a "loading… <context>" line above every panel 1/2/3 plot
-        while a data worker runs (per the spec: must happen everywhere)."""
-        text = f"loading… {context}" if on else ""
+        """Show/clear a bold "loading" line above every panel 1/2/3 plot while a
+        data worker runs (per the spec: must happen everywhere)."""
+        text = "<b>loading</b>" if on else ""
         for label in (getattr(self, "p1_loading", None),
                       getattr(self, "p2_loading", None),
                       getattr(self, "p3_loading", None)):
@@ -1059,9 +1404,19 @@ class MSViewerTab(QMainWindow):
         # centroid points directly.
         win = (mz_min, mz_max, rt_start, rt_end)
         if self.use_profile() and cur.get("profile"):
-            self._assigned, self._groups = self._assignment_profile(points, win)
+            self._assigned, self._groups = self._assignment_profile(points, win, status="primary")
+            self._rec_assigned, self._rec_groups = self._assignment_profile(points, win, status="recovered")
         else:
-            self._assigned, self._groups = self._assignment(points, win)
+            self._assigned, self._groups = self._assignment(points, win, status="primary")
+            self._rec_assigned, self._rec_groups = self._assignment(points, win, status="recovered")
+        # Noise = points in NO distribution (validated OR recovered): pass the
+        # combined assignment so recovered members are not double-counted as noise.
+        combined = self._assigned
+        if combined is not None and self._rec_assigned is not None:
+            combined = combined | self._rec_assigned
+        elif self._rec_assigned is not None:
+            combined = self._rec_assigned
+        self._noise_class = self._compute_noise_class(points, win, combined)
 
         self.draw_panel1(points, region, mz_min, mz_max, rt_start, rt_end)
         self.draw_panel2(points, (mz_min, mz_max, rt_start, rt_end))
@@ -1099,19 +1454,42 @@ class MSViewerTab(QMainWindow):
                     idx |= fm
                 idx &= vm
                 if idx.any():
+                    # data=did + sigClicked makes a distribution clickable in
+                    # panel 1 too, opening it in panel 3 exactly like panel 2.
                     sc = pg.ScatterPlotItem(x=mz[idx], y=inten[idx], size=3, pen=None,
-                                            brush=pg.mkBrush(*color))
+                                            brush=pg.mkBrush(*color),
+                                            data=[_did] * int(idx.sum()))
+                    sc.sigClicked.connect(self.on_panel2_dist_clicked)
                     self.p1_2d.addItem(sc)
                     self._p1_scatters.append((sc, 3))
                     shown_max = max(shown_max, float(inten[idx].max()))
-            if self.use_noise():
-                un = (~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)) & vm
-                if un.any():
-                    sc = pg.ScatterPlotItem(x=mz[un], y=inten[un], size=2, pen=None,
-                                            brush=pg.mkBrush(150, 150, 150, 150))
-                    self.p1_2d.addItem(sc)
-                    self._p1_scatters.append((sc, 2))
-                    shown_max = max(shown_max, float(inten[un].max()))
+            # Recovered (less-confident) distributions: same colours, fainter, only
+            # from noise level 1 onward.
+            if self.recovered_visible():
+                for _did, color, feat_masks in (self._rec_groups or []):
+                    idx = np.zeros(mz.size, dtype=bool)
+                    for fm in feat_masks:
+                        idx |= fm
+                    idx &= vm
+                    if idx.any():
+                        sc = pg.ScatterPlotItem(x=mz[idx], y=inten[idx], size=3, pen=None,
+                                                brush=pg.mkBrush(*color, 140),
+                                                data=[_did] * int(idx.sum()))
+                        sc.sigClicked.connect(self.on_panel2_dist_clicked)
+                        self.p1_2d.addItem(sc)
+                        self._p1_scatters.append((sc, 3))
+                        shown_max = max(shown_max, float(inten[idx].max()))
+            noise_vis = self.noise_visible_mask(mz.size) & vm
+            if noise_vis.any():
+                # One scatter per noise class so the levels are visually distinct.
+                for cls, (color, size) in NOISE_STYLE.items():
+                    nm = noise_vis & (self._noise_class == cls)
+                    if nm.any():
+                        sc = pg.ScatterPlotItem(x=mz[nm], y=inten[nm], size=size, pen=None,
+                                                brush=pg.mkBrush(*color))
+                        self.p1_2d.addItem(sc)
+                        self._p1_scatters.append((sc, size))
+                        shown_max = max(shown_max, float(inten[nm].max()))
             if self._p1_scatters:
                 self.p1_2d.getViewBox().setYRange(0, (shown_max or 1.0) * 1.05, padding=0)
         # No title on panel 1 (per the user).
@@ -1120,7 +1498,7 @@ class MSViewerTab(QMainWindow):
         # The 3D scatter is expensive; only build it when 3D is actually shown.
         # Cache the inputs so toggling to 3D can render without a reload.
         self._p1_3d_inputs = (points, region, mz_min, mz_max, rt_start, rt_end)
-        if HAVE_GL and self.dim_toggle.isChecked():
+        if HAVE_GL and self.dim_toggle.key() == "3D":
             self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
 
     def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
@@ -1140,15 +1518,24 @@ class MSViewerTab(QMainWindow):
             c = np.array(color, dtype=np.float32) / 255.0
             for fm in feat_masks:
                 base[fm] = c
+        if self.recovered_visible():
+            for _did, color, feat_masks in (self._rec_groups or []):
+                c = np.array(color, dtype=np.float32) / 255.0
+                for fm in feat_masks:
+                    base[fm] = c
 
         # Show EXACTLY panel 2's visible window (not the padded load region), so
         # the 3D mass/time extent matches panel 2 instead of being "way off".
         if self.window is not None:
             mz_min, mz_max, rt_start, rt_end = self.window
         view = (mz >= mz_min) & (mz <= mz_max) & (rt >= rt_start) & (rt <= rt_end)
-        # Honour the noise toggle: drop points not in any distribution when off.
-        if not self.use_noise() and self._assigned is not None and self._assigned.any():
-            view &= self._assigned
+        # Honour the noise level: keep assigned points plus only the noise classes
+        # the current mode reveals.
+        if self._assigned is not None:
+            keep = self._assigned | self.noise_visible_mask(mz.size)
+            if self.recovered_visible() and self._rec_assigned is not None:
+                keep = keep | self._rec_assigned
+            view &= keep
         mz, rt, inten, base = mz[view], rt[view], inten[view], base[view]
         if mz.size == 0:
             self.p1_scatter.setVisible(False)
@@ -1209,7 +1596,7 @@ class MSViewerTab(QMainWindow):
         if not feats:
             return None
         store = (cur.get("profile") if (self.use_profile() and cur.get("profile"))
-                 else cur.get("centroid"))
+                 else (cur.get("points") or cur.get("centroid")))
         if store is None:
             return None
         mzlo = min(f["mz_min"] for f in feats); mzhi = max(f["mz_max"] for f in feats)
@@ -1239,12 +1626,13 @@ class MSViewerTab(QMainWindow):
             self._dist_colors[distribution_id] = pool[i % len(pool)]
         return self._dist_colors[distribution_id]
 
-    def _assignment(self, points, window):
+    def _assignment(self, points, window, status=None):
         """Membership of each raw point in a sqlite distribution. Returns
         ``(assigned_mask, groups)`` where groups is a list of
         ``(distribution_id, colour, [feature_point_masks])`` -- one mask per
         *line* (feature), since a connect-the-dots line must follow a single
-        line's trace, not jump across a whole distribution. Computed once per
+        line's trace, not jump across a whole distribution. ``status`` selects the
+        confidence tier ('primary', 'recovered', or None=all). Computed once per
         reload and shared by panels 1 and 2 + the noise toggle."""
         if not isinstance(points, dict) or points["mz"].size == 0 or self.db is None:
             return None, []
@@ -1252,7 +1640,7 @@ class MSViewerTab(QMainWindow):
         mz_min, mz_max, rt_start, rt_end = window
         assigned = np.zeros(mz.size, dtype=bool)
         groups = []
-        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
+        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end, status=status):
             did = dist["distribution_id"]
             feat_masks = []
             for feat in self.db.distribution_members(did):
@@ -1265,7 +1653,40 @@ class MSViewerTab(QMainWindow):
                 groups.append((did, self.distribution_color(did), feat_masks))
         return assigned, groups
 
-    def _assignment_profile(self, points, window):
+    def _compute_noise_class(self, points, window, assigned):
+        """Classify every loaded raw point into a noise level.
+
+        0 = assigned (belongs to a distribution; always shown);
+        1 = noise line   (a feature/line with >=5 points, in no distribution);
+        2 = small line   (a feature with 2..4 points, in no distribution);
+        3 = single point (a 1-point feature, or a stray datapoint in no feature).
+
+        Unassigned points default to 3 (lone/stray) and are promoted to a stronger
+        (lower) class when they fall inside a larger noise feature's box; a point
+        in overlapping noise features takes the strongest (largest-line) class.
+        """
+        if not isinstance(points, dict) or points["mz"].size == 0:
+            return None
+        mz = points["mz"]; rt = points["rt"]
+        cls = np.where(assigned if assigned is not None else False, 0, 3).astype(np.int8)
+        if self.db is None or assigned is None:
+            return cls
+        unassigned = ~assigned
+        if not unassigned.any():
+            return cls
+        for feat in self.db.noise_features_in_window(*window):
+            npoints = feat["n_points"]
+            c = 1 if npoints >= 5 else (2 if npoints >= 2 else 3)
+            if c == 3:
+                continue  # already the default for unassigned points
+            m = (unassigned
+                 & (mz >= feat["mz_min"]) & (mz <= feat["mz_max"])
+                 & (rt >= feat["rt_start"]) & (rt <= feat["rt_end"]))
+            if m.any():
+                cls[m] = np.minimum(cls[m], np.int8(c))
+        return cls
+
+    def _assignment_profile(self, points, window, status=None):
         """Profile-mode membership via peak finding (roadmap 1.9): run the same
         centroiding peak-detection (``axis_peaks``) per scan, take each peak's
         apex as the centroid, match THAT centroid to a sqlite feature, and assign
@@ -1283,7 +1704,7 @@ class MSViewerTab(QMainWindow):
         mz_min, mz_max, rt_start, rt_end = window
         # Flatten the features into arrays for vectorised apex->feature matching.
         flist = []
-        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end):
+        for dist in self.db.distributions_in_window(mz_min, mz_max, rt_start, rt_end, status=status):
             did = dist["distribution_id"]
             color = self.distribution_color(did)
             for feat in self.db.distribution_members(did):
@@ -1326,9 +1747,11 @@ class MSViewerTab(QMainWindow):
         # (instead of per feature) to keep it fast. Clicking a dot selects the
         # distribution and opens its MS1 panel 3.
         self.p2.clear()
+        self._sel_border_item = None   # cleared by p2.clear(); re-added below
         self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
         self.p2.addItem(self.p2_ms2_star)   # survives clear; empty until hover
         if not isinstance(points, dict) or points["mz"].size == 0:
+            self._render_selection_border()
             return
         mz = points["mz"]
         rt = points["rt"]
@@ -1355,16 +1778,38 @@ class MSViewerTab(QMainWindow):
             self.p2.addItem(scatter)
             self._p2_scatters.append((scatter, 3))
 
-        # points not in any distribution -> faint gray dots, unless noise is off.
-        if self.use_noise():
-            unassigned = ~self._assigned if self._assigned is not None else np.ones(mz.size, dtype=bool)
-            if unassigned.any():
-                grey = pg.ScatterPlotItem(
-                    x=mz[unassigned], y=rt[unassigned], size=1.5, pen=None,
-                    brush=pg.mkBrush(160, 160, 160, 70))
-                self.p2.addItem(grey)
-                self._p2_scatters.append((grey, 1.5))
+        # Recovered (less-confident) distributions: same colours, fainter dots +
+        # dashed connectors, only from noise level 1 onward.
+        if self.recovered_visible():
+            for did, color, feat_masks in (self._rec_groups or []):
+                xs, ys, smz, srt = [], [], [], []
+                for fm in feat_masks:
+                    o = np.argsort(rt[fm])
+                    xs.append(mz[fm][o]); xs.append(nan)
+                    ys.append(rt[fm][o]); ys.append(nan)
+                    smz.append(mz[fm]); srt.append(rt[fm])
+                self.p2.addItem(pg.PlotCurveItem(
+                    np.concatenate(xs), np.concatenate(ys), connect="finite",
+                    pen=pg.mkPen(color=(*color, 130), width=0.5, style=Qt.DashLine)))
+                cmz = np.concatenate(smz); crt = np.concatenate(srt)
+                sc = pg.ScatterPlotItem(x=cmz, y=crt, size=2.5, pen=None,
+                                        brush=pg.mkBrush(*color, 150), data=[did] * cmz.size)
+                sc.sigClicked.connect(self.on_panel2_dist_clicked)
+                self.p2.addItem(sc)
+                self._p2_scatters.append((sc, 2.5))
 
+        # Noise points -> one scatter per visible noise class (level-dependent).
+        noise_vis = self.noise_visible_mask(mz.size)
+        if noise_vis.any():
+            for cls, (color, size) in NOISE_STYLE.items():
+                nm = noise_vis & (self._noise_class == cls)
+                if nm.any():
+                    sc = pg.ScatterPlotItem(x=mz[nm], y=rt[nm], size=size, pen=None,
+                                            brush=pg.mkBrush(*color))
+                    self.p2.addItem(sc)
+                    self._p2_scatters.append((sc, size))
+
+        self._render_selection_border()   # dotted rect around the selected distribution
         self._rescale_points()
 
     def on_panel2_dist_clicked(self, _scatter, points):
@@ -1375,7 +1820,8 @@ class MSViewerTab(QMainWindow):
         did = points[0].data()
         if did is None:
             return
-        self.current["distribution_id"] = did
+        # Select it: dotted border + charge-search anchor (no view move on click).
+        self._set_selected(did)
         # Selecting an MS1 distribution returns panel 3 to its MS1 view.
         self._panel3_mode = "ms1"
         self._ms2_scan = None
@@ -1661,11 +2107,148 @@ class MSViewerTab(QMainWindow):
     def _fill_table1(self, rows):
         self.table1.setRowCount(len(rows))
         for i, row in enumerate(rows):
-            for j, (field, _) in enumerate(LINE_METRIC_COLUMNS):
-                value = row.get(field, "")
-                if isinstance(value, float):
-                    value = f"{value:.4g}"
-                self.table1.setItem(i, j, QTableWidgetItem(str(value)))
+            for j, (field, _, kind) in enumerate(LINE_METRIC_COLUMNS):
+                self.table1.setItem(i, j, QTableWidgetItem(_fmt(row.get(field), kind)))
+
+    # ---- table-1 tabs: lines / distributions / charge distributions -------
+
+    def reset_table1_tabs(self):
+        """Forget loaded tab data (call when the file/db changes)."""
+        self._table1_loaded = set()
+        if getattr(self, "dists_model", None) is not None:
+            self.dists_model.set_rows([])
+            self.charge_model.set_rows([])
+        if getattr(self, "table1_tabs", None) is not None:
+            self._on_table1_tab_changed(self.table1_tabs.currentIndex())
+
+    def _reload_current_tab(self):
+        """'All' button: reload the full list for whichever tab is active."""
+        if self.db is None or getattr(self, "table1_tabs", None) is None:
+            return
+        name = self.table1_tabs.tabText(self.table1_tabs.currentIndex())
+        if name == "distributions":
+            self.dists_model.set_rows(self.db.all_distributions())
+            self._table1_loaded.add("distributions")
+        elif name == "charge distributions":
+            self.charge_model.set_rows(self.db.all_analytes_multicharge())
+            self._table1_loaded.add("charge distributions")
+
+    def _on_table1_tab_changed(self, index):
+        if getattr(self, "table1_tabs", None) is None or self.db is None:
+            return
+        name = self.table1_tabs.tabText(index)
+        if name in self._table1_loaded:
+            return
+        if name == "distributions":
+            self.dists_model.set_rows(self.db.all_distributions())
+        elif name == "charge distributions":
+            self.charge_model.set_rows(self.db.all_analytes_multicharge())
+        else:
+            return
+        self._table1_loaded.add(name)
+
+    def _jump_to(self, mz_center, rt, distribution_id=None):
+        """Centre panels 1 & 2 on (m/z, RT) and optionally select a distribution."""
+        if not self.current_file or mz_center is None or rt is None:
+            return
+        filename = self.current_file
+        if not isinstance(self.current, dict) or self.current.get("filename") != filename:
+            self.current = {
+                "row": {}, "filename": filename, "scan": "",
+                "charge": None, "neutral_mass": None, "rt": rt,
+                "targets": [], "mz_center": mz_center,
+                "centroid": self.centroid_store(filename),
+                "profile": self.profile_store(filename),
+                "points": self.points_store(filename),
+            }
+        self.current["mz_center"] = mz_center
+        self.current["rt"] = rt
+        self.current["distribution_id"] = distribution_id
+        self._panel3_mode = "ms1"
+        self._ms2_scan = None
+        # Select it first so the dotted border + bbox are ready when panel 2
+        # redraws after the window move.
+        if distribution_id is not None:
+            self._set_selected(distribution_id)
+        else:
+            self._clear_selection()
+        rt_start = max(0.0, rt - self.rt_half)
+        rt_end = rt + self.rt_half
+        self.set_window([mz_center - self.mz_half, mz_center + self.mz_half, rt_start, rt_end],
+                        set_view=True)
+        if distribution_id is not None:
+            try:
+                self.table1_for_distribution(distribution_id)
+            except Exception:
+                pass
+            self.draw_panel3_ms1(self.current, getattr(self, "_last_scan_mz", None),
+                                 getattr(self, "_last_scan_int", None))
+
+    def _tab_index(self, name):
+        for i in range(self.table1_tabs.count()):
+            if self.table1_tabs.tabText(i) == name:
+                return i
+        return -1
+
+    def _on_distribution_activated(self, row):
+        # double-click a distribution -> show its lines (current tab) and jump
+        if not row:
+            return
+        self.table1_tabs.setCurrentIndex(self._tab_index("current"))
+        self._jump_to(row.get("mono_mz"), row.get("rt_apex"), row.get("distribution_id"))
+
+    def _on_charge_activated(self, row):
+        # double-click a charge distribution -> open ALL its member distributions
+        # in the distributions tab and jump panels 1/2 to the analyte.
+        if not row or self.db is None:
+            return
+        members = self.db.analyte_distributions(row.get("analyte_id"))
+        self.dists_model.set_rows(members)
+        self.table1_tabs.setCurrentIndex(self._tab_index("distributions"))
+        # jump to a representative member (highest n_members, else first)
+        rep = max(members, key=lambda d: d.get("n_members", 0)) if members else None
+        if rep is not None:
+            self._jump_to(rep.get("mono_mz"), rep.get("rt_apex"), rep.get("distribution_id"))
+
+    # single click in a list -> load that distribution into panel 3 (no window
+    # move; double-click still jumps panels 1/2).
+    def _ensure_current_for_file(self):
+        if not self.current_file:
+            return False
+        if not isinstance(self.current, dict) or self.current.get("filename") != self.current_file:
+            self.current = {
+                "row": {}, "filename": self.current_file, "scan": "",
+                "charge": None, "neutral_mass": None, "rt": None,
+                "targets": [], "mz_center": 500.0,
+                "centroid": self.centroid_store(self.current_file),
+                "profile": self.profile_store(self.current_file),
+                "points": self.points_store(self.current_file),
+            }
+        return True
+
+    def _show_distribution_in_panel3(self, distribution_id):
+        if distribution_id is None or self.db is None or not self._ensure_current_for_file():
+            return
+        self._set_selected(distribution_id)
+        self._panel3_mode = "ms1"
+        self._ms2_scan = None
+        try:
+            self.table1_for_distribution(distribution_id)
+        except Exception:
+            pass
+        self.draw_panel3_ms1(self.current, getattr(self, "_last_scan_mz", None),
+                             getattr(self, "_last_scan_int", None))
+
+    def _on_dist_clicked(self, index):
+        row = self.dists_model.row_dict(self.dists_view.model().mapToSource(index).row())
+        if row:
+            # loads panel 3 + fills the 'current' tab with this distribution's lines
+            self._show_distribution_in_panel3(row.get("distribution_id"))
+
+    def _on_charge_clicked(self, index):
+        row = self.charge_model.row_dict(self.charge_view.model().mapToSource(index).row())
+        if row:
+            self._show_distribution_in_panel3(row.get("rep_distribution_id"))
 
     # ---- panel 3 charge-comparison grid ----------------------------------
 
@@ -1742,7 +2325,10 @@ class MSViewerTab(QMainWindow):
 
         points = getattr(self, "_last_points", None)
         self._grid_cells = {}
+        row_first = {}   # row index -> leftmost cell (owns the shared y-axis labels)
         fg = palette(self.theme)["fg"]
+
+        last_row = len(self.CHARGE_ROW_LABELS) - 1
 
         def cell(ri, ci):
             p = self.p3_grid.addPlot(row=ri, col=ci)
@@ -1759,20 +2345,58 @@ class MSViewerTab(QMainWindow):
                 ax.setPen(pg.mkPen(fg)); ax.setTextPen(pg.mkPen(fg))
                 ax.enableAutoSIPrefix(False)   # no "1e6"-style SI prefixes
             if ri == 0:
-                p.setTitle(f"z={charges[ci]}", color=fg)
+                d = group[charges[ci]].get("distribution") or {}
+                badge = " ⚠" if d.get("status") == "ambiguous" else ""
+                iso = d.get("iso_score")
+                extra = f"  iso {iso:.2f}" if iso is not None else ""
+                p.setTitle(f"z={charges[ci]}{badge}{extra}", color=fg)
+
+            # Y axis: only the leftmost column carries the axis (labels + values);
+            # the other columns get a ZERO-width axis so there's no empty gap
+            # between plots. Equal stretch over the remaining space keeps the
+            # plots themselves the same width, and the left labels stay put.
             if ci == 0:
+                left.setWidth(54)
+                row_first[ri] = p
                 p.setLabel("left", self.CHARGE_ROW_LABELS[ri], color=fg)
-            left.setWidth(54)
-            # Every cell shows exactly 3 y ticks (bottom / middle / top of its
-            # current range), updated live as the range changes.
-            def _ticks(*_args, ax=left, vb=vb):
-                # NB: sigYRangeChanged passes (viewbox, range) positionally, so
-                # swallow all positional args and keep ax/vb as keyword defaults.
-                (y0, y1) = vb.viewRange()[1]
-                mid = (y0 + y1) / 2.0
-                ax.setTicks([[(y0, f"{y0:.3g}"), (mid, f"{mid:.3g}"), (y1, f"{y1:.3g}")]])
-            vb.sigYRangeChanged.connect(_ticks)
-            p._tick_updater = _ticks
+                # Ticks are inset from the view edges (pyqtgraph clips edge labels,
+                # which is why only one value showed). 2 values (top, middle) for a
+                # zero-baseline bar row; 3 (top, middle, bottom) otherwise.
+                zero = ri in self.GRID_ZERO_ROWS
+
+                def _ticks(*_args, ax=left, vb=vb, zero=zero):
+                    (y0, y1) = vb.viewRange()[1]
+                    span = y1 - y0
+                    if span <= 0:
+                        return
+                    top = y0 + 0.92 * span
+                    mid = y0 + 0.50 * span
+                    ticks = [(top, _gtick(top)), (mid, _gtick(mid))]
+                    if not zero:
+                        ticks.append((y0 + 0.08 * span, _gtick(y0 + 0.08 * span)))
+                    ax.setTicks([ticks])
+
+                vb.sigYRangeChanged.connect(_ticks)
+                p._tick_updater = _ticks
+            else:
+                left.setStyle(showValues=False)
+                left.setWidth(0)                  # no empty axis -> no inter-column gap
+                if ri in row_first:
+                    p.setYLink(row_first[ri])
+
+            # X axis: only the bottom row shows m/z values (3 ticks, no squish);
+            # every other row hides its x labels to reclaim vertical space.
+            if ri == last_row:
+                def _xticks(*_args, ax=bottom, vb=vb):
+                    (x0, x1) = vb.viewRange()[0]
+                    xm = (x0 + x1) / 2.0
+                    ax.setTicks([[(x0, f"{x0:.2f}"), (xm, f"{xm:.2f}"), (x1, f"{x1:.2f}")]])
+
+                vb.sigXRangeChanged.connect(_xticks)
+                p._xtick_updater = _xticks
+            else:
+                bottom.setStyle(showValues=False)
+                bottom.setHeight(6)         # reclaim vertical space
             self._grid_cells[(ri, ci)] = p
             return p
 
@@ -1907,6 +2531,9 @@ class MSViewerTab(QMainWindow):
         # column's plots are wider than another's.
         try:
             glayout = self.p3_grid.ci.layout
+            glayout.setHorizontalSpacing(0)   # tight gaps -> reclaim blank space
+            glayout.setVerticalSpacing(1)
+            glayout.setContentsMargins(2, 2, 2, 2)
             for ci in range(len(charges)):
                 glayout.setColumnStretchFactor(ci, 1)
                 glayout.setColumnPreferredWidth(ci, 0)
@@ -1915,11 +2542,19 @@ class MSViewerTab(QMainWindow):
         # Fit synchronously from the items' data (no deferred pass), so the grid
         # opens directly in the right state -- the deferred reset was causing a
         # one-frame flicker through the wrong auto-fit.
+        # Remove the outline border on every bar and force full opacity so the
+        # true colour reads cleanly at any zoom.
+        for p in self._grid_cells.values():
+            for it in p.items:
+                if isinstance(it, pg.BarGraphItem):
+                    it.setOpts(pen=None)
         self._fit_grid_cols()
         self._fit_grid_rows()
         for p in self._grid_cells.values():
             if hasattr(p, "_tick_updater"):
                 p._tick_updater()
+            if hasattr(p, "_xtick_updater"):
+                p._xtick_updater()
 
     # Non-negative bar rows glued to a 0 baseline (peak area, cross-charge,
     # intensity sum %): y starts at 0 at the bottom, like the MS2 spectrum.
@@ -2047,8 +2682,7 @@ class MSViewerTab(QMainWindow):
     # ---- toggles + sync --------------------------------------------------
 
     def toggle_dimension(self):
-        to_3d = self.dim_toggle.isChecked()
-        self.dim_toggle.setText("2D" if to_3d else "3D")
+        to_3d = self.dim_toggle.key() == "3D"
         self.p1_stack.setCurrentIndex(1 if to_3d else 0)
         self.reset3d_button.setEnabled(to_3d and HAVE_GL)
         # Build the 3D view lazily on first switch (it's skipped while 2D shows).
@@ -2070,6 +2704,107 @@ class MSViewerTab(QMainWindow):
     def set_rt_half(self, value):
         self.rt_half = float(value)
         self._recenter_window()
+
+    # ---- distribution selection + dotted border --------------------------
+
+    def _set_selected(self, distribution_id, keep_group=False):
+        """Mark a distribution as selected: update the charge-search anchor
+        (current charge/mass/RT) to it, cache its analyte's charge group, and
+        compute its bounding box for the dotted border. Does not move the view."""
+        if self.db is None or distribution_id is None:
+            return
+        dist = self.db.distribution(distribution_id)
+        if dist is None:
+            return
+        members = self.db.distribution_members(distribution_id)
+        if isinstance(self.current, dict):
+            self.current["distribution_id"] = distribution_id
+            self.current["charge"] = dist.get("charge")
+            self.current["neutral_mass"] = dist.get("neutral_mass")
+            self.current["rt"] = dist.get("rt_apex")
+        self.assumed_charge = dist.get("charge")
+        self._border_color = None   # a real distribution -> normal (fg) border
+        if members:
+            self._selected_bbox = (
+                min(m["mz_min"] for m in members),
+                max(m["mz_max"] for m in members),
+                min(m["rt_start"] for m in members),
+                max(m["rt_end"] for m in members),
+            )
+            self._selected_rt_band = (self._selected_bbox[2], self._selected_bbox[3])
+            self._selected_n_members = len(members)
+        else:
+            self._selected_bbox = None
+        if not keep_group:
+            self._selected_charge_group = self.db.charge_group(distribution_id)
+        self._selected_dist_id = distribution_id
+        self._render_selection_border()
+
+    def _set_hypothetical(self, charge):
+        """Show a RED dotted box where the distribution at `charge` *would* sit if
+        it existed: the theoretical isotope m/z span at the selection's neutral
+        mass, over the analyte's RT band. Auto-fits to it like a real lock-on."""
+        nm = self.current.get("neutral_mass") if isinstance(self.current, dict) else None
+        if nm is None:
+            self._clear_selection()
+            self._recenter_for_charge()
+            return
+        n = self._selected_n_members or 6
+        mzs = isotope_mzs(nm, max(1, charge), n=n)
+        if not mzs:
+            self._clear_selection()
+            self._recenter_for_charge()
+            return
+        if self._selected_rt_band is not None:
+            y0, y1 = self._selected_rt_band
+        elif self.window is not None:
+            y0, y1 = self.window[2], self.window[3]
+        else:
+            y0, y1 = 0.0, 1.0
+        self._selected_bbox = (min(mzs), max(mzs), y0, y1)
+        self._border_color = "red"
+        self._selected_dist_id = None
+        self._fit_to_selected()
+
+    def _clear_selection(self):
+        self._selected_bbox = None
+        self._render_selection_border()
+
+    def _render_selection_border(self):
+        """Draw (or refresh) the dotted rectangle around the selected
+        distribution on panel 2. A standalone item so it survives without a full
+        redraw; draw_panel2 re-adds it after its clear()."""
+        if getattr(self, "_sel_border_item", None) is not None:
+            try:
+                self.p2.removeItem(self._sel_border_item)
+            except Exception:
+                pass
+            self._sel_border_item = None
+        bbox = getattr(self, "_selected_bbox", None)
+        if bbox is None:
+            return
+        x0, x1, y0, y1 = bbox
+        px = (x1 - x0) * 0.04 + 1e-4
+        py = (y1 - y0) * 0.04 + 1e-4
+        xs = np.array([x0 - px, x1 + px, x1 + px, x0 - px, x0 - px])
+        ys = np.array([y0 - py, y0 - py, y1 + py, y1 + py, y0 - py])
+        color = (230, 70, 70) if self._border_color == "red" else palette(self.theme)["fg"]
+        pen = pg.mkPen(color=color, width=1.4, style=Qt.DashLine)
+        item = pg.PlotCurveItem(xs, ys, pen=pen)
+        item.setZValue(50)
+        self.p2.addItem(item)
+        self._sel_border_item = item
+
+    def _fit_to_selected(self):
+        """Auto-fit panels 1 & 2 to the selected distribution's bounding box so it
+        sits centred and fully framed (the charge-search lock-on)."""
+        bbox = getattr(self, "_selected_bbox", None)
+        if bbox is None:
+            return
+        x0, x1, y0, y1 = bbox
+        mzpad = (x1 - x0) * 0.18 + 0.05
+        rtpad = (y1 - y0) * 0.30 + 0.02
+        self.set_window([x0 - mzpad, x1 + mzpad, max(0.0, y0 - rtpad), y1 + rtpad], set_view=True)
 
     # ---- charge search + navigation history ------------------------------
 
@@ -2093,8 +2828,23 @@ class MSViewerTab(QMainWindow):
     def charge_step(self, delta):
         if self.current is None:
             return
-        self.assumed_charge = max(1, (self.assumed_charge or self.current.get("charge") or 1) + delta)
-        self._recenter_for_charge()
+        step = 1 if delta > 0 else -1
+        base = self.current.get("charge") or self.assumed_charge or 1
+        target = max(1, base + step)
+        grp = getattr(self, "_selected_charge_group", None)
+        # If the selected distribution's analyte has a distribution at the target
+        # charge, lock onto it: transfer the dotted border and auto-fit to it.
+        if grp and target in grp and grp[target].get("distribution"):
+            did = grp[target]["distribution"]["distribution_id"]
+            self._set_selected(did, keep_group=True)
+            self._fit_to_selected()
+            return
+        # Otherwise no distribution exists at this charge: show a RED box where the
+        # hypothetical distribution would be, and fit to it.
+        self.assumed_charge = target
+        if isinstance(self.current, dict):
+            self.current["charge"] = target
+        self._set_hypothetical(target)
 
     def set_charge(self, z):
         if self.current is None:
