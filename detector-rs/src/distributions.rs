@@ -10,6 +10,7 @@ const AVERAGINE_LAMBDA_PER_DA: f64 = 0.000594;
 const MAX_ISOTOPE_GAP: i64 = 2;
 const MAX_OFFSET_SEARCH: i64 = 3;
 const MAX_Q: i64 = 2;
+const MERGE_MAX_INDEX_GAP: i64 = 2;
 
 pub struct Features {
     pub mz: Vec<f64>,
@@ -458,6 +459,12 @@ fn grow_lattice(f: &Features, cfg: &Config, seed: usize, z: i64) -> std::collect
     for &direction in &[1i64, -1i64] {
         let mut misses = 0;
         let mut k = direction;
+        // Reference for the shape gate: the nearest already-occupied member in
+        // the growth direction (seed to start). A wide envelope's far isotopes
+        // correlate more with their neighbour than with the seed, so gating
+        // purely on similarity-to-seed skips real internal members and fragments
+        // the envelope. Accept a rung coherent with the seed OR that neighbour.
+        let mut last = seed;
         while misses <= MAX_ISOTOPE_GAP {
             let target = seed_mz + k as f64 * spacing;
             if target <= 0.0 {
@@ -469,7 +476,7 @@ fn grow_lattice(f: &Features, cfg: &Config, seed: usize, z: i64) -> std::collect
                 if used.contains(&j) || !f.coelutes(seed, j) {
                     continue;
                 }
-                let sim = f.coelution_score(cfg, seed, j);
+                let sim = f.coelution_score(cfg, seed, j).max(f.coelution_score(cfg, last, j));
                 if sim >= best_sim {
                     best_sim = sim;
                     best_j = Some(j);
@@ -479,6 +486,7 @@ fn grow_lattice(f: &Features, cfg: &Config, seed: usize, z: i64) -> std::collect
                 Some(j) => {
                     occupied.insert(k, j);
                     used.insert(j);
+                    last = j;
                     misses = 0;
                 }
                 None => misses += 1,
@@ -663,34 +671,181 @@ pub fn build_distributions(f: &Features, cfg: &Config) -> Vec<DistRow> {
 /// features. Recovered rows are tagged status='recovered'; ids assigned after the
 /// merge. Mirrors envelope.build_distributions_two_pass.
 pub fn build_distributions_two_pass(f: &Features, cfg: &Config) -> Vec<DistRow> {
-    let mut primary = build_rows(f, cfg);
-    if !cfg.enable_recovery {
-        return finalize(primary);
-    }
-    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for r in &primary {
-        for m in &r.members {
-            claimed.insert(m.feature_id);
+    let mut rows = build_rows(f, cfg);
+    if cfg.enable_recovery {
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for r in &rows {
+            for m in &r.members {
+                claimed.insert(m.feature_id);
+            }
+        }
+        let leftover: Vec<usize> = (0..f.mz.len()).filter(|i| !claimed.contains(i)).collect();
+        if !leftover.is_empty() {
+            let sub = f.subset(&leftover);
+            let mut relaxed = cfg.clone();
+            relaxed.min_trace_similarity = cfg.recover_min_trace_similarity;
+            relaxed.min_envelope_score = cfg.recover_min_envelope_score;
+            relaxed.short_trace_fallback = true;
+            let mut rec = build_rows(&sub, &relaxed);
+            for r in rec.iter_mut() {
+                r.status = "recovered".to_string();
+                for m in r.members.iter_mut() {
+                    m.feature_id = leftover[m.feature_id]; // sub-index -> original feature_id
+                }
+            }
+            rows.extend(rec);
         }
     }
-    let leftover: Vec<usize> = (0..f.mz.len()).filter(|i| !claimed.contains(i)).collect();
-    if leftover.is_empty() {
-        return finalize(primary);
+    rows = merge_collinear_distributions(f, cfg, rows);
+    finalize(rows)
+}
+
+fn rows_coelute(a: &DistRow, b: &DistRow, cfg: &Config) -> bool {
+    let overlap = a.rt_end.min(b.rt_end) - a.rt_start.max(b.rt_start);
+    if overlap <= 0.0 {
+        return false;
     }
-    let sub = f.subset(&leftover);
-    let mut relaxed = cfg.clone();
-    relaxed.min_trace_similarity = cfg.recover_min_trace_similarity;
-    relaxed.min_envelope_score = cfg.recover_min_envelope_score;
-    relaxed.short_trace_fallback = true;
-    let mut rec = build_rows(&sub, &relaxed);
-    for r in rec.iter_mut() {
-        r.status = "recovered".to_string();
-        for m in r.members.iter_mut() {
-            m.feature_id = leftover[m.feature_id]; // sub-index -> original feature_id
+    let width = (a.rt_end - a.rt_start).max(b.rt_end - b.rt_start).max(1e-9);
+    let allowed = cfg.max_apex_shift.max(cfg.max_apex_shift_width_fraction * width);
+    (a.rt_apex - b.rt_apex).abs() <= allowed
+}
+
+fn same_lattice(a: &DistRow, b: &DistRow, cfg: &Config) -> bool {
+    if a.charge != b.charge {
+        return false;
+    }
+    let spacing = C13_DELTA / a.charge as f64;
+    let dmz = b.mono_mz - a.mono_mz;
+    let k = (dmz / spacing).round();
+    let tol = cfg.isotope_mz_abs.max(b.mono_mz * cfg.isotope_mz_ppm / 1_000_000.0);
+    (dmz - k * spacing).abs() <= tol
+}
+
+/// Stitch collinear, coeluting fragments of one envelope into a single
+/// continuous distribution. Mirrors envelope.merge_collinear_distributions.
+fn merge_collinear_distributions(f: &Features, cfg: &Config, rows: Vec<DistRow>) -> Vec<DistRow> {
+    let n = rows.len();
+    if n < 2 {
+        return rows;
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+
+    let mut by_charge: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        by_charge.entry(r.charge).or_default().push(i);
+    }
+    for (z, mut idxs) in by_charge {
+        let spacing = C13_DELTA / z as f64;
+        let window = (MERGE_MAX_INDEX_GAP + 8) as f64 * spacing;
+        idxs.sort_by(|&a, &b| rows[a].mono_mz.partial_cmp(&rows[b].mono_mz).unwrap());
+        for ai in 0..idxs.len() {
+            let a = idxs[ai];
+            for &b in idxs.iter().skip(ai + 1) {
+                if rows[b].mono_mz - rows[a].mono_mz > window {
+                    break;
+                }
+                if find(&mut parent, a) == find(&mut parent, b) {
+                    continue;
+                }
+                if same_lattice(&rows[a], &rows[b], cfg) && rows_coelute(&rows[a], &rows[b], cfg) {
+                    let ra = find(&mut parent, a);
+                    let rb = find(&mut parent, b);
+                    parent[rb] = ra;
+                }
+            }
         }
     }
-    primary.extend(rec);
-    finalize(primary)
+
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+
+    let mut out: Vec<DistRow> = Vec::new();
+    for (_, members_idx) in groups {
+        if members_idx.len() == 1 {
+            out.push(rows[members_idx[0]].clone());
+            continue;
+        }
+        let frags: Vec<&DistRow> = members_idx.iter().map(|&i| &rows[i]).collect();
+        match try_merge_group(f, cfg, &frags) {
+            Some(merged) => out.push(merged),
+            None => {
+                for &i in &members_idx {
+                    out.push(rows[i].clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn try_merge_group(f: &Features, cfg: &Config, frags: &[&DistRow]) -> Option<DistRow> {
+    let z = frags[0].charge;
+    let spacing = C13_DELTA / z as f64;
+    let anchor = frags.iter().map(|r| r.mono_mz).fold(f64::INFINITY, f64::min);
+
+    // larger fragments first so they win any (rare) lattice-index collision
+    let mut ordered: Vec<&DistRow> = frags.to_vec();
+    ordered.sort_by(|a, b| b.n_members.cmp(&a.n_members));
+    let mut occupied: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    for frag in ordered {
+        for m in &frag.members {
+            let rel = ((f.mz[m.feature_id] - anchor) / spacing).round() as i64;
+            occupied.entry(rel).or_insert(m.feature_id);
+        }
+    }
+    if occupied.is_empty() {
+        return None;
+    }
+    let span = occupied.keys().next_back().unwrap() - occupied.keys().next().unwrap() + 1;
+    if span > occupied.len() as i64 + MERGE_MAX_INDEX_GAP {
+        return None;
+    }
+    let s = score_envelope(f, cfg, &occupied, z)?;
+    if s.total < cfg.min_envelope_score {
+        return None;
+    }
+    let non_recovered = frags.iter().any(|r| r.status != "recovered");
+    let status = if non_recovered { "validated" } else { "recovered" }.to_string();
+    let ambiguity = frags.iter().map(|r| r.ambiguity_score).fold(f64::INFINITY, f64::min);
+
+    let fids: Vec<usize> = s.members.iter().map(|m| m.feature_id).collect();
+    let apex = *fids.iter().max_by(|&&a, &&b| f.height[a].partial_cmp(&f.height[b]).unwrap()).unwrap();
+    Some(DistRow {
+        distribution_id: -1,
+        charge: z,
+        neutral_mass: s.neutral_mass,
+        mono_mz: s.mono_mz,
+        rt_start: fids.iter().map(|&p| f.rt_start[p]).fold(f64::INFINITY, f64::min),
+        rt_apex: f.rt_apex[apex],
+        rt_end: fids.iter().map(|&p| f.rt_end[p]).fold(f64::NEG_INFINITY, f64::max),
+        ms1_start: fids.iter().map(|&p| f.ms1_start[p]).min().unwrap(),
+        ms1_apex: f.ms1_apex[apex],
+        ms1_end: fids.iter().map(|&p| f.ms1_end[p]).max().unwrap(),
+        n_members: fids.len() as i64,
+        score: s.total,
+        quality: s.total,
+        mz_score: s.mz_score,
+        iso_score: s.iso_score,
+        trace_score: s.trace_score,
+        missing_score: s.missing_score,
+        interloper_score: s.interloper_score,
+        mono_offset: s.mono_offset,
+        n_missing_interior: s.missing_interior,
+        n_interlopers: s.interlopers,
+        ambiguity_score: ambiguity,
+        status,
+        members: s.members.clone(),
+    })
 }
 
 fn finalize(mut rows: Vec<DistRow>) -> Vec<DistRow> {

@@ -42,6 +42,7 @@ AVERAGINE_LAMBDA_PER_DA = 0.000594  # Poisson mean of the averagine isotope mode
 MAX_ISOTOPE_GAP = 2     # consecutive missing rungs tolerated while growing
 MAX_OFFSET_SEARCH = 3   # monoisotope offsets (M+0..M+3) considered for the first rung
 MAX_Q = 2               # isotope-index gap considered when deriving charge from a pair
+MERGE_MAX_INDEX_GAP = 2  # holes tolerated when stitching collinear fragments into one envelope
 
 
 def averagine_envelope(neutral_mass, n_peaks):
@@ -244,6 +245,14 @@ def grow_lattice(ctx, seed, z):
     for direction in (1, -1):
         misses = 0
         k = direction
+        # The reference for the shape gate is the nearest already-occupied member
+        # in the growth direction (the seed to start). A wide envelope's far
+        # isotopes correlate more with their NEIGHBOUR than with the seed, so
+        # gating purely on similarity-to-seed skips real internal members and
+        # fragments the envelope. We accept a rung if it is coherent with the seed
+        # OR with that nearest occupied neighbour; the seed RT-overlap gate,
+        # averagine fit and interloper penalty still bound the growth.
+        last = seed
         while misses <= MAX_ISOTOPE_GAP:
             target = seed_mz + k * spacing
             if target <= 0:
@@ -254,7 +263,7 @@ def grow_lattice(ctx, seed, z):
                     continue
                 if not ctx.coelutes(seed, j):
                     continue
-                sim = ctx.coelution_score(seed, j)
+                sim = max(ctx.coelution_score(seed, j), ctx.coelution_score(last, j))
                 if sim >= best_sim:
                     best_sim = sim
                     best_j = j
@@ -262,6 +271,7 @@ def grow_lattice(ctx, seed, z):
                 misses += 1
             else:
                 occupied[k] = best_j
+                last = best_j
                 misses = 0
             k += direction
     return occupied
@@ -406,6 +416,159 @@ def min_members_for_charge(charge, cfg):
     return cfg["min_distribution_members"]
 
 
+def _rows_coelute(a, b, cfg):
+    overlap = min(a["rt_end"], b["rt_end"]) - max(a["rt_start"], b["rt_start"])
+    if overlap <= 0:
+        return False
+    width = max(a["rt_end"] - a["rt_start"], b["rt_end"] - b["rt_start"], 1e-9)
+    allowed = max(cfg.get("max_apex_shift", 0.15),
+                  cfg.get("max_apex_shift_width_fraction", 0.5) * width)
+    return abs(a["rt_apex"] - b["rt_apex"]) <= allowed
+
+
+def _same_lattice(a, b, cfg):
+    """True if a and b are the same charge and their monoisotopes sit on the same
+    isotope lattice (mono m/z differ by an integer number of C13/z steps)."""
+    z = a["charge"]
+    if b["charge"] != z:
+        return False
+    spacing = C13_DELTA / z
+    dmz = b["mono_mz"] - a["mono_mz"]
+    k = round(dmz / spacing)
+    tol = max(cfg["isotope_mz_abs"], b["mono_mz"] * cfg["isotope_mz_ppm"] / 1_000_000.0)
+    return abs(dmz - k * spacing) <= tol
+
+
+def merge_collinear_distributions(ctx, rows, config_dict):
+    """Stitch fragments of one envelope back together.
+
+    A real isotope envelope must be a single distribution. Growth/competition can
+    still split one envelope into two distributions that lie on the SAME charge
+    lattice and coelute (e.g. a strict primary catches iso 0-3,6 while the
+    recovery pass picks up iso 4,5). This merges any such collinear, coeluting
+    pair: union their member features, re-fit the whole envelope, and keep the
+    merged result only if it is genuinely near-continuous and still scores above
+    the envelope floor (otherwise the fragments are left untouched). Conservative
+    by construction -- it never merges different charges, non-coeluting peaks, or
+    unions that would be mostly holes.
+    """
+    n = len(rows)
+    if n < 2:
+        return rows
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Candidate pairs: same charge, mono m/z within a small window, sorted sweep.
+    by_charge = {}
+    for i, row in enumerate(rows):
+        by_charge.setdefault(row["charge"], []).append(i)
+    for z, idxs in by_charge.items():
+        spacing = C13_DELTA / z
+        window = (MERGE_MAX_INDEX_GAP + 8) * spacing  # a few isotope steps of reach
+        idxs.sort(key=lambda i: rows[i]["mono_mz"])
+        for ai in range(len(idxs)):
+            a = idxs[ai]
+            for bi in range(ai + 1, len(idxs)):
+                b = idxs[bi]
+                if rows[b]["mono_mz"] - rows[a]["mono_mz"] > window:
+                    break
+                if find(a) == find(b):
+                    continue
+                if _same_lattice(rows[a], rows[b], config_dict) and _rows_coelute(rows[a], rows[b], config_dict):
+                    union(a, b)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    out = []
+    for members_idx in groups.values():
+        if len(members_idx) == 1:
+            out.append(rows[members_idx[0]])
+            continue
+        merged = _try_merge_group(ctx, [rows[i] for i in members_idx], config_dict)
+        if merged is None:
+            out.extend(rows[i] for i in members_idx)  # merge rejected: keep fragments
+        else:
+            out.append(merged)
+    return out
+
+
+def _try_merge_group(ctx, frags, cfg):
+    """Build one envelope from a group of collinear fragments; None if the union
+    is too gappy or scores below the envelope floor (keep fragments instead)."""
+    z = frags[0]["charge"]
+    spacing = C13_DELTA / z
+    anchor = min(f["mono_mz"] for f in frags)
+
+    # Map every member feature onto the shared lattice; larger fragments first so
+    # they win any (rare) index collision.
+    occupied = {}
+    for frag in sorted(frags, key=lambda f: -f["n_members"]):
+        for m in frag["members"]:
+            fid = m["feature_id"]
+            rel = int(round((ctx.mz[fid] - anchor) / spacing))
+            occupied.setdefault(rel, fid)
+
+    if not occupied:
+        return None
+    span = max(occupied) - min(occupied) + 1
+    if span > len(occupied) + MERGE_MAX_INDEX_GAP:
+        return None  # union is mostly holes -> not one envelope; keep fragments
+
+    scored = score_envelope(ctx, occupied, z)
+    if scored is None:
+        return None
+    ev, members = scored
+    if ev["total"] < cfg.get("min_envelope_score", 0.45):
+        return None  # merged fit is worse than the floor -> keep fragments
+
+    # A merged envelope that includes any validated/ambiguous fragment is itself a
+    # confident call; only an all-recovered merge stays in the recovered tier.
+    non_recovered = [f for f in frags if f.get("status") != "recovered"]
+    status = "validated" if non_recovered else "recovered"
+
+    fids = [m["feature_id"] for m in members]
+    path = np.asarray(fids, dtype=np.int64)
+    apex_fid = int(path[np.argmax(ctx.height[path])])
+    return {
+        "charge": int(z),
+        "neutral_mass": ev["neutral_mass"],
+        "mono_mz": ev["mono_mz"],
+        "rt_start": float(np.min(ctx.rt_start[path])),
+        "rt_apex": float(ctx.rt_apex[apex_fid]),
+        "rt_end": float(np.max(ctx.rt_end[path])),
+        "ms1_start": int(np.min(ctx.ms1_start[path])),
+        "ms1_apex": int(ctx.ms1_apex[apex_fid]),
+        "ms1_end": int(np.max(ctx.ms1_end[path])),
+        "n_members": len(fids),
+        "score": ev["total"],
+        "quality": ev["total"],
+        "mz_score": ev["mz_score"],
+        "iso_score": ev["iso_score"],
+        "trace_score": ev["trace_score"],
+        "missing_score": ev["missing_score"],
+        "interloper_score": ev["interloper_score"],
+        "mono_offset": ev["mono_offset"],
+        "n_missing_interior": ev["n_missing_interior"],
+        "n_interlopers": ev["n_interlopers"],
+        "ambiguity_score": min(f.get("ambiguity_score", 0.0) for f in frags),
+        "status": status,
+        "members": members,
+    }
+
+
 def build_distributions_two_pass(features, traces, config_dict, progress=False):
     """Primary envelope pass + a relaxed recovery pass on the leftovers.
 
@@ -415,36 +578,40 @@ def build_distributions_two_pass(features, traces, config_dict, progress=False):
     coelution fallback, recovering weaker/shorter envelopes that are visually
     obvious in m/z-vs-RT but too faint for the strict pass. Recovered rows carry
     status='recovered' so they stay a separate, opt-in confidence tier.
+
+    Finally a merge pass stitches any collinear, coeluting fragments of one
+    envelope (across both passes) back into a single continuous distribution.
     """
     primary = build_distributions_envelope(features, traces, config_dict, progress=progress)
+    rows = primary
 
-    if not config_dict.get("enable_recovery", True):
-        return primary
+    if config_dict.get("enable_recovery", True):
+        claimed = {m["feature_id"] for row in primary for m in row["members"]}
+        leftover = [i for i in range(len(features)) if i not in claimed]
+        if leftover:
+            sub_features = [features[i] for i in leftover]
+            sub_traces = [traces[i] for i in leftover]
+            relaxed = dict(config_dict)
+            relaxed["min_trace_similarity"] = config_dict.get("recover_min_trace_similarity", 0.3)
+            relaxed["min_envelope_score"] = config_dict.get("recover_min_envelope_score", 0.30)
+            relaxed["short_trace_fallback"] = True
+            rec_rows = build_distributions_envelope(sub_features, sub_traces, relaxed, progress=progress)
+            for row in rec_rows:
+                row["status"] = "recovered"
+                for m in row["members"]:
+                    m["feature_id"] = leftover[m["feature_id"]]  # sub-index -> original feature_id
+            if progress:
+                print(f"recovery leftover_features={len(leftover)} recovered={len(rec_rows)}",
+                      file=__import__("sys").stderr, flush=True)
+            rows = primary + rec_rows
 
-    claimed = {m["feature_id"] for row in primary for m in row["members"]}
-    leftover = [i for i in range(len(features)) if i not in claimed]
-    if not leftover:
-        return primary
-
-    sub_features = [features[i] for i in leftover]
-    sub_traces = [traces[i] for i in leftover]
-
-    relaxed = dict(config_dict)
-    relaxed["min_trace_similarity"] = config_dict.get("recover_min_trace_similarity", 0.3)
-    relaxed["min_envelope_score"] = config_dict.get("recover_min_envelope_score", 0.30)
-    relaxed["short_trace_fallback"] = True
-
-    rec_rows = build_distributions_envelope(sub_features, sub_traces, relaxed, progress=progress)
-    for row in rec_rows:
-        row["status"] = "recovered"
-        for m in row["members"]:
-            m["feature_id"] = leftover[m["feature_id"]]  # sub-index -> original feature_id
-
-    if progress:
-        print(f"recovery leftover_features={len(leftover)} recovered={len(rec_rows)}",
+    ctx = EnvelopeContext(features, traces, config_dict)
+    before = len(rows)
+    rows = merge_collinear_distributions(ctx, rows, config_dict)
+    if progress and len(rows) != before:
+        print(f"merge collinear: {before} -> {len(rows)} ({before - len(rows)} fragments stitched)",
               file=__import__("sys").stderr, flush=True)
-
-    return primary + rec_rows
+    return rows
 
 
 def build_distributions_envelope(features, traces, config_dict, progress=False):
