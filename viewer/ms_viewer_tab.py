@@ -2064,22 +2064,22 @@ class MSViewerTab(QMainWindow):
             else:
                 rep = {"divider": "", "score": 0.0, "matched": []}
             reports.append((r, rep))
-        reports.sort(key=lambda rr: rr[1]["score"], reverse=True)
+        # Rank by matchcounts (the reference's secondfinalmetrics): higher = more
+        # fragment coverage = more confident. Best-first by default.
+        reports.sort(key=lambda rr: rr[1]["matchcounts"], reverse=True)
 
         # Disable sorting while filling so row indices stay put; the default
-        # best-score-first order shows once re-enabled (until the user clicks a
-        # header to re-sort).
+        # best-first order shows once re-enabled (until the user clicks a header
+        # to re-sort).
         self.table2.setSortingEnabled(False)
         self.table2.setRowCount(len(reports))
         for i, (r, rep) in enumerate(reports):
             self.table2.setItem(i, 0, QTableWidgetItem(str(r.get("peptide", ""))))
             self.table2.setItem(i, 1, NumericItem(str(r.get("percolator_q", "")),
                                                   safe_float(r.get("percolator_q"))))
-            if rep["matched"]:
-                cov = f"{rep['score']:.3g}"
-                cov_val = rep["score"]
-            elif peaks is not None and peaks.size:
-                cov, cov_val = "0", 0.0
+            if peaks is not None and peaks.size:
+                cov_val = rep["matchcounts"]
+                cov = str(cov_val)
             else:
                 cov, cov_val = "", None
             self.table2.setItem(i, 2, NumericItem(cov, cov_val))

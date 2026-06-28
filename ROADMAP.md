@@ -202,10 +202,12 @@ data the pipeline produces. The four founding goals:
   column + score** per **`examples/sequencecoverageconcept.py`** — ported to `viewer/coverage.py`: each
   candidate peptide's theoretical b/y fragment ions are matched (±ppm, charges 1–2) against the MS2
   spectrum, rendered as the divider string (`PEP|T|I|DER`) with matched-ion count + residue coverage,
-  and scored by the reference's `finalmetrics` (`dividerweight·isolationlengthweight·coverageweight`).
-  Table 2 columns are **peptide / q / coverage**, where coverage IS the score, ranked best-first. The
-  MS2 fragment coverage concept, **distinct from Tab 2's protein coverage**. ⬜ modified residues are
-  matched on their plain (unmodified) mass for now.
+  and scored by the reference's **`secondfinalmetrics` = `matchcounts`** (unique matched ions + Σ
+  segment-length·cover-count) — higher = more/longer/more-redundant coverage = more confident. Table 2
+  columns are **peptide / q / coverage**, where coverage IS the matchcounts value, ranked highest-first
+  (header-click re-sorts). The MS2 fragment coverage concept, **distinct from Tab 2's protein
+  coverage**. ⬜ modified residues are matched on their plain (unmodified) mass for now — a modified
+  identified peptide can therefore read 0 until mod mass shifts are applied.
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).
