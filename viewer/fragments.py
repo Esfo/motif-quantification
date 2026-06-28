@@ -535,6 +535,84 @@ def _fragment_main_masses(subformula, fragments, dividingthreshold):
     return out
 
 
+def nearest_neighbors_ppm(baselist, flylist, ppm):
+    """Port of ``nearest_neighbors_ppm_tolerance`` (peptidefragmentscoring.py).
+
+    For each base m/z (theoretical, sorted ascending) finds the nearest fly m/z
+    (experimental peaks, sorted ascending) within ``ppm``. Returns
+    ``{base_index: [fly_index, ...]}`` (two indices only on an exact tie)."""
+    base = np.asarray(baselist, dtype=float)
+    fly = np.asarray(flylist, dtype=float)
+    indices = {}
+    if base.size == 0 or fly.size == 0:
+        return indices
+    ppmmod = ppm / 1e6
+    rights = np.searchsorted(fly, base)
+    for bn, rightfn in enumerate(rights.tolist()):
+        b = base[bn]
+        btol = b * ppmmod
+        bmin = b - btol
+        bmax = b + btol
+        leftfn = rightfn - 1
+        left = leftfn >= 0 and bmin < fly[leftfn] < bmax
+        right = rightfn < fly.size and bmin < fly[rightfn] < bmax
+        if left and right:
+            leftdist = b - fly[leftfn]
+            rightdist = fly[rightfn] - b
+            if leftdist < rightdist:
+                indices[bn] = [leftfn]
+            elif rightdist < leftdist:
+                indices[bn] = [rightfn]
+            else:
+                indices[bn] = [leftfn, rightfn]
+        elif left:
+            indices[bn] = [leftfn]
+        elif right:
+            indices[bn] = [rightfn]
+    return indices
+
+
+def annotate_spectrum(entries, peak_mz, peak_int, ppm=20.0):
+    """Match theoretical fragment ions to the REAL MS2 peaks and split the
+    spectrum into matched / unmatched actual peaks.
+
+    Theoretical ``entries`` (from :func:`peptide_fragment_ions`) are matched to
+    the experimental peaks via :func:`nearest_neighbors_ppm` at the search ppm.
+    Returns ``(matched, (unmatched_mz, unmatched_int))`` where ``matched`` is a
+    list of ``{mz, intensity, ion, charge, isotopes}`` at the EXPERIMENTAL peaks
+    that were hit (theoretical ions with no match are simply dropped)."""
+    fly = np.asarray(peak_mz, dtype=float)
+    fint = np.asarray(peak_int, dtype=float)
+    if fly.size == 0 or fint.size != fly.size:
+        return [], (np.array([]), np.array([]))
+    order = fly.argsort()
+    fly = fly[order]
+    fint = fint[order]
+
+    ents = sorted(entries, key=lambda e: e["mz"])
+    base = [e["mz"] for e in ents]
+    nn = nearest_neighbors_ppm(base, fly, ppm)
+
+    flyann = defaultdict(list)
+    for bi, flist in nn.items():
+        for fi in flist:
+            flyann[fi].append(ents[bi])
+
+    matched = []
+    for fi in sorted(flyann):
+        anns = flyann[fi]
+        rep = min(anns, key=lambda a: abs(a["mz"] - fly[fi]))
+        isos = sorted({a["isotope_index"] for a in anns if a["ion"] == rep["ion"]})
+        matched.append({"mz": float(fly[fi]), "intensity": float(fint[fi]),
+                        "ion": rep["ion"], "charge": rep["charge"], "isotopes": isos})
+
+    matched_set = set(flyann)
+    keep = np.array([i for i in range(fly.size) if i not in matched_set], dtype=int)
+    if keep.size:
+        return matched, (fly[keep], fint[keep])
+    return matched, (np.array([]), np.array([]))
+
+
 def match_fragment_ions(entries, peak_mz, peak_int, ppm=20.0):
     """Match theoretical fragment ions to an MS2 spectrum.
 

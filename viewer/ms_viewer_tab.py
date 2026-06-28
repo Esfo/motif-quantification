@@ -249,14 +249,17 @@ class FragmentWorker(QThread):
         self.subiso_depth = subiso_depth
 
     def run(self):
-        result = {"token": self.token, "seq": self.seq, "items": []}
+        result = {"token": self.token, "seq": self.seq,
+                  "matched": [], "unmatched": (np.array([]), np.array([]))}
         try:
             entries = seqfragments_module.peptide_fragment_ions(
                 self.seq, self.charge, self.iso_low, self.iso_high,
                 dividingthreshold=self.dividing_threshold,
                 subisotopomericdepth=self.subiso_depth)
-            result["items"] = seqfragments_module.match_fragment_ions(
+            matched, unmatched = seqfragments_module.annotate_spectrum(
                 entries, self.peak_mz, self.peak_int, ppm=self.ppm)
+            result["matched"] = matched
+            result["unmatched"] = unmatched
         except Exception as exc:
             result["error"] = f"{exc}\n{traceback.format_exc()}"
         self.done.emit(result)
@@ -468,6 +471,9 @@ class MSViewerTab(QMainWindow):
         self.session = session
         self.db = distributions_db
         self.xics_ppm = float(xics_ppm)
+        # Fragment-match tolerance for MS2 ion annotation = the search fragment
+        # tolerance (Sage fragment_tol, ±20 ppm in execution.xsh).
+        self.frag_ppm = 20.0
         self.rt_half = float(xics_rt_window)
         self.mz_half = 2.5
         self.theme = theme
@@ -514,6 +520,8 @@ class MSViewerTab(QMainWindow):
         self._selected_n_members = None      # isotope count of the selection, for hypothetical width
         self._panel3_mode = "ms1"  # "ms1" (envelope/charge grid) or "ms2" (spectrum)
         self._ms2_scan = None      # the MS2 scan currently shown in panel 3
+        self._ms1_theo = None      # {seq, charge} of the Table-2 peptide overlaid on panel 1
+        self._ms1_theo_item = None # the BarGraphItem for that overlay
         self._nav = []            # navigation history of (window, charge)
         self._nav_i = -1
         self._suppress_record = False
@@ -713,6 +721,12 @@ class MSViewerTab(QMainWindow):
             on_change=self._on_noise_changed)
         self.logcolor_toggle = FlipButton([("lin", "lin color"), ("log", "log color")],
                                           on_change=self._on_logcolor)
+        # Theoretical-MS1 overlay mode (only matters once a Table-2 peptide is
+        # selected): 'raw' keeps every isotopomer separate; 'summed' merges all
+        # isotopomers at the same M+N into one signal.
+        self.ms1theo_toggle = FlipButton(
+            [("raw", "raw isotopomers"), ("summed", "summed M+N")],
+            on_change=self._on_ms1theo_changed)
         # Snap the 3D view to the aligned top-down (2D-like) orientation.
         self.reset3d_button = QPushButton("align 3D")
         self.reset3d_button.setFixedWidth(70)
@@ -758,6 +772,7 @@ class MSViewerTab(QMainWindow):
         bar.addWidget(self.source_toggle)
         bar.addWidget(self.noise_toggle)
         bar.addWidget(self.logcolor_toggle)
+        bar.addWidget(self.ms1theo_toggle)
         bar.addWidget(self.reset3d_button)
         bar.addWidget(self.theme_btn)
         bar.addSpacing(8)
@@ -1315,6 +1330,7 @@ class MSViewerTab(QMainWindow):
         # only shown after the user clicks an MS2 point).
         self._panel3_mode = "ms1"
         self._ms2_scan = None
+        self._ms1_theo = None   # drop any Table-2 theoretical MS1 overlay
         self.render_table1(self.current)
         # Initialize the window from the ± controls and snap the views to it.
         rt_start = max(0.0, rt - self.rt_half) if rt is not None else 0.0
@@ -1633,6 +1649,8 @@ class MSViewerTab(QMainWindow):
         self._p1_3d_inputs = (points, region, mz_min, mz_max, rt_start, rt_end)
         if HAVE_GL and self.dim_toggle.key() == "3D":
             self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
+        # p1_2d.clear() above dropped any theoretical-MS1 overlay; re-add it.
+        self._draw_ms1_theo_overlay()
 
     def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
         if not HAVE_GL:
@@ -2132,7 +2150,10 @@ class MSViewerTab(QMainWindow):
         # best-first order shows once re-enabled (until the user clicks a header
         # to re-sort).
         self.table2.setSortingEnabled(False)
-        # Clear any selection-driven fragment overlay from a previous spectrum.
+        # Clear any selection-driven fragment overlay + theoretical MS1 overlay
+        # from a previous spectrum.
+        self._ms1_theo = None
+        self._draw_ms1_theo_overlay()
         self.table2.clearSelection()
         self.table2.setRowCount(len(reports))
         for i, (r, rep) in enumerate(reports):
@@ -2166,6 +2187,9 @@ class MSViewerTab(QMainWindow):
         if len(seq) < 2:
             return
         charge = peptide_charge(r) or scan.get("charge") or 2
+        # Also overlay this peptide's theoretical MS1 distribution on panel 1.
+        self._ms1_theo = {"seq": seq, "charge": charge}
+        self._draw_ms1_theo_overlay()
         low = scan.get("iso_low")
         high = scan.get("iso_high")
         if low is None or high is None:
@@ -2180,7 +2204,7 @@ class MSViewerTab(QMainWindow):
             seq, charge, low, high,
             getattr(self, "_ms2_mz", np.array([])),
             getattr(self, "_ms2_int", np.array([])),
-            self.xics_ppm, self._frag_token,
+            self.frag_ppm, self._frag_token,
             dividing_threshold=0.1, subiso_depth=0.5)
         worker.done.connect(self._on_fragments_ready)
         self._frag_workers = [w for w in getattr(self, "_frag_workers", [])
@@ -2188,12 +2212,66 @@ class MSViewerTab(QMainWindow):
         self._frag_workers.append(worker)
         worker.start()
 
+    def _on_ms1theo_changed(self):
+        """raw <-> summed switch for the theoretical MS1 overlay."""
+        self._draw_ms1_theo_overlay()
+
+    def _p1_experimental_max(self):
+        """Max experimental intensity currently drawn in panel 1 (2D)."""
+        ymax = 0.0
+        for scatter, _base in getattr(self, "_p1_scatters", []):
+            try:
+                ys = scatter.getData()[1]
+                if ys is not None and len(ys):
+                    ymax = max(ymax, float(np.nanmax(ys)))
+            except Exception:
+                pass
+        return ymax
+
+    def _draw_ms1_theo_overlay(self):
+        """Overlay the selected Table-2 peptide's theoretical MS1 isotope
+        distribution on panel 1 (2D only) as a 50%-opacity bar chart, normalized
+        so the tallest theoretical bar matches the tallest experimental peak."""
+        if getattr(self, "_ms1_theo_item", None) is not None:
+            try:
+                self.p1_2d.removeItem(self._ms1_theo_item)
+            except Exception:
+                pass
+            self._ms1_theo_item = None
+        # 2D only.
+        if (self._ms1_theo is None
+                or getattr(self, "p1_stack", None) is None
+                or self.p1_stack.currentIndex() != 0):
+            return
+        exp_max = self._p1_experimental_max()
+        if exp_max <= 0:
+            return
+        try:
+            mode = self.ms1theo_toggle.key()
+            mzs, abund = isotopes.peptide_isotope_bars(
+                self._ms1_theo["seq"], self._ms1_theo["charge"], mode=mode,
+                dividing_threshold=0.1)
+        except Exception:
+            return
+        if mzs is None or len(mzs) == 0:
+            return
+        theo_max = float(np.max(abund)) or 1.0
+        # Normalize: tallest theoretical bar == tallest experimental peak.
+        heights = np.asarray(abund, dtype=float) * (exp_max / theo_max)
+        bars = pg.BarGraphItem(x=np.asarray(mzs, dtype=float), height=heights,
+                               width=0.02, brush=pg.mkBrush(90, 160, 255, 128),
+                               pen=pg.mkPen(90, 160, 255, 128))
+        bars.setZValue(15)
+        self.p1_2d.addItem(bars)
+        self._ms1_theo_item = bars
+
     def _on_fragments_ready(self, result):
         if result.get("token") != getattr(self, "_frag_token", 0):
             return
         if result.get("error"):
             return
-        self._draw_fragment_overlay(result.get("items", []))
+        self._draw_fragment_overlay(result.get("matched", []),
+                                    result.get("unmatched", (np.array([]), np.array([]))))
 
     def _clear_fragment_overlay(self):
         for item in getattr(self, "_frag_overlay", []):
@@ -2203,45 +2281,64 @@ class MSViewerTab(QMainWindow):
                 pass
         self._frag_overlay = []
 
-    def _draw_fragment_overlay(self, items):
-        """Draw a green (matched) / red (absent) vertical marker + label per
-        theoretical fragment ion onto the MS2 spectrum."""
+    @staticmethod
+    def _sticks(mzs, ints):
+        """NaN-separated (x, y) for drawing baseline-grounded spectrum sticks."""
+        mzs = np.asarray(mzs, dtype=float)
+        ints = np.asarray(ints, dtype=float)
+        if mzs.size == 0:
+            return np.array([]), np.array([])
+        x = np.empty(mzs.size * 3)
+        y = np.empty(mzs.size * 3)
+        x[0::3] = mzs
+        x[1::3] = mzs
+        x[2::3] = np.nan
+        y[0::3] = 0.0
+        y[1::3] = ints
+        y[2::3] = np.nan
+        return x, y
+
+    def _draw_fragment_overlay(self, matched, unmatched):
+        """Recolour the ACTUAL MS2 spectrum: peaks matched by a theoretical b/y
+        fragment ion are drawn green (and labelled with the ion + the MS1
+        isotope it came from); the remaining real peaks are drawn red.
+        Theoretical ions with no experimental match are not drawn."""
         self._clear_fragment_overlay()
-        if not items:
-            return
         pal = palette(self.theme)
         fg = pal["fg"]
         dark = self.theme == "dark"
         green = (90, 220, 120) if dark else (0, 150, 0)
-        red = (255, 95, 95) if dark else (205, 0, 0)
-        # Heights: matched lines reach their peak; absent lines a low stub so the
-        # expected position is visible without dominating.
-        inten = getattr(self, "_ms2_int", np.array([]))
-        top = float(np.max(inten)) if inten.size else 1.0
-        stub = top * 0.18
+        red = (235, 90, 90) if dark else (205, 0, 0)
         overlay = []
-        for it in items:
-            mz = it["theo_mz"]
-            matched = it["matched"]
-            color = green if matched else red
-            height = it["intensity"] if matched and it["intensity"] > 0 else stub
-            line = pg.PlotCurveItem([mz, mz], [0.0, height],
-                                    pen=pg.mkPen(*color, width=2))
-            line.setZValue(20)
-            self.p3.addItem(line)
-            overlay.append(line)
-            # Label: ion + which MS1 isotope(s) it descended from. Coloured by the
-            # theme fg (NOT the line colour), sitting at the top of the line.
-            isos = it.get("isotopes", [])
-            iso_txt = ",".join(f"M+{i}" for i in isos) if isos else ""
-            z = it.get("charge", 1)
-            ztxt = "" if z == 1 else f"({z}+)"
-            label = pg.TextItem(f"{it['ion']}{ztxt} {iso_txt}".strip(),
-                                color=fg, anchor=(0.5, 1.0))
-            label.setPos(mz, height)
-            label.setZValue(21)
-            self.p3.addItem(label)
-            overlay.append(label)
+
+        um_mz, um_int = unmatched
+        ux, uy = self._sticks(um_mz, um_int)
+        if ux.size:
+            red_curve = pg.PlotCurveItem(ux, uy, pen=pg.mkPen(*red, width=1),
+                                         connect="finite")
+            red_curve.setZValue(18)
+            self.p3.addItem(red_curve)
+            overlay.append(red_curve)
+
+        if matched:
+            mx, my = self._sticks([m["mz"] for m in matched],
+                                  [m["intensity"] for m in matched])
+            green_curve = pg.PlotCurveItem(mx, my, pen=pg.mkPen(*green, width=2),
+                                           connect="finite")
+            green_curve.setZValue(20)
+            self.p3.addItem(green_curve)
+            overlay.append(green_curve)
+            for m in matched:
+                isos = m.get("isotopes", [])
+                iso_txt = ",".join(f"M+{i}" for i in isos) if isos else ""
+                z = m.get("charge", 1)
+                ztxt = "" if z == 1 else f"({z}+)"
+                label = pg.TextItem(f"{m['ion']}{ztxt} {iso_txt}".strip(),
+                                    color=fg, anchor=(0.5, 1.0))
+                label.setPos(m["mz"], m["intensity"])
+                label.setZValue(21)
+                self.p3.addItem(label)
+                overlay.append(label)
         self._frag_overlay = overlay
 
     # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
@@ -3046,6 +3143,8 @@ class MSViewerTab(QMainWindow):
         # Build the 3D view lazily on first switch (it's skipped while 2D shows).
         if to_3d and HAVE_GL and getattr(self, "_p1_3d_inputs", None) is not None:
             self.draw_panel1_3d(*self._p1_3d_inputs)
+        # The theoretical MS1 overlay is 2D-only.
+        self._draw_ms1_theo_overlay()
 
     def _recenter_window(self):
         if self.center is None:
