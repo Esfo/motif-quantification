@@ -474,6 +474,10 @@ class MSViewerTab(QMainWindow):
         # Fragment-match tolerance for MS2 ion annotation = the search fragment
         # tolerance (Sage fragment_tol, ±20 ppm in execution.xsh).
         self.frag_ppm = 20.0
+        # Precursor tolerance for picking Table-2 candidates near the sampled
+        # precursor = the search precursor tolerance (Sage precursor_tol, ±10 ppm
+        # in execution.xsh), not a hard-coded Da window.
+        self.precursor_ppm = 10.0
         self.rt_half = float(xics_rt_window)
         self.mz_half = 2.5
         self.theme = theme
@@ -2159,7 +2163,8 @@ class MSViewerTab(QMainWindow):
                 psm_mz = (row_mz / z + 1.007276) if row_mz else None
             except Exception:
                 psm_mz = None
-            if prec is None or (psm_mz is not None and abs(psm_mz - prec) < 3.0):
+            prec_tol = (prec * self.precursor_ppm / 1e6) if prec else 0.0
+            if prec is None or (psm_mz is not None and abs(psm_mz - prec) <= prec_tol):
                 rows.append(r)
         # Compute each candidate's fragment coverage (matchcounts), then rank the
         # peptides best-first so the most distinguishable candidate is at the top.
@@ -2297,10 +2302,36 @@ class MSViewerTab(QMainWindow):
                 pass
         return ymax
 
+    def _distribution_experimental_max(self, did):
+        """Max experimental intensity of just ONE distribution's points (within
+        the visible window), used to normalize its theoretical MS1 overlay."""
+        points = getattr(self, "_last_points", None)
+        if did is None or not isinstance(points, dict):
+            return 0.0
+        mz = points.get("mz")
+        rt = points.get("rt")
+        inten = points.get("intensity")
+        if inten is None or mz is None or not len(inten):
+            return 0.0
+        if self.window is not None:
+            vmz0, vmz1, vrt0, vrt1 = self.window
+            vm = (mz >= vmz0) & (mz <= vmz1) & (rt >= vrt0) & (rt <= vrt1)
+        else:
+            vm = np.ones(mz.size, dtype=bool)
+        idx = np.zeros(mz.size, dtype=bool)
+        for g_did, _color, feat_masks in ((self._groups or []) + (self._rec_groups or [])):
+            if g_did == did:
+                for fm in feat_masks:
+                    idx |= fm
+                break
+        idx &= vm
+        return float(inten[idx].max()) if idx.any() else 0.0
+
     def _draw_ms1_theo_overlay(self):
         """Overlay the selected Table-2 peptide's theoretical MS1 isotope
         distribution on panel 1 (2D only) as a 50%-opacity bar chart, normalized
-        so the tallest theoretical bar matches the tallest experimental peak."""
+        so the tallest theoretical bar matches the tallest experimental peak of
+        the DISTRIBUTION it matched (not all the data visible in the plot)."""
         if getattr(self, "_ms1_theo_item", None) is not None:
             try:
                 self.p1_2d.removeItem(self._ms1_theo_item)
@@ -2312,7 +2343,12 @@ class MSViewerTab(QMainWindow):
                 or getattr(self, "p1_stack", None) is None
                 or self.p1_stack.currentIndex() != 0):
             return
-        exp_max = self._p1_experimental_max()
+        # Normalize to the matched distribution's max; fall back to the overall
+        # visible max only if no distribution was matched.
+        exp_max = self._distribution_experimental_max(
+            getattr(self, "_selected_dist_id", None))
+        if exp_max <= 0:
+            exp_max = self._p1_experimental_max()
         if exp_max <= 0:
             return
         try:
