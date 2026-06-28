@@ -945,7 +945,10 @@ class MSViewerTab(QMainWindow):
         # fragment sequence coverage each gets against the MS2 spectrum (the
         # coverage concept from sequencecoverageconcept.py). Lives under panel 3.
         self.table2 = QTableWidget()
-        cols = ["peptide", "protein", "q", "coverage"]
+        # Table 2 compares the candidate PEPTIDES for the sampled precursor (not
+        # proteins): each peptide's q-value, its b/y fragment coverage of the
+        # MS2 spectrum, and the coverage score from sequencecoverageconcept.py.
+        cols = ["peptide", "q", "coverage", "score"]
         self.table2.setColumnCount(len(cols))
         self.table2.setHorizontalHeaderLabels(cols)
         self.table2.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1990,16 +1993,33 @@ class MSViewerTab(QMainWindow):
                 psm_mz = None
             if prec is None or (psm_mz is not None and abs(psm_mz - prec) < 3.0):
                 rows.append(r)
-        self.table2.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            for j, key in enumerate(("peptide", "proteins", "percolator_q")):
-                self.table2.setItem(i, j, QTableWidgetItem(str(r.get(key, ""))))
+        # Compute each candidate's fragment coverage + score, then rank the
+        # peptides best-score-first (how the reference sorts them) so the most
+        # distinguishable candidate is at the top.
+        reports = []
+        for r in rows:
             if peaks is not None and peaks.size:
-                cell = seqcoverage.coverage_summary(
+                rep = seqcoverage.coverage_report(
                     plain_seq(r.get("peptide", "")), peaks, ppm=self.xics_ppm)
             else:
-                cell = ""
-            self.table2.setItem(i, 3, QTableWidgetItem(cell))
+                rep = {"divider": "", "score": 0.0, "matched": []}
+            reports.append((r, rep))
+        reports.sort(key=lambda rr: rr[1]["score"], reverse=True)
+
+        self.table2.setRowCount(len(reports))
+        for i, (r, rep) in enumerate(reports):
+            self.table2.setItem(i, 0, QTableWidgetItem(str(r.get("peptide", ""))))
+            self.table2.setItem(i, 1, QTableWidgetItem(str(r.get("percolator_q", ""))))
+            if rep["matched"]:
+                cov = f"{len(rep['matched'])} ions  {rep.get('covered','')}/" \
+                      f"{len(plain_seq(r.get('peptide','')))} aa  {rep['divider']}"
+                score = f"{rep['score']:.3g}"
+            elif peaks is not None and peaks.size:
+                cov, score = "no match", "0"
+            else:
+                cov, score = "", ""
+            self.table2.setItem(i, 2, QTableWidgetItem(cov))
+            self.table2.setItem(i, 3, QTableWidgetItem(score))
 
     # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used

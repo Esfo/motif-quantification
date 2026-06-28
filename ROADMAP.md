@@ -199,11 +199,13 @@ data the pipeline produces. The four founding goals:
   the user can judge whether one peptide is distinguishable from another. Optional panel. 🟡 dock +
   candidate listing exists, and **Table 2 now only appears when Panel 3 is in MS2 mode** (hidden for
   MS1 so the MS1 view takes the full space); ⬜ "could-have-matched" candidate logic; ✅ the **coverage
-  column** per **`examples/sequencecoverageconcept.py`** — ported to `viewer/coverage.py`: each
+  column + score** per **`examples/sequencecoverageconcept.py`** — ported to `viewer/coverage.py`: each
   candidate peptide's theoretical b/y fragment ions are matched (±ppm, charges 1–2) against the MS2
-  spectrum and rendered as the divider string (`PEP|T|I|DER`) with matched-ion count and residue
-  coverage. The MS2 fragment coverage concept, **distinct from Tab 2's protein coverage**. ⬜ modified
-  residues are matched on their plain (unmodified) mass for now.
+  spectrum, rendered as the divider string (`PEP|T|I|DER`) with matched-ion count + residue coverage,
+  and scored by the reference's `finalmetrics` (`dividerweight·isolationlengthweight·coverageweight`).
+  Table 2 columns are **peptide / q / coverage / score**, ranked best-score-first. The MS2 fragment
+  coverage concept, **distinct from Tab 2's protein coverage**. ⬜ modified residues are matched on
+  their plain (unmodified) mass for now.
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).

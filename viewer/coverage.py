@@ -168,6 +168,90 @@ def coverage_segments(seq, ion_labels):
     return segments
 
 
+def coverage_metrics(seq, ion_labels):
+    """The coverage SCORE and its components, ported verbatim from the metric
+    block in ``sequencecoverageconcept.py`` (the ``finalmetrics`` computation).
+
+    The fragmentation isolates the sequence into segments (``partialseqs``);
+    each segment that is spanned by at least one ion is "covered" ``count``
+    times. The reference scores a peptide by how finely and redundantly its
+    ions isolate the backbone:
+
+      * ``coverageweight``       = 1 / (max N-term cut + max C-term cut)
+      * ``isolationlengthweight``= ∏ over covered segments of 1/len(seg)/len(seq)
+      * ``dividerweight``        = 1 / (number of covered segments)
+      * ``score``                = dividerweight·isolationlengthweight·coverageweight
+
+    Returns a dict with ``score`` and the three component weights plus the
+    segment count and a ``matchcounts`` tally (``secondfinalmetrics``). Returns
+    all-zero metrics when nothing is covered.
+    """
+    slen = len(seq)
+    zero = {"score": 0.0, "dividerweight": 0.0, "isolationlengthweight": 0.0,
+            "coverageweight": 0.0, "nsegments": 0, "matchcounts": 0}
+    if slen < 1 or not ion_labels:
+        return zero
+
+    maxncoverage = 0   # max C-term cut (reference's confusingly-named var)
+    maxccoverage = 0   # max N-term cut
+    dividers = []
+    ntermcoverage = []
+    ctermcoverage = []
+    for ion in ion_labels:
+        iontype = ion[0]
+        ioncount = int(ion[1:])
+        if iontype in "abc":
+            dividers.append(ioncount)
+            ntermcoverage.append(ioncount)
+            if ioncount > maxccoverage:
+                maxccoverage = ioncount
+        elif iontype in "xyz":
+            dividers.append(slen - ioncount)
+            ctermcoverage.append(slen - ioncount)
+            if ioncount > maxncoverage:
+                maxncoverage = ioncount
+    if (maxncoverage + maxccoverage) == 0:
+        return zero
+    dividers = sorted(set(dividers))
+    coverageweight = 1.0 / (maxncoverage + maxccoverage)
+
+    # Isolated segments (start..start+d), keyed by start index so identical
+    # partial sequences at different positions stay distinct.
+    ind = 0
+    ddiff = np.diff(dividers, prepend=0).tolist()
+    partialseqs = defaultdict(int)
+    for d in ddiff:
+        pseq = seq[ind:ind + d]
+        ntermcovers = [i for i in ntermcoverage if i > ind]
+        ctermcovers = [i for i in ctermcoverage if i <= ind]
+        covers = len(ntermcovers) + len(ctermcovers)
+        if covers > 0:
+            partialseqs[f"{ind}-{pseq}"] += covers
+        ind += d
+    pseq = seq[ind:]
+    ntermcovers = [i for i in ntermcoverage if i > ind]
+    ctermcovers = [i for i in ctermcoverage if i <= ind]
+    covers = len(ntermcovers) + len(ctermcovers)
+    if covers > 0:
+        partialseqs[f"{ind}-{pseq}"] += covers
+
+    if not partialseqs:
+        return zero
+
+    matchcounts = len(set(ion_labels))
+    isolationlengthweight = 1.0
+    for indseq, count in partialseqs.items():
+        _ind, pseq = indseq.split("-", 1)
+        isolationlengthweight *= 1.0 / len(pseq) / len(seq)
+        matchcounts += len(pseq) * count
+    dividerweight = 1.0 / len(partialseqs)
+    score = dividerweight * isolationlengthweight * coverageweight
+    return {"score": score, "dividerweight": dividerweight,
+            "isolationlengthweight": isolationlengthweight,
+            "coverageweight": coverageweight,
+            "nsegments": len(partialseqs), "matchcounts": matchcounts}
+
+
 def coverage_summary(seq, peak_mz, charges=DEFAULT_CHARGES, ions=DEFAULT_IONS,
                      ppm=DEFAULT_PPM):
     """One-line Table-2 cell for a candidate peptide.
@@ -185,6 +269,26 @@ def coverage_summary(seq, peak_mz, charges=DEFAULT_CHARGES, ions=DEFAULT_IONS,
     covered = _covered_residues(seq, matched)
     return (f"{len(matched)} ions  {covered}/{len(seq)} aa  "
             f"{coverage_string(seq, matched)}")
+
+
+def coverage_report(seq, peak_mz, charges=DEFAULT_CHARGES, ions=DEFAULT_IONS,
+                    ppm=DEFAULT_PPM):
+    """Everything Table 2 needs for one candidate peptide, in a single pass.
+
+    Returns a dict: ``matched`` (ion labels), ``divider`` (the ``PEP|T|I|DER``
+    string), ``covered`` (residues touched), ``score`` and the metric
+    components from :func:`coverage_metrics`. ``score`` is 0 with an empty
+    divider when nothing matched.
+    """
+    seq = seq or ""
+    matched = match_coverage(seq, peak_mz, charges, ions, ppm) if len(seq) >= 2 else []
+    metrics = coverage_metrics(seq, matched)
+    return {
+        "matched": matched,
+        "divider": coverage_string(seq, matched) if matched else "",
+        "covered": _covered_residues(seq, matched),
+        **metrics,
+    }
 
 
 def _covered_residues(seq, ion_labels):
