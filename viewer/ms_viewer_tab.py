@@ -630,6 +630,18 @@ class MSViewerTab(QMainWindow):
         self.p1_loading = QLabel("")
         self.p1_loading.setStyleSheet("color: black;")
 
+        # Navigation-history arrows: same design as the charge arrows, placed to
+        # their left ("history: ◀ ▶"). Moved here from the (now removed) top
+        # toolbar.
+        self.hist_back_btn = QPushButton("◀")
+        self.hist_back_btn.setFixedWidth(28)
+        self.hist_back_btn.setToolTip("navigation history: back")
+        self.hist_back_btn.clicked.connect(self.nav_back)
+        self.hist_fwd_btn = QPushButton("▶")
+        self.hist_fwd_btn.setFixedWidth(28)
+        self.hist_fwd_btn.setToolTip("navigation history: forward")
+        self.hist_fwd_btn.clicked.connect(self.nav_forward)
+
         # Charge-search arrows: right-aligned, to the right of "align 3D".
         self.charge_prev_btn = QPushButton("◀")
         self.charge_prev_btn.setFixedWidth(28)
@@ -650,6 +662,10 @@ class MSViewerTab(QMainWindow):
         bar.addSpacing(8)
         bar.addWidget(self.p1_loading)
         bar.addStretch(1)
+        bar.addWidget(QLabel("history:"))
+        bar.addWidget(self.hist_back_btn)
+        bar.addWidget(self.hist_fwd_btn)
+        bar.addSpacing(12)
         bar.addWidget(QLabel("charge"))
         bar.addWidget(self.charge_prev_btn)
         bar.addWidget(self.charge_next_btn)
@@ -770,6 +786,9 @@ class MSViewerTab(QMainWindow):
         self.p1_2d.setXLink(self.p2)
         self.p2.sigXRangeChanged.connect(self.on_view_range_changed)
         self.p2.sigYRangeChanged.connect(self.on_view_range_changed)
+        # Plain wheel over panel 2 pans the window (m/z / time); Ctrl+wheel zooms
+        # (handled in eventFilter).
+        self.p2.viewport().installEventFilter(self)
 
         self.p2_loading = QLabel("")
         self.p2_loading.setStyleSheet("color: black;")
@@ -1983,7 +2002,11 @@ class MSViewerTab(QMainWindow):
                 return True
             return super().eventFilter(obj, event)
         p1 = getattr(self, "p1_2d", None)
+        p2 = getattr(self, "p2", None)
         p3 = getattr(self, "p3", None)
+        # Panel 1 / panel 3 intensity (y-axis strip) zoom: wheel over the left
+        # axis scrolls intensity with the baseline pinned at 0. Panel 1's
+        # intensity behaviour is intentionally left untouched.
         target = None
         if p1 is not None and obj is p1.viewport():
             target = self.p1_2d
@@ -1999,7 +2022,49 @@ class MSViewerTab(QMainWindow):
                 # the top of the y range moves, so the data baseline never lifts.
                 vb.setYRange(0.0, y1 * factor, padding=0)
                 return True
+
+        # Panels 1 & 2 plot area: plain wheel pans the window (m/z on panel 1's
+        # x-axis; m/z / time on panel 2), Ctrl+wheel falls through to pyqtgraph's
+        # default zoom. Panel 1's intensity (y) axis is excluded above.
+        pan_target = None
+        if p1 is not None and obj is p1.viewport():
+            pan_target = self.p1_2d
+        elif p2 is not None and obj is p2.viewport():
+            pan_target = self.p2
+        if pan_target is not None and event.type() == QEvent.Wheel:
+            if event.modifiers() & Qt.ControlModifier:
+                # Let pyqtgraph zoom (current behaviour).
+                return super().eventFilter(obj, event)
+            vb = pan_target.getViewBox()
+            dy = event.angleDelta().y()
+            dx = event.angleDelta().x()
+            if pan_target is self.p1_2d:
+                # Panel 1: vertical wheel pans m/z (x). Intensity y stays fixed.
+                self._pan_axis(vb, 0, dy)
+            else:
+                # Panel 2: horizontal wheel pans m/z (x), vertical wheel pans
+                # time (y).
+                if abs(dx) > abs(dy):
+                    self._pan_axis(vb, 0, dx)
+                else:
+                    self._pan_axis(vb, 1, dy)
+            return True
         return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _pan_axis(vb, axis, delta):
+        """Pan a viewbox along one axis (0=x, 1=y) by a fraction of the visible
+        range proportional to the wheel delta. Positive delta moves the window
+        toward higher values."""
+        if not delta:
+            return
+        lo, hi = vb.viewRange()[axis]
+        span = hi - lo
+        shift = span * 0.10 * (delta / 120.0)
+        if axis == 0:
+            vb.setXRange(lo + shift, hi + shift, padding=0)
+        else:
+            vb.setYRange(lo + shift, hi + shift, padding=0)
 
     def _on_p1_clicked(self, event):
         # Double-click re-fits panel 1's intensity (y) axis to the visible data,
