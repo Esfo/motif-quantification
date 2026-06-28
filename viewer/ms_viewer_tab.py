@@ -87,6 +87,24 @@ except ImportError:
     from points_store import PointsStore
 
 
+class NumericItem(QTableWidgetItem):
+    """Table item that sorts by a numeric value when one is set, else by text.
+
+    Used for Table 2's q / coverage-score columns so header-click sorting orders
+    them by magnitude rather than lexically ('0.9' before '0.1' etc.)."""
+
+    def __init__(self, text, value=None):
+        super().__init__(text)
+        self._value = value
+
+    def __lt__(self, other):
+        a = self._value
+        b = getattr(other, "_value", None)
+        if a is not None and b is not None:
+            return a < b
+        return super().__lt__(other)
+
+
 def plain_seq(peptide):
     """Strip flanks and modifications to a bare uppercase residue sequence."""
     value = peptide or ""
@@ -161,6 +179,45 @@ class EvidenceWorker(QThread):
                             "scan_int": scan_int, "points": points, "region": region, "ms2": ms2})
         except Exception as exc:
             self.done.emit({"error": f"{exc}\n{traceback.format_exc()}"})
+
+
+class Table1Worker(QThread):
+    """Reads Table 1's line metrics off the UI thread.
+
+    The distribution lookup + member query hit the (read-only) distributions
+    sqlite, which can be slow; doing it here keeps selection responsive. SQLite
+    connections are thread-bound, so the worker opens its OWN ``DistributionsDB``
+    on ``db_path`` rather than touching the UI thread's connection. ``token``
+    lets the tab discard results from a superseded selection (latest-wins).
+    """
+
+    done = Signal(object)
+
+    def __init__(self, db_path, token, distribution_id=None, window=None):
+        super().__init__()
+        self.db_path = db_path
+        self.token = token
+        self.distribution_id = distribution_id
+        self.window = window  # dict(mz_min, mz_max, rt_start, rt_end, charge)
+
+    def run(self):
+        result = {"token": self.token, "distribution_id": None, "rows": []}
+        try:
+            db = DistributionsDB(self.db_path)
+            try:
+                did = self.distribution_id
+                if did is None and self.window is not None:
+                    dists = db.distributions_in_window(limit=1, **self.window)
+                    if dists:
+                        did = dists[0]["distribution_id"]
+                if did is not None:
+                    result["distribution_id"] = did
+                    result["rows"] = db.distribution_members(did)
+            finally:
+                db.close()
+        except Exception as exc:
+            result["error"] = f"{exc}\n{traceback.format_exc()}"
+        self.done.emit(result)
 
 
 # Horizontal alignment of the m/z (x) axis across panel 1 (2D & 3D) and panel 2.
@@ -953,6 +1010,9 @@ class MSViewerTab(QMainWindow):
         self.table2.setHorizontalHeaderLabels(cols)
         self.table2.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table2.verticalHeader().setVisible(False)   # no 1,2,3 index column
+        # Click a header to sort by that column; click again to reverse.
+        self.table2.setSortingEnabled(True)
+        self.table2.horizontalHeader().setSortIndicatorShown(True)
         dock = QDockWidget("Table 2 - MS2 candidates", self)
         dock.setObjectName("dock_table2")
         dock.setWidget(self.table2)
@@ -2006,17 +2066,24 @@ class MSViewerTab(QMainWindow):
             reports.append((r, rep))
         reports.sort(key=lambda rr: rr[1]["score"], reverse=True)
 
+        # Disable sorting while filling so row indices stay put; the default
+        # best-score-first order shows once re-enabled (until the user clicks a
+        # header to re-sort).
+        self.table2.setSortingEnabled(False)
         self.table2.setRowCount(len(reports))
         for i, (r, rep) in enumerate(reports):
             self.table2.setItem(i, 0, QTableWidgetItem(str(r.get("peptide", ""))))
-            self.table2.setItem(i, 1, QTableWidgetItem(str(r.get("percolator_q", ""))))
+            self.table2.setItem(i, 1, NumericItem(str(r.get("percolator_q", "")),
+                                                  safe_float(r.get("percolator_q"))))
             if rep["matched"]:
                 cov = f"{rep['score']:.3g}"
+                cov_val = rep["score"]
             elif peaks is not None and peaks.size:
-                cov = "0"
+                cov, cov_val = "0", 0.0
             else:
-                cov = ""
-            self.table2.setItem(i, 2, QTableWidgetItem(cov))
+                cov, cov_val = "", None
+            self.table2.setItem(i, 2, NumericItem(cov, cov_val))
+        self.table2.setSortingEnabled(True)
 
     # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
@@ -2183,25 +2250,58 @@ class MSViewerTab(QMainWindow):
             self.p3_title.setText(title)
 
     def render_table1(self, cur):
-        rows = []
         cur["distribution_id"] = None
-        if self.db is not None and cur["rt"] is not None and cur["charge"]:
-            mz_min, mz_max = cur["mz_center"] - self.mz_half, cur["mz_center"] + self.mz_half
-            dists = self.db.distributions_in_window(
-                mz_min=mz_min, mz_max=mz_max,
-                rt_start=cur["rt"] - self.rt_half, rt_end=cur["rt"] + self.rt_half,
-                charge=cur["charge"], limit=1,
-            )
-            if dists:
-                cur["distribution_id"] = dists[0]["distribution_id"]
-                rows = self.db.distribution_members(dists[0]["distribution_id"])
-        self._fill_table1(rows)
+        if self.db is None or cur["rt"] is None or not cur["charge"]:
+            self._fill_table1([])
+            return
+        window = {
+            "mz_min": cur["mz_center"] - self.mz_half,
+            "mz_max": cur["mz_center"] + self.mz_half,
+            "rt_start": cur["rt"] - self.rt_half,
+            "rt_end": cur["rt"] + self.rt_half,
+            "charge": cur["charge"],
+        }
+        # Window mode discovers the distribution id, which panel 3's charge grid
+        # also needs -> let the worker result redraw panel 3 if it arrives late.
+        self._start_table1_worker(window=window, redraw_panel3=True)
 
     def table1_for_distribution(self, distribution_id):
         """Fill table 1 with a specific distribution's line metrics (used when a
         distribution is clicked directly in panel 2)."""
-        rows = self.db.distribution_members(distribution_id) if self.db is not None else []
-        self._fill_table1(rows)
+        if self.db is None:
+            self._fill_table1([])
+            return
+        self._start_table1_worker(distribution_id=distribution_id)
+
+    def _start_table1_worker(self, distribution_id=None, window=None,
+                             redraw_panel3=False):
+        """Load Table 1's rows on a background thread (latest-wins by token)."""
+        self._table1_token = getattr(self, "_table1_token", 0) + 1
+        self._table1_redraw_panel3 = redraw_panel3
+        # Show a placeholder while the query runs so a slow load is visible.
+        self.table1.setRowCount(0)
+        worker = Table1Worker(str(self.db.path), self._table1_token,
+                              distribution_id=distribution_id, window=window)
+        worker.done.connect(self._on_table1_loaded)
+        # Keep a reference so the QThread isn't garbage-collected mid-run.
+        self._table1_workers = [w for w in getattr(self, "_table1_workers", [])
+                                if w.isRunning()]
+        self._table1_workers.append(worker)
+        worker.start()
+
+    def _on_table1_loaded(self, result):
+        # Ignore results from a superseded selection.
+        if result.get("token") != getattr(self, "_table1_token", 0):
+            return
+        did = result.get("distribution_id")
+        if self.current is not None:
+            self.current["distribution_id"] = did
+        self._fill_table1(result.get("rows", []))
+        # If panel 3 drew its MS1 view before the id was known (the sqlite query
+        # finished after the mzML read), rebuild it now that we have the id.
+        if (self._table1_redraw_panel3 and self._panel3_mode == "ms1"
+                and did != getattr(self, "_grid_dist_id", None)):
+            self._redraw_panel3()
 
     def _fill_table1(self, rows):
         self.table1.setRowCount(len(rows))

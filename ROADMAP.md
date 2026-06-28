@@ -68,7 +68,7 @@ data the pipeline produces. The four founding goals:
 - ✅ **Bounded region** — the profile/region view is the ID's ± m/z / ± RT window, **never the
   entire spectrum** (which was unreadable).
 - ✅ Removed the **orange 3D background** (was the height-color shader).
-- ✅ **No UI freeze** — selection reads run on a worker thread; rapid changes are latest-wins. The per-scan reads inside `extract_region`/`extract_points` are now **read in parallel** (a thread pool of independent mzML readers — the base64+zlib decode releases the GIL, so this genuinely parallelises), speeding up the initial load and every grow/zoom/move. (Threads rather than processes: avoids per-process file re-indexing and array IPC, while still parallelising the decode.)
+- ✅ **No UI freeze** — selection reads run on a worker thread; rapid changes are latest-wins. **Table 1's line-metric query** (distribution lookup + members on the sqlite) also runs on its **own background thread** (`Table1Worker`, latest-wins by token, opens its own read-only connection); panel 3's charge grid redraws if the distribution id resolves after it first drew. The per-scan reads inside `extract_region`/`extract_points` are now **read in parallel** (a thread pool of independent mzML readers — the base64+zlib decode releases the GIL, so this genuinely parallelises), speeding up the initial load and every grow/zoom/move. (Threads rather than processes: avoids per-process file re-indexing and array IPC, while still parallelising the decode.)
 - ✅ Sync model decision: **"forget the old generic sync"** — synchronization is now per-shared-
   axis (Panel 1↔2 m/z; Panel 3 columns on mass), not a single global lock.
 - ✅ Pipeline driver runs from a **top-level `.py`** (`index-distributions.py`) via `execution.xsh`,
