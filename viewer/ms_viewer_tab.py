@@ -474,10 +474,12 @@ class MSViewerTab(QMainWindow):
         # Fragment-match tolerance for MS2 ion annotation = the search fragment
         # tolerance (Sage fragment_tol, ±20 ppm in execution.xsh).
         self.frag_ppm = 20.0
-        # Precursor tolerance for picking Table-2 candidates near the sampled
-        # precursor = the search precursor tolerance (Sage precursor_tol, ±10 ppm
-        # in execution.xsh), not a hard-coded Da window.
+        # Precursor tolerance for picking Table-2 candidates = the search
+        # precursor tolerance (Sage precursor_tol, ±10 ppm) together with the
+        # search isotope-error offsets (Sage isotope_errors, -1..+2). These are
+        # the search parameters from execution.xsh, not a hard-coded Da window.
         self.precursor_ppm = 10.0
+        self.precursor_isotope_errors = (-1, 2)
         self.rt_half = float(xics_rt_window)
         self.mz_half = 2.5
         self.theme = theme
@@ -2155,6 +2157,13 @@ class MSViewerTab(QMainWindow):
         if low is None or high is None:
             base = prec or 0.0
             low, high = base - 1.0, base + 1.0
+        # Candidates = the peptides the SEARCH would have considered for this
+        # precursor: any file PSM whose precursor m/z falls within the search
+        # precursor tolerance of this scan's precursor, allowing the search's
+        # isotope-error offsets (Sage precursor_tol + isotope_errors). No
+        # hard-coded Da window.
+        NEUTRON = 1.0033548
+        iso_lo, iso_hi = self.precursor_isotope_errors
         rows = []
         for r in self.file_psms():
             try:
@@ -2163,9 +2172,16 @@ class MSViewerTab(QMainWindow):
                 psm_mz = (row_mz / z + 1.007276) if row_mz else None
             except Exception:
                 psm_mz = None
-            prec_tol = (prec * self.precursor_ppm / 1e6) if prec else 0.0
-            if prec is None or (psm_mz is not None and abs(psm_mz - prec) <= prec_tol):
+            if prec is None:
                 rows.append(r)
+                continue
+            if psm_mz is None:
+                continue
+            for k in range(iso_lo, iso_hi + 1):
+                target = prec + k * NEUTRON / z
+                if abs(psm_mz - target) <= target * self.precursor_ppm / 1e6:
+                    rows.append(r)
+                    break
         # Compute each candidate's fragment coverage (matchcounts), then rank the
         # peptides best-first so the most distinguishable candidate is at the top.
         reports = []
@@ -2921,11 +2937,9 @@ class MSViewerTab(QMainWindow):
                 ax.setPen(pg.mkPen(fg)); ax.setTextPen(pg.mkPen(fg))
                 ax.enableAutoSIPrefix(False)   # no "1e6"-style SI prefixes
             if ri == 0:
-                d = group[charges[ci]].get("distribution") or {}
-                badge = " ⚠" if d.get("status") == "ambiguous" else ""
-                iso = d.get("iso_score")
-                extra = f"  iso {iso:.2f}" if iso is not None else ""
-                p.setTitle(f"z={charges[ci]}{badge}{extra}", color=fg)
+                # Just the charge per column (the iso-score / ambiguous badge were
+                # dropped per the user).
+                p.setTitle(f"z={charges[ci]}", color=fg)
 
             # Y axis: only the leftmost column carries the axis (labels + values);
             # the other columns get a ZERO-width axis so there's no empty gap
