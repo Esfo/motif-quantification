@@ -472,15 +472,15 @@ class MSViewerTab(QMainWindow):
             if name and self.session.distributions_db_for(name) is not None:
                 self.file_combo.addItem(name, name)
         self.file_combo.currentIndexChanged.connect(self.on_file_changed)
-        layout.addWidget(QLabel("file"))
         layout.addWidget(self.file_combo)
 
         self.protein_list = self._titled_list(layout, "proteins", self.on_protein_selected, self.show_all_proteins)
         self.peptide_list = self._titled_list(layout, "peptides", self.on_peptide_selected, self.show_all_peptides)
         self.psm_list = self._titled_list(layout, "PSMs", self.on_psm_selected, self.show_all_psms)
 
-        dock = QDockWidget("Lists", self)
+        dock = QDockWidget("", self)
         dock.setObjectName("dock_lists")
+        dock.setTitleBarWidget(QWidget())   # drop the "Lists" title bar (dead space)
         dock.setWidget(container)
         self.dock_lists = dock
 
@@ -2042,9 +2042,12 @@ class MSViewerTab(QMainWindow):
                 # Panel 1: vertical wheel pans m/z (x). Intensity y stays fixed.
                 self._pan_axis(vb, 0, dy)
             else:
-                # Panel 2: horizontal wheel pans m/z (x), vertical wheel pans
-                # time (y).
-                if abs(dx) > abs(dy):
+                # Panel 2: horizontal wheel (or Shift+wheel) pans m/z (x),
+                # vertical wheel pans time (y). Shift+vertical scrolls m/z the
+                # same as scrolling over the m/z axis outside the plot area.
+                if event.modifiers() & Qt.ShiftModifier:
+                    self._pan_axis(vb, 0, dy or dx)
+                elif abs(dx) > abs(dy):
                     self._pan_axis(vb, 0, dx)
                 else:
                     self._pan_axis(vb, 1, dy)
