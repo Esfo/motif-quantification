@@ -2261,12 +2261,17 @@ class MSViewerTab(QMainWindow):
 
     def _select_distribution_for_candidate(self, r, charge, scan):
         """Select the MS1 distribution matching a Table-2 candidate (dotted border
-        on panel 2) without redrawing panel 3 (keeps the MS2 view up)."""
+        on panel 2) without redrawing panel 3 (keeps the MS2 view up).
+
+        Targets the candidate's actual mono m/z (within the precursor tolerance)
+        and RT, and picks the CLOSEST distribution -- not just the highest-quality
+        one in a wide window, which otherwise stuck on the first selection."""
         if self.db is None:
             return
         try:
             neutral = peptide_mass(r)
             if not neutral:
+                self._clear_selection()
                 return
             z = max(1, int(charge or 1))
             mono_mz = neutral / z + 1.007276
@@ -2274,15 +2279,26 @@ class MSViewerTab(QMainWindow):
             if rt is None and isinstance(self.current, dict):
                 rt = self.current.get("rt")
             if rt is None:
+                self._clear_selection()
                 return
+            # Tight m/z window around the candidate's mono m/z (search precursor
+            # tolerance, with a small absolute floor for isotope/centroiding slack).
+            tol = max(mono_mz * self.precursor_ppm / 1e6, 0.02)
             dists = self.db.distributions_in_window(
-                mz_min=mono_mz - self.mz_half, mz_max=mono_mz + self.mz_half,
+                mz_min=mono_mz - tol, mz_max=mono_mz + tol,
                 rt_start=rt - self.rt_half, rt_end=rt + self.rt_half,
-                charge=z, limit=1)
-            if dists:
-                # _set_selected only draws the border + anchors charge search; it
-                # does NOT touch panel 3, so the MS2 spectrum stays up.
-                self._set_selected(dists[0]["distribution_id"])
+                charge=z, limit=50)
+            if not dists:
+                self._clear_selection()
+                self._selected_dist_id = None
+                return
+            # Closest by m/z, then RT.
+            best = min(dists, key=lambda d: (
+                abs((d.get("mono_mz") or mono_mz) - mono_mz),
+                abs((d.get("rt_apex") or rt) - rt)))
+            # _set_selected only draws the border + anchors charge search; it does
+            # NOT touch panel 3, so the MS2 spectrum stays up.
+            self._set_selected(best["distribution_id"])
         except Exception:
             pass
 
