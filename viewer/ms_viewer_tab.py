@@ -1356,9 +1356,9 @@ class MSViewerTab(QMainWindow):
         self._start_evidence()
 
     def _set_loading(self, on, context=""):
-        """Show/clear a "loading… <context>" line above every panel 1/2/3 plot
-        while a data worker runs (per the spec: must happen everywhere)."""
-        text = f"loading… {context}" if on else ""
+        """Show/clear a bold "loading" line above every panel 1/2/3 plot while a
+        data worker runs (per the spec: must happen everywhere)."""
+        text = "<b>loading</b>" if on else ""
         for label in (getattr(self, "p1_loading", None),
                       getattr(self, "p2_loading", None),
                       getattr(self, "p3_loading", None)):
