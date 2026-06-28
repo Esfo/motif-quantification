@@ -203,9 +203,9 @@ data the pipeline produces. The four founding goals:
   candidate peptide's theoretical b/y fragment ions are matched (±ppm, charges 1–2) against the MS2
   spectrum, rendered as the divider string (`PEP|T|I|DER`) with matched-ion count + residue coverage,
   and scored by the reference's `finalmetrics` (`dividerweight·isolationlengthweight·coverageweight`).
-  Table 2 columns are **peptide / q / coverage / score**, ranked best-score-first. The MS2 fragment
-  coverage concept, **distinct from Tab 2's protein coverage**. ⬜ modified residues are matched on
-  their plain (unmodified) mass for now.
+  Table 2 columns are **peptide / q / coverage**, where coverage IS the score, ranked best-first. The
+  MS2 fragment coverage concept, **distinct from Tab 2's protein coverage**. ⬜ modified residues are
+  matched on their plain (unmodified) mass for now.
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).

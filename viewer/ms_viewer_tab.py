@@ -946,9 +946,9 @@ class MSViewerTab(QMainWindow):
         # coverage concept from sequencecoverageconcept.py). Lives under panel 3.
         self.table2 = QTableWidget()
         # Table 2 compares the candidate PEPTIDES for the sampled precursor (not
-        # proteins): each peptide's q-value, its b/y fragment coverage of the
-        # MS2 spectrum, and the coverage score from sequencecoverageconcept.py.
-        cols = ["peptide", "q", "coverage", "score"]
+        # proteins): each peptide's q-value and its coverage score (the b/y
+        # fragment coverage metric from sequencecoverageconcept.py).
+        cols = ["peptide", "q", "coverage"]
         self.table2.setColumnCount(len(cols))
         self.table2.setHorizontalHeaderLabels(cols)
         self.table2.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -2011,15 +2011,12 @@ class MSViewerTab(QMainWindow):
             self.table2.setItem(i, 0, QTableWidgetItem(str(r.get("peptide", ""))))
             self.table2.setItem(i, 1, QTableWidgetItem(str(r.get("percolator_q", ""))))
             if rep["matched"]:
-                cov = f"{len(rep['matched'])} ions  {rep.get('covered','')}/" \
-                      f"{len(plain_seq(r.get('peptide','')))} aa  {rep['divider']}"
-                score = f"{rep['score']:.3g}"
+                cov = f"{rep['score']:.3g}"
             elif peaks is not None and peaks.size:
-                cov, score = "no match", "0"
+                cov = "0"
             else:
-                cov, score = "", ""
+                cov = ""
             self.table2.setItem(i, 2, QTableWidgetItem(cov))
-            self.table2.setItem(i, 3, QTableWidgetItem(score))
 
     # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
