@@ -747,7 +747,13 @@ def peptide_fragment_ions(seq, charge, iso_low, iso_high, ions="by",
     seen = set()
     for isotope_index, (_mn, mean_mass, subidxs) in enumerate(groups):
         prec_mz = (mean_mass + proton * charge) / charge
-        if not (iso_low <= prec_mz <= iso_high):
+        # Always generate the monoisotopic (index 0) fragments so a candidate is
+        # never zeroed out just because its precursor isotope fell outside the
+        # MS2 isolation window (e.g. a different-charge candidate); the window
+        # only ADDS the higher precursor isotopes (M+1, M+2, ...) that were
+        # co-isolated. This keeps Table 2 coverage and the panel-3 annotation
+        # consistent for every candidate.
+        if isotope_index != 0 and not (iso_low <= prec_mz <= iso_high):
             continue
         if not subidxs:
             continue

@@ -520,6 +520,7 @@ class MSViewerTab(QMainWindow):
         self._selected_n_members = None      # isotope count of the selection, for hypothetical width
         self._panel3_mode = "ms1"  # "ms1" (envelope/charge grid) or "ms2" (spectrum)
         self._ms2_scan = None      # the MS2 scan currently shown in panel 3
+        self._ms2_band = None      # (low, high, rt) isolation band kept on panel 2
         self._ms1_theo = None      # {seq, charge} of the Table-2 peptide overlaid on panel 1
         self._ms1_theo_item = None # the BarGraphItem for that overlay
         self._nav = []            # navigation history of (window, charge)
@@ -1330,6 +1331,8 @@ class MSViewerTab(QMainWindow):
         # only shown after the user clicks an MS2 point).
         self._panel3_mode = "ms1"
         self._ms2_scan = None
+        self._ms2_band = None   # drop the isolation band
+        self._apply_ms2_band()
         self._ms1_theo = None   # drop any Table-2 theoretical MS1 overlay
         self.render_table1(self.current)
         # Initialize the window from the ± controls and snap the views to it.
@@ -1900,7 +1903,8 @@ class MSViewerTab(QMainWindow):
         self.p2.clear()
         self._sel_border_item = None   # cleared by p2.clear(); re-added below
         self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
-        self.p2.addItem(self.p2_ms2_band)   # survives clear; empty until hover
+        self.p2.addItem(self.p2_ms2_band)   # survives clear
+        self._apply_ms2_band()              # restore the current scan's band
         if not isinstance(points, dict) or points["mz"].size == 0:
             self._render_selection_border()
             return
@@ -1976,6 +1980,8 @@ class MSViewerTab(QMainWindow):
         # Selecting an MS1 distribution returns panel 3 to its MS1 view.
         self._panel3_mode = "ms1"
         self._ms2_scan = None
+        self._ms2_band = None
+        self._apply_ms2_band()
         # Refresh table 1 to this distribution's members, then redraw panel 3.
         try:
             self.table1_for_distribution(did)
@@ -2032,16 +2038,26 @@ class MSViewerTab(QMainWindow):
         except Exception:
             pass
 
-    def _on_ms2_hover(self, scene_pos):
-        """Hovering an MS2 line on the strip draws its isolation band on panel 2:
-        a horizontal line at the scan's RT spanning the isolated m/z range."""
-        if not self._ms2_scans:
+    def _apply_ms2_band(self):
+        """(Re)draw the persistent isolation band on panel 2 for the current MS2
+        scan, or clear it when there is none."""
+        band = getattr(self, "_ms2_band", None)
+        if band is not None and band[0] is not None and band[2] is not None:
+            low, high, rt = band
+            self.p2_ms2_band.setData([low, high], [rt, rt])
+        else:
             self.p2_ms2_band.setData([], [])
+
+    def _on_ms2_hover(self, scene_pos):
+        """Hovering an MS2 line on the strip previews its isolation band on panel
+        2; leaving the strip reverts to the band of the scan being viewed."""
+        if not self._ms2_scans:
+            self._apply_ms2_band()
             return
         try:
             vb = self.ms2_plot.getViewBox()
             if not vb.sceneBoundingRect().contains(scene_pos):
-                self.p2_ms2_band.setData([], [])
+                self._apply_ms2_band()
                 return
             y = vb.mapSceneToView(scene_pos).y()
             (y0, y1) = vb.viewRange()[1]
@@ -2058,7 +2074,7 @@ class MSViewerTab(QMainWindow):
         if abs(rt_arr[i] - y) <= max(abs(y1 - y0) * 0.03, 1e-4) and low is not None:
             self.p2_ms2_band.setData([low, high], [scan["rt"], scan["rt"]])
         else:
-            self.p2_ms2_band.setData([], [])
+            self._apply_ms2_band()
 
     def _on_ms2_strip_clicked(self, event):
         """Click anywhere on the MS2 strip -> select the nearest MS2 line by RT."""
@@ -2087,6 +2103,13 @@ class MSViewerTab(QMainWindow):
             return
         self._panel3_mode = "ms2"
         self._ms2_scan = scan
+        # Keep the isolation band on panel 2 for the scan being viewed (persists
+        # through redraws + Table-2 peptide selection, not just on hover).
+        low, high = scan.get("iso_low"), scan.get("iso_high")
+        if low is None or high is None:
+            low = high = scan.get("mz")
+        self._ms2_band = (low, high, scan.get("rt")) if low is not None else None
+        self._apply_ms2_band()
         # Table 2 (other candidate PSMs) only appears for the MS2 view.
         self.dock_table2.show()
         try:
@@ -2115,12 +2138,19 @@ class MSViewerTab(QMainWindow):
             self.p3_title.setText(f"MS2 load error: {exc}")
 
     def populate_table2(self, scan, peak_mz=None):
-        # Candidate PSMs near this precursor m/z in the current file, each shown
-        # with the sequence coverage its b/y fragment ions get against THIS MS2
-        # spectrum -- so the user can judge how distinguishable the candidates
-        # are (the coverage concept from sequencecoverageconcept.py).
+        # Candidate PSMs near this precursor m/z in the current file. The coverage
+        # column is computed from the SAME generate-and-match used to annotate the
+        # MS2 spectrum in panel 3 (fragments.peptide_fragment_ions ->
+        # annotate_spectrum -> coverage_metrics matchcounts), so the table value
+        # and the green ions in panel 3 always agree.
         prec = scan.get("mz")
         peaks = np.asarray(peak_mz, dtype=float) if peak_mz is not None else None
+        ints = getattr(self, "_ms2_int", None)
+        low = scan.get("iso_low")
+        high = scan.get("iso_high")
+        if low is None or high is None:
+            base = prec or 0.0
+            low, high = base - 1.0, base + 1.0
         rows = []
         for r in self.file_psms():
             try:
@@ -2131,17 +2161,25 @@ class MSViewerTab(QMainWindow):
                 psm_mz = None
             if prec is None or (psm_mz is not None and abs(psm_mz - prec) < 3.0):
                 rows.append(r)
-        # Compute each candidate's fragment coverage + score, then rank the
-        # peptides best-score-first (how the reference sorts them) so the most
-        # distinguishable candidate is at the top.
+        # Compute each candidate's fragment coverage (matchcounts), then rank the
+        # peptides best-first so the most distinguishable candidate is at the top.
         reports = []
         for r in rows:
-            if peaks is not None and peaks.size:
-                rep = seqcoverage.coverage_report(
-                    plain_seq(r.get("peptide", "")), peaks, ppm=self.xics_ppm)
-            else:
-                rep = {"divider": "", "score": 0.0, "matched": []}
-            reports.append((r, rep))
+            mc = 0
+            if peaks is not None and peaks.size and ints is not None:
+                seq = plain_seq(r.get("peptide", ""))
+                z = peptide_charge(r) or scan.get("charge") or 2
+                try:
+                    ents = seqfragments_module.peptide_fragment_ions(
+                        seq, z, low, high, dividingthreshold=0.1,
+                        subisotopomericdepth=0.5)
+                    matched, _ = seqfragments_module.annotate_spectrum(
+                        ents, peaks, ints, ppm=self.frag_ppm)
+                    labels = [m["ion"] for m in matched]
+                    mc = seqcoverage.coverage_metrics(seq, labels)["matchcounts"]
+                except Exception:
+                    mc = 0
+            reports.append((r, {"matchcounts": mc}))
         # Rank by matchcounts (the reference's secondfinalmetrics): higher = more
         # fragment coverage = more confident. Best-first by default.
         reports.sort(key=lambda rr: rr[1]["matchcounts"], reverse=True)
@@ -2187,6 +2225,10 @@ class MSViewerTab(QMainWindow):
         if len(seq) < 2:
             return
         charge = peptide_charge(r) or scan.get("charge") or 2
+        # Auto-select the matching MS1 distribution in panel 2 (dotted border)
+        # WITHOUT flipping panel 3 back to its MS1 view (we stay on the MS2
+        # spectrum). The band + border survive panel-2 redraws.
+        self._select_distribution_for_candidate(r, charge, scan)
         # Also overlay this peptide's theoretical MS1 distribution on panel 1.
         self._ms1_theo = {"seq": seq, "charge": charge}
         self._draw_ms1_theo_overlay()
@@ -2211,6 +2253,33 @@ class MSViewerTab(QMainWindow):
                               if w.isRunning()]
         self._frag_workers.append(worker)
         worker.start()
+
+    def _select_distribution_for_candidate(self, r, charge, scan):
+        """Select the MS1 distribution matching a Table-2 candidate (dotted border
+        on panel 2) without redrawing panel 3 (keeps the MS2 view up)."""
+        if self.db is None:
+            return
+        try:
+            neutral = peptide_mass(r)
+            if not neutral:
+                return
+            z = max(1, int(charge or 1))
+            mono_mz = neutral / z + 1.007276
+            rt = scan.get("rt")
+            if rt is None and isinstance(self.current, dict):
+                rt = self.current.get("rt")
+            if rt is None:
+                return
+            dists = self.db.distributions_in_window(
+                mz_min=mono_mz - self.mz_half, mz_max=mono_mz + self.mz_half,
+                rt_start=rt - self.rt_half, rt_end=rt + self.rt_half,
+                charge=z, limit=1)
+            if dists:
+                # _set_selected only draws the border + anchors charge search; it
+                # does NOT touch panel 3, so the MS2 spectrum stays up.
+                self._set_selected(dists[0]["distribution_id"])
+        except Exception:
+            pass
 
     def _on_ms1theo_changed(self):
         """raw <-> summed switch for the theoretical MS1 overlay."""
