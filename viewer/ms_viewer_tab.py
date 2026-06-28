@@ -2042,10 +2042,13 @@ class MSViewerTab(QMainWindow):
                 # Panel 1: vertical wheel pans m/z (x). Intensity y stays fixed.
                 self._pan_axis(vb, 0, dy)
             else:
-                # Panel 2: horizontal wheel (or Shift+wheel) pans m/z (x),
-                # vertical wheel pans time (y). Shift+vertical scrolls m/z the
-                # same as scrolling over the m/z axis outside the plot area.
-                if event.modifiers() & Qt.ShiftModifier:
+                # Panel 2: horizontal wheel, Shift+wheel, or a wheel over the
+                # bottom m/z axis pans m/z (x); vertical wheel over the plot
+                # pans time (y).
+                bottom = pan_target.getPlotItem().getAxis("bottom")
+                plot_h = pan_target.viewport().height()
+                over_mz_axis = event.position().y() > (plot_h - bottom.height())
+                if (event.modifiers() & Qt.ShiftModifier) or over_mz_axis:
                     self._pan_axis(vb, 0, dy or dx)
                 elif abs(dx) > abs(dy):
                     self._pan_axis(vb, 0, dx)
