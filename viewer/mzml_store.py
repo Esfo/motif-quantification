@@ -50,6 +50,38 @@ def precursor_mz(scan):
     return None
 
 
+def isolation_window(scan):
+    """(low_mz, high_mz) of the precursor isolation window, or None.
+
+    Reads the mzML ``isolationWindow`` target + lower/upper offsets; falls back
+    to the selected-ion m/z when offsets are absent. Used to draw the MS2
+    selection band on panel 2 spanning the exact mass range that was isolated.
+    """
+    try:
+        precursor = scan["precursorList"]["precursor"][0]
+    except Exception:
+        return None
+    try:
+        win = precursor.get("isolationWindow", {})
+        target = win.get("isolation window target m/z")
+        lower = win.get("isolation window lower offset")
+        upper = win.get("isolation window upper offset")
+        if target is not None and lower is not None and upper is not None:
+            target = float(target)
+            return (target - float(lower), target + float(upper))
+    except Exception:
+        pass
+    # Fall back to the selected ion m/z with no width.
+    try:
+        selected = precursor["selectedIonList"]["selectedIon"][0]
+        value = selected.get("selected ion m/z")
+        if value is not None:
+            return (float(value), float(value))
+    except Exception:
+        pass
+    return None
+
+
 def scan_arrays(scan):
     mz_value = scan.get("m/z array")
     intensity_value = scan.get("intensity array")
@@ -78,6 +110,8 @@ class ScanSummary:
     level: int
     rt: float | None
     precursor_mz: float | None
+    iso_low: float | None = None
+    iso_high: float | None = None
 
 
 class MzmlStore:
@@ -123,6 +157,7 @@ class MzmlStore:
                 level = scan_ms_level(scan)
                 rt = scan_rt(scan)
                 pmz = precursor_mz(scan)
+                iso = isolation_window(scan) if level == 2 else None
 
                 summary = ScanSummary(
                     number=number,
@@ -130,6 +165,8 @@ class MzmlStore:
                     level=level,
                     rt=rt,
                     precursor_mz=pmz,
+                    iso_low=iso[0] if iso else None,
+                    iso_high=iso[1] if iso else None,
                 )
 
                 summaries.append(summary)

@@ -72,6 +72,7 @@ try:
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     from . import isotopes
     from . import coverage as seqcoverage
+    from . import fragments as seqfragments_module
     from .theming import palette, style_plot, style_gl
     from .distributions_db import DistributionsDB
     from .points_store import PointsStore
@@ -82,6 +83,7 @@ except ImportError:
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     import isotopes
     import coverage as seqcoverage
+    import fragments as seqfragments_module
     from theming import palette, style_plot, style_gl
     from distributions_db import DistributionsDB
     from points_store import PointsStore
@@ -172,7 +174,8 @@ class EvidenceWorker(QThread):
                     self.mz_min, self.mz_max, self.rt_start, self.rt_end,
                     mz_bins=self.mz_bins, mode=self.mode)
                 # MS2 scans always come from the centroid run (where they live).
-                ms2 = [{"rt": s.rt, "mz": s.precursor_mz, "number": s.number, "id": s.spectrum_id}
+                ms2 = [{"rt": s.rt, "mz": s.precursor_mz, "number": s.number, "id": s.spectrum_id,
+                        "iso_low": s.iso_low, "iso_high": s.iso_high}
                        for s in self.centroid.ms2_in_rt(self.rt_start, self.rt_end)]
 
             self.done.emit({"ms1_number": ms1_number, "scan_mz": scan_mz,
@@ -215,6 +218,45 @@ class Table1Worker(QThread):
                     result["rows"] = db.distribution_members(did)
             finally:
                 db.close()
+        except Exception as exc:
+            result["error"] = f"{exc}\n{traceback.format_exc()}"
+        self.done.emit(result)
+
+
+class FragmentWorker(QThread):
+    """Computes a peptide's theoretical b/y fragment ions and matches them to the
+    MS2 spectrum off the UI thread.
+
+    The fragment-isotope walk (``fragments.peptide_fragment_ions``) is heavy, so
+    it runs here; the result drives the green/red overlay in panel 3. ``token``
+    discards a superseded peptide selection (latest-wins).
+    """
+
+    done = Signal(object)
+
+    def __init__(self, seq, charge, iso_low, iso_high, peak_mz, peak_int, ppm,
+                 token, dividing_threshold, subiso_depth):
+        super().__init__()
+        self.seq = seq
+        self.charge = charge
+        self.iso_low = iso_low
+        self.iso_high = iso_high
+        self.peak_mz = peak_mz
+        self.peak_int = peak_int
+        self.ppm = ppm
+        self.token = token
+        self.dividing_threshold = dividing_threshold
+        self.subiso_depth = subiso_depth
+
+    def run(self):
+        result = {"token": self.token, "seq": self.seq, "items": []}
+        try:
+            entries = seqfragments_module.peptide_fragment_ions(
+                self.seq, self.charge, self.iso_low, self.iso_high,
+                dividingthreshold=self.dividing_threshold,
+                subisotopomericdepth=self.subiso_depth)
+            result["items"] = seqfragments_module.match_fragment_ions(
+                entries, self.peak_mz, self.peak_int, ppm=self.ppm)
         except Exception as exc:
             result["error"] = f"{exc}\n{traceback.format_exc()}"
         self.done.emit(result)
@@ -829,14 +871,15 @@ class MSViewerTab(QMainWindow):
             except Exception:
                 pass
 
-        # Star marker on panel 2 showing a hovered MS2 scan's (m/z, RT) location,
-        # same colour as the MS2 strip. Re-added after each p2.clear (draw_panel2).
-        self.p2_ms2_star = pg.ScatterPlotItem(size=16, symbol="star",
-                                              brush=pg.mkBrush(255, 170, 50, 255),
-                                              pen=pg.mkPen(255, 170, 50, 255))
-        self.p2_ms2_star.setZValue(30)
-        self.p2.addItem(self.p2_ms2_star)
-        # Hover over the MS2 strip -> show that scan's star on panel 2.
+        # Band on panel 2 showing a hovered MS2 scan's isolation window: a thick
+        # horizontal line at the scan's RT spanning the exact m/z range that was
+        # isolated, same colour as the MS2 strip lines at ~50% opacity (3 px, so
+        # it reads as a band the same width as the left strip's RT bands).
+        self.p2_ms2_band = pg.PlotCurveItem(
+            pen=pg.mkPen(255, 170, 50, 128, width=3))
+        self.p2_ms2_band.setZValue(30)
+        self.p2.addItem(self.p2_ms2_band)
+        # Hover over the MS2 strip -> show that scan's isolation band on panel 2.
         self.ms2_plot.scene().sigMouseMoved.connect(self._on_ms2_hover)
 
         # MS2 strip shares panel 2's RT (y) axis.
@@ -1013,8 +1056,13 @@ class MSViewerTab(QMainWindow):
         # Click a header to sort by that column; click again to reverse.
         self.table2.setSortingEnabled(True)
         self.table2.horizontalHeader().setSortIndicatorShown(True)
-        dock = QDockWidget("Table 2 - MS2 candidates", self)
+        self.table2.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table2.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Selecting a candidate peptide overlays its fragment ions on panel 3.
+        self.table2.itemSelectionChanged.connect(self._on_table2_peptide_selected)
+        dock = QDockWidget("", self)
         dock.setObjectName("dock_table2")
+        dock.setTitleBarWidget(QWidget())   # drop the title bar (dead space)
         dock.setWidget(self.table2)
         self.dock_table2 = dock
 
@@ -1834,7 +1882,7 @@ class MSViewerTab(QMainWindow):
         self.p2.clear()
         self._sel_border_item = None   # cleared by p2.clear(); re-added below
         self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
-        self.p2.addItem(self.p2_ms2_star)   # survives clear; empty until hover
+        self.p2.addItem(self.p2_ms2_band)   # survives clear; empty until hover
         if not isinstance(points, dict) or points["mz"].size == 0:
             self._render_selection_border()
             return
@@ -1967,15 +2015,15 @@ class MSViewerTab(QMainWindow):
             pass
 
     def _on_ms2_hover(self, scene_pos):
-        """Hovering an MS2 line on the strip puts a star at its (m/z, RT) on
-        panel 2 (same colour as the strip)."""
+        """Hovering an MS2 line on the strip draws its isolation band on panel 2:
+        a horizontal line at the scan's RT spanning the isolated m/z range."""
         if not self._ms2_scans:
-            self.p2_ms2_star.setData([])
+            self.p2_ms2_band.setData([], [])
             return
         try:
             vb = self.ms2_plot.getViewBox()
             if not vb.sceneBoundingRect().contains(scene_pos):
-                self.p2_ms2_star.setData([])
+                self.p2_ms2_band.setData([], [])
                 return
             y = vb.mapSceneToView(scene_pos).y()
             (y0, y1) = vb.viewRange()[1]
@@ -1984,10 +2032,15 @@ class MSViewerTab(QMainWindow):
         rt_arr = np.array([rt for rt, _ in self._ms2_scans])
         i = int(np.argmin(np.abs(rt_arr - y)))
         scan = self._ms2_scans[i][1]
-        if abs(rt_arr[i] - y) <= max(abs(y1 - y0) * 0.03, 1e-4) and scan.get("mz") is not None:
-            self.p2_ms2_star.setData([{"pos": (scan["mz"], scan["rt"])}])
+        # m/z span = the isolation window; fall back to the precursor m/z.
+        low = scan.get("iso_low")
+        high = scan.get("iso_high")
+        if low is None or high is None:
+            low = high = scan.get("mz")
+        if abs(rt_arr[i] - y) <= max(abs(y1 - y0) * 0.03, 1e-4) and low is not None:
+            self.p2_ms2_band.setData([low, high], [scan["rt"], scan["rt"]])
         else:
-            self.p2_ms2_star.setData([])
+            self.p2_ms2_band.setData([], [])
 
     def _on_ms2_strip_clicked(self, event):
         """Click anywhere on the MS2 strip -> select the nearest MS2 line by RT."""
@@ -2024,7 +2077,14 @@ class MSViewerTab(QMainWindow):
                 self.p3_title.setText(f"MS2 scan {scan.get('number','')} not found")
                 return
             mz, inten = scan_arrays(spectrum)
+            # Remember the spectrum so a Table-2 peptide selection can overlay its
+            # fragment ions without re-reading the scan.
+            self._ms2_mz, self._ms2_int = mz, inten
+            self._frag_overlay = []          # cleared by plot_spectrum's clear()
+            self._frag_token = getattr(self, "_frag_token", 0) + 1
             self.p3_stack.setCurrentIndex(0)
+            # Default title until a peptide is picked in Table 2 (then it becomes
+            # just the peptide).
             plot_spectrum(self.p3, mz, inten, color=palette(self.theme)["fg"],
                           title=f"MS2  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
             # Ground the baseline at 0 (no gap below the sticks).
@@ -2072,18 +2132,117 @@ class MSViewerTab(QMainWindow):
         # best-first order shows once re-enabled (until the user clicks a header
         # to re-sort).
         self.table2.setSortingEnabled(False)
+        # Clear any selection-driven fragment overlay from a previous spectrum.
+        self.table2.clearSelection()
         self.table2.setRowCount(len(reports))
         for i, (r, rep) in enumerate(reports):
-            self.table2.setItem(i, 0, QTableWidgetItem(str(r.get("peptide", ""))))
+            pep_item = QTableWidgetItem(str(r.get("peptide", "")))
+            pep_item.setData(Qt.UserRole, r)   # full PSM row for selection lookup
+            self.table2.setItem(i, 0, pep_item)
             self.table2.setItem(i, 1, NumericItem(str(r.get("percolator_q", "")),
                                                   safe_float(r.get("percolator_q"))))
             if peaks is not None and peaks.size:
-                cov_val = rep["matchcounts"]
+                cov_val = rep.get("matchcounts", 0)
                 cov = str(cov_val)
             else:
                 cov, cov_val = "", None
             self.table2.setItem(i, 2, NumericItem(cov, cov_val))
         self.table2.setSortingEnabled(True)
+
+    def _on_table2_peptide_selected(self):
+        """A candidate peptide was clicked in Table 2 -> overlay its theoretical
+        b/y fragment ions on the MS2 spectrum (green = matched, red = absent),
+        and set the panel-3 title to just that peptide."""
+        items = self.table2.selectedItems()
+        scan = getattr(self, "_ms2_scan", None)
+        if not items or scan is None or self._panel3_mode != "ms2":
+            return
+        row = items[0].row()
+        pep_item = self.table2.item(row, 0)
+        r = pep_item.data(Qt.UserRole) if pep_item is not None else None
+        if not r:
+            return
+        seq = plain_seq(r.get("peptide", ""))
+        if len(seq) < 2:
+            return
+        charge = peptide_charge(r) or scan.get("charge") or 2
+        low = scan.get("iso_low")
+        high = scan.get("iso_high")
+        if low is None or high is None:
+            # No isolation window in the mzML -> use a default ~1 m/z window so at
+            # least the monoisotopic precursor is included.
+            prec = scan.get("mz") or 0.0
+            low, high = prec - 1.0, prec + 1.0
+        self._frag_token = getattr(self, "_frag_token", 0) + 1
+        # Title becomes just the peptide once a candidate is selected.
+        self.p3.setTitle(str(r.get("peptide", "")), color=palette(self.theme)["fg"])
+        worker = FragmentWorker(
+            seq, charge, low, high,
+            getattr(self, "_ms2_mz", np.array([])),
+            getattr(self, "_ms2_int", np.array([])),
+            self.xics_ppm, self._frag_token,
+            dividing_threshold=0.1, subiso_depth=0.5)
+        worker.done.connect(self._on_fragments_ready)
+        self._frag_workers = [w for w in getattr(self, "_frag_workers", [])
+                              if w.isRunning()]
+        self._frag_workers.append(worker)
+        worker.start()
+
+    def _on_fragments_ready(self, result):
+        if result.get("token") != getattr(self, "_frag_token", 0):
+            return
+        if result.get("error"):
+            return
+        self._draw_fragment_overlay(result.get("items", []))
+
+    def _clear_fragment_overlay(self):
+        for item in getattr(self, "_frag_overlay", []):
+            try:
+                self.p3.removeItem(item)
+            except Exception:
+                pass
+        self._frag_overlay = []
+
+    def _draw_fragment_overlay(self, items):
+        """Draw a green (matched) / red (absent) vertical marker + label per
+        theoretical fragment ion onto the MS2 spectrum."""
+        self._clear_fragment_overlay()
+        if not items:
+            return
+        pal = palette(self.theme)
+        fg = pal["fg"]
+        dark = self.theme == "dark"
+        green = (90, 220, 120) if dark else (0, 150, 0)
+        red = (255, 95, 95) if dark else (205, 0, 0)
+        # Heights: matched lines reach their peak; absent lines a low stub so the
+        # expected position is visible without dominating.
+        inten = getattr(self, "_ms2_int", np.array([]))
+        top = float(np.max(inten)) if inten.size else 1.0
+        stub = top * 0.18
+        overlay = []
+        for it in items:
+            mz = it["theo_mz"]
+            matched = it["matched"]
+            color = green if matched else red
+            height = it["intensity"] if matched and it["intensity"] > 0 else stub
+            line = pg.PlotCurveItem([mz, mz], [0.0, height],
+                                    pen=pg.mkPen(*color, width=2))
+            line.setZValue(20)
+            self.p3.addItem(line)
+            overlay.append(line)
+            # Label: ion + which MS1 isotope(s) it descended from. Coloured by the
+            # theme fg (NOT the line colour), sitting at the top of the line.
+            isos = it.get("isotopes", [])
+            iso_txt = ",".join(f"M+{i}" for i in isos) if isos else ""
+            z = it.get("charge", 1)
+            ztxt = "" if z == 1 else f"({z}+)"
+            label = pg.TextItem(f"{it['ion']}{ztxt} {iso_txt}".strip(),
+                                color=fg, anchor=(0.5, 1.0))
+            label.setPos(mz, height)
+            label.setZValue(21)
+            self.p3.addItem(label)
+            overlay.append(label)
+        self._frag_overlay = overlay
 
     # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
