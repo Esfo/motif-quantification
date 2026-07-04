@@ -229,7 +229,7 @@ data the pipeline produces. The four founding goals:
 - ✅ **Lin/Log colour** toggle (like MS Data's) rescales the FDR colour gradient; the colour bar's percentage ticks move with it.
 - ✅ **Light/dark** adaptive colours for the panels only (the left file list keeps the app palette); theme stays in sync across tabs.
 - ✅ Panel sizes are **remembered** (h/v splitters persisted by the main window, like the MS Data dock layout); opening/reloading a folder keeps the current tab.
-- ✅ Protein list **sort** row ("Sort By" + metric dropdown + asc/desc toggle): % Coverage, Protein Length, Total Identified Peptides, Protein Confidence, Spectral Count (PSMs), Best Peptide q-value, Accession (A–Z).
+- ✅ Protein **table** (sorted value | protein name) with a "Sort By" row (metric dropdown + asc/desc toggle): % Coverage, Protein Length, Total Identified Peptides, FDR, Spectral Count (PSMs). Changing the sort jumps the view to the top.
 
 ---
 

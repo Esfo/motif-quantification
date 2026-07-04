@@ -28,20 +28,21 @@ mirror the Sage enzyme config in execution.xsh.
 """
 
 import math
-import re
 
 from PySide6.QtCore import Qt, QRectF, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDoubleSpinBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -101,10 +102,8 @@ SORT_OPTIONS = [
     "% Coverage",
     "Protein Length",
     "Total Identified Peptides",
-    "Protein Confidence",
+    "FDR",
     "Spectral Count (PSMs)",
-    "Best Peptide q-value",
-    "Accession (A–Z)",
 ]
 
 
@@ -693,14 +692,25 @@ class ProteinsTab(QWidget):
         sort_row.addWidget(self.sort_dir_btn)
         left_layout.addLayout(sort_row)
 
-        self.protein_list = QListWidget()
-        self.protein_list.setStyleSheet(
-            "QListWidget::item:selected,"
-            "QListWidget::item:selected:!active"
+        # Protein table: the sorted value on the left, protein name on the right.
+        self.protein_table = QTableWidget(0, 2)
+        self.protein_table.setHorizontalHeaderLabels([SORT_OPTIONS[0], "Protein"])
+        self.protein_table.verticalHeader().setVisible(False)
+        self.protein_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.protein_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.protein_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.protein_table.setShowGrid(False)
+        self.protein_table.setWordWrap(False)
+        hdr = self.protein_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        self.protein_table.setStyleSheet(
+            "QTableWidget::item:selected,"
+            "QTableWidget::item:selected:!active"
             " { background-color: #2f6fb3; color: white; }"
         )
-        self.protein_list.itemSelectionChanged.connect(self._on_protein_selected)
-        left_layout.addWidget(self.protein_list, stretch=1)
+        self.protein_table.itemSelectionChanged.connect(self._on_protein_selected)
+        left_layout.addWidget(self.protein_table, stretch=1)
 
         # right side: panel 1 over panel 2
         right = QWidget()
@@ -879,59 +889,55 @@ class ProteinsTab(QWidget):
                 self._cov_cache[key] = 100.0 * sum(hit) / len(seq)
         return self._cov_cache[key]
 
-    def _best_peptide_q(self, row, filename):
-        qmap = self.session.peptide_q_for_file(filename or "")
-        best = None
-        for pep in str(row.get("peptides", "")).split(";"):
-            plain = _plain(pep)
-            q = qmap.get(plain)
-            if plain in qmap and q is not None and (best is None or q < best):
-                best = q
-        return best
-
-    def _metric_value(self, metric, pid, row, filename):
-        """A sortable value; larger = 'better' so descending puts the best first."""
+    def _metric_raw(self, metric, pid, row, filename):
+        """The metric's actual value (for display), or None when unavailable."""
         if metric == "% Coverage":
             return self._protein_coverage(pid, filename)
         if metric == "Protein Length":
             return self._protein_len(pid)
         if metric == "Total Identified Peptides":
             return _safe_int(row.get("n_peptides"))
-        if metric == "Protein Confidence":
-            q = _safe_float(row.get("protein_q"))
-            return -(q if q is not None else 1.0)     # most confident (low q) first
+        if metric == "FDR":
+            return _safe_float(row.get("protein_q"))
         if metric == "Spectral Count (PSMs)":
             return _safe_int(row.get("n_psms"))
-        if metric == "Best Peptide q-value":
-            q = self._best_peptide_q(row, filename)
-            return -(q if q is not None else 1.0)
-        if metric == "Accession (A–Z)":
-            return pid.lower()
-        return pid.lower()
+        return None
+
+    def _format_metric(self, metric, val):
+        if val is None:
+            return "—"
+        if metric == "% Coverage":
+            return f"{val:.1f}%"
+        if metric == "FDR":
+            return f"{val * 100:.2f}%"
+        return str(int(val))
+
+    def _metric_value(self, metric, pid, row, filename):
+        """Sort key; larger = 'better' so descending puts the best first."""
+        raw = self._metric_raw(metric, pid, row, filename)
+        if metric == "FDR":                 # lower FDR is better
+            return -(raw if raw is not None else 1.0)
+        return raw if raw is not None else 0
 
     def _sort_proteins(self, items, filename):
         metric = self.sort_combo.currentText() if hasattr(self, "sort_combo") else SORT_OPTIONS[0]
         keyed = [(self._metric_value(metric, pid, row, filename), pid, row)
                  for pid, row in items]
-        # Accession sorts alphabetically (ascending A–Z by default); numeric
-        # metrics default to descending (best first). The button flips either.
-        is_text = metric.startswith("Accession")
-        reverse = self._sort_desc if not is_text else (not self._sort_desc)
         try:
-            keyed.sort(key=lambda t: t[0], reverse=reverse)
+            keyed.sort(key=lambda t: t[0], reverse=self._sort_desc)
         except TypeError:
-            keyed.sort(key=lambda t: str(t[0]), reverse=reverse)
+            keyed.sort(key=lambda t: str(t[0]), reverse=self._sort_desc)
         return [(pid, row) for _v, pid, row in keyed]
 
     # ---- events ----------------------------------------------------------
 
     def _on_sort_changed(self):
-        self._refresh_protein_list()
+        self._refresh_protein_list(scroll_top=True)
 
     def _on_sort_dir_toggle(self):
         self._sort_desc = not self._sort_desc
         self.sort_dir_btn.setText("▼" if self._sort_desc else "▲")
-        self._refresh_protein_list()
+        self._refresh_protein_list(scroll_top=True)
 
     def _on_file_changed(self):
         self.current_file = self.file_combo.currentData()
@@ -940,24 +946,39 @@ class ProteinsTab(QWidget):
     def _on_fdr_changed(self):
         self._refresh_protein_list()
 
-    def _refresh_protein_list(self):
+    def _refresh_protein_list(self, scroll_top=False):
         prev = self.current_protein
-        self.protein_list.blockSignals(True)
-        self.protein_list.clear()
-        for pid, _row in self._identified_proteins(self.current_file):
-            item = QListWidgetItem(pid)
-            item.setData(Qt.UserRole, pid)
-            self.protein_list.addItem(item)
-        self.protein_list.blockSignals(False)
-        if prev is not None:
-            for i in range(self.protein_list.count()):
-                if self.protein_list.item(i).data(Qt.UserRole) == prev:
-                    self.protein_list.setCurrentRow(i)
-                    break
+        metric = self.sort_combo.currentText()
+        rows = self._identified_proteins(self.current_file)
+
+        self.protein_table.blockSignals(True)
+        self.protein_table.setHorizontalHeaderLabels([metric, "Protein"])
+        self.protein_table.setRowCount(len(rows))
+        restore_row = -1
+        for i, (pid, row) in enumerate(rows):
+            val = self._format_metric(metric, self._metric_raw(metric, pid, row, self.current_file))
+            val_item = QTableWidgetItem(val)
+            val_item.setData(Qt.UserRole, pid)
+            name_item = QTableWidgetItem(pid)
+            name_item.setData(Qt.UserRole, pid)
+            self.protein_table.setItem(i, 0, val_item)
+            self.protein_table.setItem(i, 1, name_item)
+            if prev is not None and pid == prev:
+                restore_row = i
+        self.protein_table.blockSignals(False)
+
+        if restore_row >= 0:
+            self.protein_table.selectRow(restore_row)
+        # On a sort change the user wants the view to jump back to the top,
+        # regardless of which protein stays selected.
+        if scroll_top:
+            self.protein_table.scrollToTop()
+        elif restore_row >= 0:
+            self.protein_table.scrollToItem(self.protein_table.item(restore_row, 0))
         self._update_panels()
 
     def _on_protein_selected(self):
-        items = self.protein_list.selectedItems()
+        items = self.protein_table.selectedItems()
         self.current_protein = items[0].data(Qt.UserRole) if items else None
         self._update_panels()
 
@@ -1086,13 +1107,3 @@ def _safe_float(value):
 def _safe_int(value):
     f = _safe_float(value)
     return int(f) if f is not None else 0
-
-
-def _plain(peptide):
-    """Bare uppercase residues (strip flanks + modifications) — for matching a
-    protein's listed peptides against the file's identified peptide_plain set."""
-    value = peptide or ""
-    if len(value) >= 5 and value[1] == "." and value[-2] == ".":
-        value = value[2:-2]
-    value = re.sub(r"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}", "", value)
-    return re.sub(r"[^A-Za-z]", "", value).upper()
