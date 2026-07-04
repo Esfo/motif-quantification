@@ -426,3 +426,36 @@ def peptide_isotope_mzs(sequence, charge, dividing_threshold=DEFAULT_DIVIDING_TH
     mzs = (masses + proton * charge) / charge
     peak = abundances.max() if abundances.size else 1.0
     return mzs, abundances / peak
+
+
+def peptide_isotope_raw(sequence, dividing_threshold=DEFAULT_DIVIDING_THRESHOLD):
+    """RAW isotopologue distribution: one entry per sub-formula, with NO joining
+    of isotopomers that share a nominal M+N mass (cf. libraryadditions.py's raw
+    ``massesandabundances`` before ``subisotopomer_handler`` groups them).
+
+    Returns ``(masses, abundances)`` sorted by mass.
+    """
+    atomiccomposition = chem.peptide_atomic_composition(sequence)
+    _subformulas, massesandabundances = distribution_generation(
+        dividing_threshold, atomiccomposition)
+    masses = np.asarray(massesandabundances[0], dtype=float)
+    abundances = np.asarray(massesandabundances[1], dtype=float)
+    order = masses.argsort()
+    return masses[order], abundances[order]
+
+
+def peptide_isotope_bars(sequence, charge, mode="raw",
+                         dividing_threshold=DEFAULT_DIVIDING_THRESHOLD):
+    """Theoretical MS1 bars (m/z, abundance) for an overlay.
+
+    ``mode='raw'`` keeps every isotopomer separate; ``mode='summed'`` merges all
+    isotopomers at the same M+N into one signal (the ``sumabundancedist``). m/z
+    is at the given precursor ``charge``.
+    """
+    charge = max(1, int(charge or 1))
+    if mode == "summed":
+        masses, abundances = peptide_isotope_distribution(sequence, dividing_threshold)
+    else:
+        masses, abundances = peptide_isotope_raw(sequence, dividing_threshold)
+    mzs = (masses + proton * charge) / charge
+    return mzs, abundances

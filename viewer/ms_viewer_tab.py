@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDockWidget,
+    QDoubleSpinBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -71,6 +72,8 @@ try:
     from .region_view import HAVE_GL, gl
     from .session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     from . import isotopes
+    from . import coverage as seqcoverage
+    from . import fragments as seqfragments_module
     from .theming import palette, style_plot, style_gl
     from .distributions_db import DistributionsDB
     from .points_store import PointsStore
@@ -80,9 +83,29 @@ except ImportError:
     from region_view import HAVE_GL, gl
     from session import isotope_mzs, peptide_charge, peptide_mass, peptide_rt, safe_float
     import isotopes
+    import coverage as seqcoverage
+    import fragments as seqfragments_module
     from theming import palette, style_plot, style_gl
     from distributions_db import DistributionsDB
     from points_store import PointsStore
+
+
+class NumericItem(QTableWidgetItem):
+    """Table item that sorts by a numeric value when one is set, else by text.
+
+    Used for Table 2's q / coverage-score columns so header-click sorting orders
+    them by magnitude rather than lexically ('0.9' before '0.1' etc.)."""
+
+    def __init__(self, text, value=None):
+        super().__init__(text)
+        self._value = value
+
+    def __lt__(self, other):
+        a = self._value
+        b = getattr(other, "_value", None)
+        if a is not None and b is not None:
+            return a < b
+        return super().__lt__(other)
 
 
 def plain_seq(peptide):
@@ -152,13 +175,124 @@ class EvidenceWorker(QThread):
                     self.mz_min, self.mz_max, self.rt_start, self.rt_end,
                     mz_bins=self.mz_bins, mode=self.mode)
                 # MS2 scans always come from the centroid run (where they live).
-                ms2 = [{"rt": s.rt, "mz": s.precursor_mz, "number": s.number, "id": s.spectrum_id}
+                ms2 = [{"rt": s.rt, "mz": s.precursor_mz, "number": s.number, "id": s.spectrum_id,
+                        "iso_low": s.iso_low, "iso_high": s.iso_high}
                        for s in self.centroid.ms2_in_rt(self.rt_start, self.rt_end)]
 
             self.done.emit({"ms1_number": ms1_number, "scan_mz": scan_mz,
                             "scan_int": scan_int, "points": points, "region": region, "ms2": ms2})
         except Exception as exc:
             self.done.emit({"error": f"{exc}\n{traceback.format_exc()}"})
+
+
+class Table1Worker(QThread):
+    """Reads Table 1's line metrics off the UI thread.
+
+    The distribution lookup + member query hit the (read-only) distributions
+    sqlite, which can be slow; doing it here keeps selection responsive. SQLite
+    connections are thread-bound, so the worker opens its OWN ``DistributionsDB``
+    on ``db_path`` rather than touching the UI thread's connection. ``token``
+    lets the tab discard results from a superseded selection (latest-wins).
+    """
+
+    done = Signal(object)
+
+    def __init__(self, db_path, token, distribution_id=None, window=None):
+        super().__init__()
+        self.db_path = db_path
+        self.token = token
+        self.distribution_id = distribution_id
+        self.window = window  # dict(mz_min, mz_max, rt_start, rt_end, charge)
+
+    def run(self):
+        result = {"token": self.token, "distribution_id": None, "rows": []}
+        try:
+            db = DistributionsDB(self.db_path)
+            try:
+                did = self.distribution_id
+                if did is None and self.window is not None:
+                    dists = db.distributions_in_window(limit=1, **self.window)
+                    if dists:
+                        did = dists[0]["distribution_id"]
+                if did is not None:
+                    result["distribution_id"] = did
+                    result["rows"] = db.distribution_members(did)
+            finally:
+                db.close()
+        except Exception as exc:
+            result["error"] = f"{exc}\n{traceback.format_exc()}"
+        self.done.emit(result)
+
+
+class FragmentWorker(QThread):
+    """Computes a peptide's theoretical b/y fragment ions and matches them to the
+    MS2 spectrum off the UI thread.
+
+    The fragment-isotope walk (``fragments.peptide_fragment_ions``) is heavy, so
+    it runs here; the result drives the green/red overlay in panel 3. ``token``
+    discards a superseded peptide selection (latest-wins).
+    """
+
+    done = Signal(object)
+
+    def __init__(self, seq, charge, iso_low, iso_high, peak_mz, peak_int, ppm,
+                 token, dividing_threshold, subiso_depth):
+        super().__init__()
+        self.seq = seq
+        self.charge = charge
+        self.iso_low = iso_low
+        self.iso_high = iso_high
+        self.peak_mz = peak_mz
+        self.peak_int = peak_int
+        self.ppm = ppm
+        self.token = token
+        self.dividing_threshold = dividing_threshold
+        self.subiso_depth = subiso_depth
+
+    def run(self):
+        result = {"token": self.token, "seq": self.seq,
+                  "matched": [], "unmatched": (np.array([]), np.array([]))}
+        try:
+            entries = seqfragments_module.peptide_fragment_ions(
+                self.seq, self.charge, self.iso_low, self.iso_high,
+                dividingthreshold=self.dividing_threshold,
+                subisotopomericdepth=self.subiso_depth)
+            matched, unmatched = seqfragments_module.annotate_spectrum(
+                entries, self.peak_mz, self.peak_int, ppm=self.ppm)
+            result["matched"] = matched
+            result["unmatched"] = unmatched
+        except Exception as exc:
+            result["error"] = f"{exc}\n{traceback.format_exc()}"
+        self.done.emit(result)
+
+
+class DbTableWorker(QThread):
+    """Loads a whole Table-1 tab (distributions / charge distributions) off the
+    UI thread so the tabs can populate by default without freezing on open.
+    Opens its own read-only DistributionsDB (sqlite connections are thread-bound)."""
+
+    done = Signal(object)
+
+    def __init__(self, db_path, kind, token):
+        super().__init__()
+        self.db_path = db_path
+        self.kind = kind          # "distributions" | "charge"
+        self.token = token
+
+    def run(self):
+        result = {"kind": self.kind, "token": self.token, "rows": []}
+        try:
+            db = DistributionsDB(self.db_path)
+            try:
+                if self.kind == "distributions":
+                    result["rows"] = db.all_distributions()
+                elif self.kind == "charge":
+                    result["rows"] = db.all_analytes_multicharge()
+            finally:
+                db.close()
+        except Exception as exc:
+            result["error"] = f"{exc}\n{traceback.format_exc()}"
+        self.done.emit(result)
 
 
 # Horizontal alignment of the m/z (x) axis across panel 1 (2D & 3D) and panel 2.
@@ -265,10 +399,20 @@ class SimpleTableModel(QAbstractTableModel):
         super().__init__(parent)
         self._columns = columns
         self._rows = rows or []
+        self._loading = False
 
     def set_rows(self, rows):
         self.beginResetModel()
+        self._loading = False
         self._rows = rows or []
+        self.endResetModel()
+
+    def set_loading(self, loading=True):
+        """Show a single 'loading…' placeholder row while the data loads."""
+        self.beginResetModel()
+        self._loading = loading
+        if loading:
+            self._rows = []
         self.endResetModel()
 
     def row_dict(self, source_row):
@@ -277,13 +421,19 @@ class SimpleTableModel(QAbstractTableModel):
         return None
 
     def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._rows)
+        if parent.isValid():
+            return 0
+        return 1 if self._loading else len(self._rows)
 
     def columnCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self._columns)
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
+            return None
+        if self._loading:
+            if role == Qt.DisplayRole and index.column() == 0:
+                return "loading…"
             return None
         field, _, kind = self._columns[index.column()]
         value = self._rows[index.row()].get(field)
@@ -349,6 +499,51 @@ class FlipButton(QPushButton):
         self.setText(self._states[self._idx][1])
 
 
+class ArrowCycle(QWidget):
+    """A ◀ label ▶ cycler: the same state machine as FlipButton, but driven by
+    left/right arrows with a plain (non-button) label showing the current state.
+    Exposes key()/index()/set_index() so it's a drop-in for FlipButton."""
+
+    def __init__(self, states, on_change=None, parent=None):
+        super().__init__(parent)
+        self._states = list(states)
+        self._idx = 0
+        self._on_change = on_change
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.setFixedWidth(22)
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setFixedWidth(22)
+        self.label = QLabel(self._states[0][1])
+        self.label.setAlignment(Qt.AlignCenter)
+        fm = self.label.fontMetrics()
+        self.label.setFixedWidth(
+            max(fm.horizontalAdvance(lbl) for _, lbl in self._states) + 10)
+        self.prev_btn.clicked.connect(lambda: self._step(-1))
+        self.next_btn.clicked.connect(lambda: self._step(1))
+        lay.addWidget(self.prev_btn)
+        lay.addWidget(self.label)
+        lay.addWidget(self.next_btn)
+
+    def _step(self, delta):
+        self._idx = (self._idx + delta) % len(self._states)
+        self.label.setText(self._states[self._idx][1])
+        if self._on_change is not None:
+            self._on_change()
+
+    def key(self):
+        return self._states[self._idx][0]
+
+    def index(self):
+        return self._idx
+
+    def set_index(self, i):
+        self._idx = i % len(self._states)
+        self.label.setText(self._states[self._idx][1])
+
+
 # Per-class noise rendering: brighter/larger for substantial noise lines, fainter
 # and smaller down to lone stray points. Keys match the _noise_class values.
 #   1 = noise line (a feature/line with >=5 points, in no distribution)
@@ -367,6 +562,19 @@ class MSViewerTab(QMainWindow):
         self.session = session
         self.db = distributions_db
         self.xics_ppm = float(xics_ppm)
+        # Fragment-match tolerance for MS2 ion annotation = the search fragment
+        # tolerance (Sage fragment_tol, ±20 ppm in execution.xsh).
+        self.frag_ppm = 20.0
+        # Precursor tolerance for picking Table-2 candidates = the search
+        # precursor tolerance (Sage precursor_tol, ±10 ppm) together with the
+        # search isotope-error offsets (Sage isotope_errors, -1..+2). These are
+        # the search parameters from execution.xsh, not a hard-coded Da window.
+        self.precursor_ppm = 10.0
+        self.precursor_isotope_errors = (-1, 2)
+        # MS2-strip identification acceptance criteria: a scan's line is green if
+        # it has a PSM with q-value <= this FDR (0.1% default), else red. Editable
+        # via the "acceptance criteria" field on the panel-1 bar (value is a %).
+        self._fdr_threshold = 0.001
         self.rt_half = float(xics_rt_window)
         self.mz_half = 2.5
         self.theme = theme
@@ -413,6 +621,9 @@ class MSViewerTab(QMainWindow):
         self._selected_n_members = None      # isotope count of the selection, for hypothetical width
         self._panel3_mode = "ms1"  # "ms1" (envelope/charge grid) or "ms2" (spectrum)
         self._ms2_scan = None      # the MS2 scan currently shown in panel 3
+        self._ms2_band = None      # (low, high, rt) isolation band kept on panel 2
+        self._ms1_theo = None      # {seq, charge} of the Table-2 peptide overlaid on panel 1
+        self._ms1_theo_item = None # the BarGraphItem for that overlay
         self._nav = []            # navigation history of (window, charge)
         self._nav_i = -1
         self._suppress_record = False
@@ -454,6 +665,9 @@ class MSViewerTab(QMainWindow):
         # Table 2 is MS2-only: hidden until the user clicks an MS2 point, so the
         # MS1 panel 3 occupies the full panel-3 + table-2 space.
         self.dock_table2.hide()
+        # Load the distributions / charge-distributions tabs up front (in the
+        # background, with a 'loading…' placeholder) instead of lazily on click.
+        self._eager_load_table1_tabs()
 
     # ---- docks -----------------------------------------------------------
 
@@ -472,15 +686,15 @@ class MSViewerTab(QMainWindow):
             if name and self.session.distributions_db_for(name) is not None:
                 self.file_combo.addItem(name, name)
         self.file_combo.currentIndexChanged.connect(self.on_file_changed)
-        layout.addWidget(QLabel("file"))
         layout.addWidget(self.file_combo)
 
         self.protein_list = self._titled_list(layout, "proteins", self.on_protein_selected, self.show_all_proteins)
         self.peptide_list = self._titled_list(layout, "peptides", self.on_peptide_selected, self.show_all_peptides)
         self.psm_list = self._titled_list(layout, "PSMs", self.on_psm_selected, self.show_all_psms)
 
-        dock = QDockWidget("Lists", self)
+        dock = QDockWidget("", self)
         dock.setObjectName("dock_lists")
+        dock.setTitleBarWidget(QWidget())   # drop the "Lists" title bar (dead space)
         dock.setWidget(container)
         self.dock_lists = dock
 
@@ -531,6 +745,7 @@ class MSViewerTab(QMainWindow):
 
     def build_panel1_dock(self):
         self.p1_2d = pg.PlotWidget()
+        self.p1_load_overlay = self._make_loading_overlay(self.p1_2d)
         self.p1_2d.setLabel("bottom", "m/z")
         self.p1_2d.setLabel("left", "intensity")
         # NOTE: clip-to-view + 'peak' auto-downsampling was culling scatter points
@@ -600,20 +815,27 @@ class MSViewerTab(QMainWindow):
         # on press -- no sunken 'pressed' look. dim/source/colour are binary; noise
         # cycles through four levels of progressively finer noise.
         self.dim_toggle = FlipButton([("2D", "2D"), ("3D", "3D")], on_change=self.toggle_dimension)
-        self.source_toggle = FlipButton([("centroid", "centroid"), ("profile", "profile")],
+        self.source_toggle = FlipButton([("centroid", "Centroid"), ("profile", "Profile")],
                                         on_change=self.refresh)
         # Noise levels: none -> noise lines -> + small lines -> + single points.
         # Levels: none -> recovered (less confident) distributions -> noise lines
-        # -> + small lines -> + single points. Each level is cumulative.
-        self.noise_toggle = FlipButton(
-            [("none", "no noise"), ("recovered", "less confident distributions"),
-             ("line", "line noise"), ("small", "small line noise"),
-             ("single", "single point noise")],
+        # -> + small lines -> + single points. Each level is cumulative. Driven by
+        # the ◀ ▶ arrows (not a button) -- see the bar layout below.
+        self.noise_toggle = ArrowCycle(
+            [("none", "No Noise"), ("recovered", "Less Confident Distributions"),
+             ("line", "Line Noise"), ("small", "Small Line Noise"),
+             ("single", "Single Point Noise")],
             on_change=self._on_noise_changed)
-        self.logcolor_toggle = FlipButton([("lin", "lin color"), ("log", "log color")],
+        self.logcolor_toggle = FlipButton([("lin", "Lin Color"), ("log", "Log Color")],
                                           on_change=self._on_logcolor)
+        # Theoretical-MS1 overlay mode (only matters once a Table-2 peptide is
+        # selected): 'raw' keeps every isotopomer separate; 'summed' merges all
+        # isotopomers at the same M+N into one signal.
+        self.ms1theo_toggle = FlipButton(
+            [("raw", "Raw Isotopomers"), ("summed", "Summed M+N")],
+            on_change=self._on_ms1theo_changed)
         # Snap the 3D view to the aligned top-down (2D-like) orientation.
-        self.reset3d_button = QPushButton("align 3D")
+        self.reset3d_button = QPushButton("Align 3D")
         self.reset3d_button.setFixedWidth(70)
         self.reset3d_button.setToolTip("align the 3D view to a top-down, panel-2-aligned 2D view")
         self.reset3d_button.clicked.connect(self.reset_3d_view)
@@ -622,13 +844,38 @@ class MSViewerTab(QMainWindow):
         # Theme toggle, to the right of "align 3D". main_window wires
         # on_theme_toggle; the label tracks the current theme.
         self.on_theme_toggle = None
-        self.theme_btn = QPushButton("Light mode" if self.theme == "dark" else "Dark mode")
+        self.theme_btn = QPushButton("Light Mode" if self.theme == "dark" else "Dark Mode")
         self.theme_btn.setFixedWidth(80)
         self.theme_btn.clicked.connect(lambda: self.on_theme_toggle and self.on_theme_toggle())
 
-        # "loading… <context>" shown above panel 1 while its worker runs.
-        self.p1_loading = QLabel("")
-        self.p1_loading.setStyleSheet("color: black;")
+        # The "loading" indicator now lives in the tab bar (main_window sets
+        # self.tab_loading_label); nothing above panel 1 anymore.
+        self.tab_loading_label = None
+
+        # FDR acceptance-criteria spin box for the MS2-strip green/red gate:
+        # "[0.10] % FDR". Scroll the cursor over it to step the value. Percentage.
+        self.fdr_edit = QDoubleSpinBox()
+        self.fdr_edit.setDecimals(2)
+        self.fdr_edit.setRange(0.0, 100.0)
+        self.fdr_edit.setSingleStep(0.1)
+        self.fdr_edit.setValue(0.1)
+        self.fdr_edit.setFixedWidth(60)
+        self.fdr_edit.setToolTip("MS2 lines are green when a PSM passes this FDR "
+                                 "(percent), red otherwise")
+        self.fdr_edit.valueChanged.connect(self._on_fdr_changed)
+        self.fdr_unit = QLabel("% FDR")
+
+        # Navigation-history arrows: same design as the charge arrows, placed to
+        # their left ("history: ◀ ▶"). Moved here from the (now removed) top
+        # toolbar.
+        self.hist_back_btn = QPushButton("◀")
+        self.hist_back_btn.setFixedWidth(28)
+        self.hist_back_btn.setToolTip("navigation history: back")
+        self.hist_back_btn.clicked.connect(self.nav_back)
+        self.hist_fwd_btn = QPushButton("▶")
+        self.hist_fwd_btn.setFixedWidth(28)
+        self.hist_fwd_btn.setToolTip("navigation history: forward")
+        self.hist_fwd_btn.clicked.connect(self.nav_forward)
 
         # Charge-search arrows: right-aligned, to the right of "align 3D".
         self.charge_prev_btn = QPushButton("◀")
@@ -643,14 +890,23 @@ class MSViewerTab(QMainWindow):
         bar = QHBoxLayout()
         bar.addWidget(self.dim_toggle)
         bar.addWidget(self.source_toggle)
-        bar.addWidget(self.noise_toggle)
         bar.addWidget(self.logcolor_toggle)
+        bar.addWidget(self.ms1theo_toggle)
         bar.addWidget(self.reset3d_button)
         bar.addWidget(self.theme_btn)
-        bar.addSpacing(8)
-        bar.addWidget(self.p1_loading)
+        bar.addSpacing(10)
+        # Noise cycler (◀ label ▶): right of "Light Mode", left of the
+        # acceptance-criteria field. Replaces the old 'loading' text slot.
+        bar.addWidget(self.noise_toggle)
         bar.addStretch(1)
-        bar.addWidget(QLabel("charge"))
+        bar.addWidget(self.fdr_edit)
+        bar.addWidget(self.fdr_unit)
+        bar.addSpacing(12)
+        bar.addWidget(QLabel("History"))
+        bar.addWidget(self.hist_back_btn)
+        bar.addWidget(self.hist_fwd_btn)
+        bar.addSpacing(12)
+        bar.addWidget(QLabel("Charge"))
         bar.addWidget(self.charge_prev_btn)
         bar.addWidget(self.charge_next_btn)
 
@@ -659,6 +915,7 @@ class MSViewerTab(QMainWindow):
         self.p1_2d.getPlotItem().hideButtons()
 
         container = QWidget()
+        container.setObjectName("panel1_frame")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.addLayout(bar)
@@ -714,9 +971,14 @@ class MSViewerTab(QMainWindow):
         # so individual scans become distinguishable. Clicking the strip selects
         # the nearest line by RT (scene click; a single curve isn't per-segment
         # clickable).
+        # Two curves: GREEN for scans with an identified peptide passing the FDR
+        # acceptance criteria, RED for scans without one.
         self._ms2_scans = []    # sorted [(rt, scan_dict)] for click hit-testing
         self.ms2_curve = pg.PlotCurveItem([], [], connect="finite",
-                                          pen=pg.mkPen(255, 170, 50, 255, width=3))
+                                          pen=pg.mkPen(60, 200, 100, 255, width=3))
+        self.ms2_curve_red = pg.PlotCurveItem([], [], connect="finite",
+                                              pen=pg.mkPen(220, 70, 70, 255, width=3))
+        self.ms2_plot.addItem(self.ms2_curve_red)
         self.ms2_plot.addItem(self.ms2_curve)
         self.ms2_plot.scene().sigMouseClicked.connect(self._on_ms2_strip_clicked)
         self._ms2_all = []      # all loaded MS2 scans; filtered to the view below
@@ -724,6 +986,7 @@ class MSViewerTab(QMainWindow):
         # Panel 2: m/z on x (aligned with panel 1), RT on its own real left axis
         # (fixed width) sitting to the right of the band strip.
         self.p2 = pg.PlotWidget()
+        self.p2_load_overlay = self._make_loading_overlay(self.p2)
         self.p2.setLabel("bottom", "m/z")
         self.p2.setLabel("left", "RT", units="min")
         self.p2.getAxis("left").setWidth(P2_AXIS_W)
@@ -754,14 +1017,15 @@ class MSViewerTab(QMainWindow):
             except Exception:
                 pass
 
-        # Star marker on panel 2 showing a hovered MS2 scan's (m/z, RT) location,
-        # same colour as the MS2 strip. Re-added after each p2.clear (draw_panel2).
-        self.p2_ms2_star = pg.ScatterPlotItem(size=16, symbol="star",
-                                              brush=pg.mkBrush(255, 170, 50, 255),
-                                              pen=pg.mkPen(255, 170, 50, 255))
-        self.p2_ms2_star.setZValue(30)
-        self.p2.addItem(self.p2_ms2_star)
-        # Hover over the MS2 strip -> show that scan's star on panel 2.
+        # Band on panel 2 showing a hovered MS2 scan's isolation window: a thick
+        # horizontal line at the scan's RT spanning the exact m/z range that was
+        # isolated, same colour as the MS2 strip lines at ~50% opacity (3 px, so
+        # it reads as a band the same width as the left strip's RT bands).
+        self.p2_ms2_band = pg.PlotCurveItem(
+            pen=pg.mkPen(255, 170, 50, 128, width=3))
+        self.p2_ms2_band.setZValue(30)
+        self.p2.addItem(self.p2_ms2_band)
+        # Hover over the MS2 strip -> show that scan's isolation band on panel 2.
         self.ms2_plot.scene().sigMouseMoved.connect(self._on_ms2_hover)
 
         # MS2 strip shares panel 2's RT (y) axis.
@@ -770,6 +1034,9 @@ class MSViewerTab(QMainWindow):
         self.p1_2d.setXLink(self.p2)
         self.p2.sigXRangeChanged.connect(self.on_view_range_changed)
         self.p2.sigYRangeChanged.connect(self.on_view_range_changed)
+        # Plain wheel over panel 2 pans the window (m/z / time); Ctrl+wheel zooms
+        # (handled in eventFilter).
+        self.p2.viewport().installEventFilter(self)
 
         self.p2_loading = QLabel("")
         self.p2_loading.setStyleSheet("color: black;")
@@ -782,6 +1049,7 @@ class MSViewerTab(QMainWindow):
         row.addWidget(self.p2, stretch=1)
 
         container = QWidget()
+        container.setObjectName("panel2_frame")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 0, 2, 2)
         # p2_loading is intentionally NOT added to the layout: its row was the
@@ -830,6 +1098,7 @@ class MSViewerTab(QMainWindow):
         self.p3_loading.setStyleSheet("color: black;")
 
         container = QWidget()
+        container.setObjectName("panel3_frame")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.addWidget(self.p3_stack, stretch=1)
@@ -912,6 +1181,9 @@ class MSViewerTab(QMainWindow):
         all_btn.setFixedWidth(44)
         all_btn.clicked.connect(self._reload_current_tab)
         self.table1_tabs.setCornerWidget(all_btn, Qt.TopRightCorner)
+        # 'loading…' shows as a placeholder row WITHIN each table (models /
+        # QTableWidget), not as a tab-corner widget (which pushed the tabs over).
+        self.table1_loading = None
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_table1")
@@ -920,16 +1192,28 @@ class MSViewerTab(QMainWindow):
         self.dock_table1 = dock
 
     def build_table2_dock(self):
-        # Shown for MS2: candidate PSMs for the sampled precursor (+ sequence
-        # coverage, staged). Lives under panel 3.
+        # Shown for MS2: candidate PSMs for the sampled precursor + the b/y
+        # fragment sequence coverage each gets against the MS2 spectrum (the
+        # coverage concept from sequencecoverageconcept.py). Lives under panel 3.
         self.table2 = QTableWidget()
-        cols = ["peptide", "protein", "q", "coverage"]
+        # Table 2 compares the candidate PEPTIDES for the sampled precursor (not
+        # proteins): each peptide's q-value and its coverage score (the b/y
+        # fragment coverage metric from sequencecoverageconcept.py).
+        cols = ["peptide", "q", "coverage"]
         self.table2.setColumnCount(len(cols))
         self.table2.setHorizontalHeaderLabels(cols)
         self.table2.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table2.verticalHeader().setVisible(False)   # no 1,2,3 index column
-        dock = QDockWidget("Table 2 - MS2 candidates", self)
+        # Click a header to sort by that column; click again to reverse.
+        self.table2.setSortingEnabled(True)
+        self.table2.horizontalHeader().setSortIndicatorShown(True)
+        self.table2.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table2.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Selecting a candidate peptide overlays its fragment ions on panel 3.
+        self.table2.itemSelectionChanged.connect(self._on_table2_peptide_selected)
+        dock = QDockWidget("", self)
         dock.setObjectName("dock_table2")
+        dock.setTitleBarWidget(QWidget())   # drop the title bar (dead space)
         dock.setWidget(self.table2)
         self.dock_table2 = dock
 
@@ -954,7 +1238,7 @@ class MSViewerTab(QMainWindow):
         self.theme = theme
         pal = palette(theme)
         if getattr(self, "theme_btn", None) is not None:
-            self.theme_btn.setText("Light mode" if theme == "dark" else "Dark mode")
+            self.theme_btn.setText("Light Mode" if theme == "dark" else "Dark Mode")
         for plot in (self.p1_2d, self.p2, self.p3, self.ms2_plot):
             style_plot(plot, pal)
         try:
@@ -969,15 +1253,38 @@ class MSViewerTab(QMainWindow):
         # blends in (instead of an awkward blank gap next to panel 2's strip).
         if getattr(self, "_p1_2d_spacer", None) is not None:
             self._p1_2d_spacer.setStyleSheet(f"background-color: {pal['bg']};")
+        # Outline each panel (1/2/3) so their boundaries are visible -- black on
+        # the light theme, light grey on the dark theme. Scoped by objectName so
+        # the border doesn't cascade onto the child plot widgets.
+        border = "#000000" if theme == "light" else "#9a9a9a"
+        for name in ("panel1_frame", "panel2_frame", "panel3_frame"):
+            w = self.findChild(QWidget, name)
+            if w is not None:
+                w.setStyleSheet(f"QWidget#{name} {{ border: 1px solid {border}; }}")
+        # Keep the loading indicators legible against the tab-bar background.
+        for lbl in (getattr(self, "tab_loading_label", None),
+                    getattr(self, "table1_loading", None)):
+            if lbl is not None:
+                lbl.setStyleSheet(f"color: {pal['fg']}; padding: 0 8px;")
         self._recolor_gl(pal)   # 3D side labels (exist with or without GL)
         if HAVE_GL:
             style_gl(self.p1_3d, pal)
         # Re-render the data-bearing panels so theme-coloured bits (panel 1/3
         # titles, the MS2 spectrum data, the charge-grid axes) follow the theme.
+        # The panel-3 rebuild routes through populate_table2, which clears the
+        # theoretical-MS1 selection -- save/restore it across the redraw.
+        saved_theo = self._ms1_theo
         if self.current is not None:
             if isinstance(getattr(self, "_last_points", None), dict):
                 self._redraw_from_cache()
             self._redraw_panel3()   # rebuilds the charge grid with the new theme
+        self._ms1_theo = saved_theo
+        self._draw_ms1_theo_overlay()   # recolor the theoretical MS1 overlay
+        # The panel-3 redraw wiped the MS2 fragment green/red annotation; restore
+        # it from the last result (no need to re-run the worker).
+        if (self._panel3_mode == "ms2"
+                and getattr(self, "_last_frag", None) is not None):
+            self._draw_fragment_overlay(*self._last_frag)
 
     def _redraw_panel3(self):
         """Re-draw whatever panel 3 is currently showing (MS2 spectrum / MS1
@@ -1182,6 +1489,9 @@ class MSViewerTab(QMainWindow):
         # only shown after the user clicks an MS2 point).
         self._panel3_mode = "ms1"
         self._ms2_scan = None
+        self._ms2_band = None   # drop the isolation band
+        self._apply_ms2_band()
+        self._ms1_theo = None   # drop any Table-2 theoretical MS1 overlay
         self.render_table1(self.current)
         # Initialize the window from the ± controls and snap the views to it.
         rt_start = max(0.0, rt - self.rt_half) if rt is not None else 0.0
@@ -1355,15 +1665,30 @@ class MSViewerTab(QMainWindow):
         self._set_loading(True, cur["row"].get("peptide", "") or "region")
         self._start_evidence()
 
+    def _make_loading_overlay(self, parent):
+        """A 'loading' badge floated ON TOP of a plot, hidden until shown."""
+        lbl = QLabel("loading", parent)
+        lbl.setStyleSheet(
+            "background: rgba(0,0,0,150); color: white; padding: 3px 10px;"
+            " border-radius: 4px; font-weight: bold;")
+        lbl.hide()
+        return lbl
+
     def _set_loading(self, on, context=""):
-        """Show/clear a bold "loading" line above every panel 1/2/3 plot while a
-        data worker runs (per the spec: must happen everywhere)."""
-        text = "<b>loading</b>" if on else ""
-        for label in (getattr(self, "p1_loading", None),
-                      getattr(self, "p2_loading", None),
-                      getattr(self, "p3_loading", None)):
-            if label is not None:
-                label.setText(text)
+        """Show/clear a 'loading' badge on top of panels 1 & 2 while the data
+        worker runs."""
+        for ov in (getattr(self, "p1_load_overlay", None),
+                   getattr(self, "p2_load_overlay", None)):
+            if ov is None:
+                continue
+            if on:
+                ov.adjustSize()
+                pw = ov.parent().width()
+                ov.move(max(4, (pw - ov.width()) // 2), 6)
+                ov.show()
+                ov.raise_()
+            else:
+                ov.hide()
 
     def _start_evidence(self):
         if self.worker is not None and self.worker.isRunning():
@@ -1492,6 +1817,10 @@ class MSViewerTab(QMainWindow):
                         shown_max = max(shown_max, float(inten[nm].max()))
             if self._p1_scatters:
                 self.p1_2d.getViewBox().setYRange(0, (shown_max or 1.0) * 1.05, padding=0)
+            # Experimental points sit ABOVE the theoretical MS1 overlay (z=0), so
+            # give every scatter a positive z; the overlay stays visually behind.
+            for _sc, _base in self._p1_scatters:
+                _sc.setZValue(1)
         # No title on panel 1 (per the user).
         # Rescale dot sizes for the current zoom, then build the 3D if shown.
         self._rescale_points()
@@ -1500,6 +1829,8 @@ class MSViewerTab(QMainWindow):
         self._p1_3d_inputs = (points, region, mz_min, mz_max, rt_start, rt_end)
         if HAVE_GL and self.dim_toggle.key() == "3D":
             self.draw_panel1_3d(points, region, mz_min, mz_max, rt_start, rt_end)
+        # p1_2d.clear() above dropped any theoretical-MS1 overlay; re-add it.
+        self._draw_ms1_theo_overlay()
 
     def draw_panel1_3d(self, points, region, mz_min, mz_max, rt_start, rt_end):
         if not HAVE_GL:
@@ -1749,7 +2080,8 @@ class MSViewerTab(QMainWindow):
         self.p2.clear()
         self._sel_border_item = None   # cleared by p2.clear(); re-added below
         self._p2_scatters = []   # (ScatterPlotItem, base_size) for zoom rescaling
-        self.p2.addItem(self.p2_ms2_star)   # survives clear; empty until hover
+        self.p2.addItem(self.p2_ms2_band)   # survives clear
+        self._apply_ms2_band()              # restore the current scan's band
         if not isinstance(points, dict) or points["mz"].size == 0:
             self._render_selection_border()
             return
@@ -1825,6 +2157,8 @@ class MSViewerTab(QMainWindow):
         # Selecting an MS1 distribution returns panel 3 to its MS1 view.
         self._panel3_mode = "ms1"
         self._ms2_scan = None
+        self._ms2_band = None
+        self._apply_ms2_band()
         # Refresh table 1 to this distribution's members, then redraw panel 3.
         try:
             self.table1_for_distribution(did)
@@ -1862,11 +2196,15 @@ class MSViewerTab(QMainWindow):
             visible.append(m)
         scans = sorted(((m["rt"], m) for m in visible), key=lambda t: t[0])
         self._ms2_scans = scans
-        xs, ys = [], []
-        for rt, _ in scans:
-            xs += [0.0, 1.0, np.nan]
-            ys += [rt, rt, np.nan]
-        self.ms2_curve.setData(np.array(xs, dtype=float), np.array(ys, dtype=float))
+        ident = self._identified_scans()
+        gx, gy, rx, ry = [], [], [], []
+        for rt, m in scans:
+            if str(m.get("number", "")) in ident:
+                gx += [0.0, 1.0, np.nan]; gy += [rt, rt, np.nan]
+            else:
+                rx += [0.0, 1.0, np.nan]; ry += [rt, rt, np.nan]
+        self.ms2_curve.setData(np.array(gx, dtype=float), np.array(gy, dtype=float))
+        self.ms2_curve_red.setData(np.array(rx, dtype=float), np.array(ry, dtype=float))
         self.ms2_plot.getViewBox().setXRange(0, 1, padding=0)
         # Inverse-scale the line thickness with RT zoom: the more you zoom in, the
         # THICKER each MS2 line gets (so it never fades to nothing). Reference is
@@ -1877,20 +2215,69 @@ class MSViewerTab(QMainWindow):
             full_span = (self._loaded_window[3] - self._loaded_window[2]
                          if self._loaded_window else view_span)
             factor = min(max((full_span / view_span) ** 0.6, 1.0), 6.0)
-            self.ms2_curve.setPen(pg.mkPen(255, 170, 50, 255, width=3.0 * factor))
+            self.ms2_curve.setPen(pg.mkPen(60, 200, 100, 255, width=3.0 * factor))
+            self.ms2_curve_red.setPen(pg.mkPen(220, 70, 70, 255, width=3.0 * factor))
         except Exception:
             pass
 
+    def _on_fdr_changed(self):
+        """FDR spin box changed: update the threshold and recolor both the MS2
+        strip lines AND the on-panel-2 isolation band."""
+        self._fdr_threshold = max(0.0, self.fdr_edit.value()) / 100.0
+        self._ident_cache_key = None   # invalidate cache
+        self._refresh_ms2_visible()
+        self._apply_ms2_band()
+
+    def _identified_scans(self):
+        """Set of MS2 scan numbers that have a PSM passing the FDR acceptance
+        criteria (q-value <= threshold). Cached per file + threshold."""
+        thr = getattr(self, "_fdr_threshold", 0.001)
+        cache_key = (self.current_file, thr)
+        if getattr(self, "_ident_cache_key", None) == cache_key:
+            return self._ident_cache
+        ident = set()
+        for r in self.file_psms():
+            q = safe_float(r.get("percolator_q"))
+            scan_no = str(r.get("scan", "") or "")
+            # q is None -> treat as identified (no q column); else gate on FDR.
+            if scan_no and (q is None or q <= thr):
+                ident.add(scan_no)
+        self._ident_cache_key = cache_key
+        self._ident_cache = ident
+        return ident
+
+    def _band_color(self, scan):
+        """Green if the scan has an identified peptide (passes FDR), else red;
+        50% opacity to match the strip lines."""
+        ident = self._identified_scans()
+        if scan is not None and str(scan.get("number", "")) in ident:
+            return (60, 200, 100, 150)
+        return (220, 70, 70, 150)
+
+    def _draw_band(self, low, high, rt, scan):
+        self.p2_ms2_band.setPen(pg.mkPen(*self._band_color(scan), width=3))
+        self.p2_ms2_band.setData([low, high], [rt, rt])
+
+    def _apply_ms2_band(self):
+        """(Re)draw the persistent isolation band on panel 2 for the current MS2
+        scan (coloured green/red by identification), or clear it when none."""
+        band = getattr(self, "_ms2_band", None)
+        if band is not None and band[0] is not None and band[2] is not None:
+            low, high, rt = band
+            self._draw_band(low, high, rt, getattr(self, "_ms2_scan", None))
+        else:
+            self.p2_ms2_band.setData([], [])
+
     def _on_ms2_hover(self, scene_pos):
-        """Hovering an MS2 line on the strip puts a star at its (m/z, RT) on
-        panel 2 (same colour as the strip)."""
+        """Hovering an MS2 line on the strip previews its isolation band on panel
+        2; leaving the strip reverts to the band of the scan being viewed."""
         if not self._ms2_scans:
-            self.p2_ms2_star.setData([])
+            self._apply_ms2_band()
             return
         try:
             vb = self.ms2_plot.getViewBox()
             if not vb.sceneBoundingRect().contains(scene_pos):
-                self.p2_ms2_star.setData([])
+                self._apply_ms2_band()
                 return
             y = vb.mapSceneToView(scene_pos).y()
             (y0, y1) = vb.viewRange()[1]
@@ -1899,10 +2286,16 @@ class MSViewerTab(QMainWindow):
         rt_arr = np.array([rt for rt, _ in self._ms2_scans])
         i = int(np.argmin(np.abs(rt_arr - y)))
         scan = self._ms2_scans[i][1]
-        if abs(rt_arr[i] - y) <= max(abs(y1 - y0) * 0.03, 1e-4) and scan.get("mz") is not None:
-            self.p2_ms2_star.setData([{"pos": (scan["mz"], scan["rt"])}])
+        # m/z span = the isolation window; fall back to a small default width.
+        low = scan.get("iso_low")
+        high = scan.get("iso_high")
+        if low is None or high is None:
+            mz = scan.get("mz")
+            low, high = (mz - 0.5, mz + 0.5) if mz is not None else (None, None)
+        if abs(rt_arr[i] - y) <= max(abs(y1 - y0) * 0.03, 1e-4) and low is not None:
+            self._draw_band(low, high, scan["rt"], scan)
         else:
-            self.p2_ms2_star.setData([])
+            self._apply_ms2_band()
 
     def _on_ms2_strip_clicked(self, event):
         """Click anywhere on the MS2 strip -> select the nearest MS2 line by RT."""
@@ -1931,6 +2324,16 @@ class MSViewerTab(QMainWindow):
             return
         self._panel3_mode = "ms2"
         self._ms2_scan = scan
+        # Keep the isolation band on panel 2 for the scan being viewed (persists
+        # through redraws + Table-2 peptide selection, not just on hover).
+        low, high = scan.get("iso_low"), scan.get("iso_high")
+        if low is None or high is None:
+            mz = scan.get("mz")
+            # No isolation window in the mzML -> a visible default width around the
+            # precursor (a zero-width line would not render).
+            low, high = (mz - 0.5, mz + 0.5) if mz is not None else (None, None)
+        self._ms2_band = (low, high, scan.get("rt")) if low is not None else None
+        self._apply_ms2_band()
         # Table 2 (other candidate PSMs) only appears for the MS2 view.
         self.dock_table2.show()
         try:
@@ -1939,22 +2342,63 @@ class MSViewerTab(QMainWindow):
                 self.p3_title.setText(f"MS2 scan {scan.get('number','')} not found")
                 return
             mz, inten = scan_arrays(spectrum)
+            # Remember the spectrum so a Table-2 peptide selection can overlay its
+            # fragment ions without re-reading the scan.
+            self._ms2_mz, self._ms2_int = mz, inten
+            self._frag_overlay = []          # cleared by plot_spectrum's clear()
+            self._frag_token = getattr(self, "_frag_token", 0) + 1
             self.p3_stack.setCurrentIndex(0)
+            # Default title until a peptide is picked in Table 2 (then it becomes
+            # just the peptide).
             plot_spectrum(self.p3, mz, inten, color=palette(self.theme)["fg"],
-                          title=f"MS2  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
+                          title=self._ms2_title(scan))
             # Ground the baseline at 0 (no gap below the sticks).
             top = float(np.max(inten)) * 1.05 if len(inten) else 1.0
             self.p3.getViewBox().setYRange(0.0, top, padding=0)
             self.p3_title.setText(
                 f"MS2 scan {scan.get('number','')}  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
-            self.populate_table2(scan)
+            self.populate_table2(scan, mz)
         except Exception as exc:
             self.p3_title.setText(f"MS2 load error: {exc}")
 
-    def populate_table2(self, scan):
-        # Candidate PSMs near this precursor m/z in the current file (sequence
-        # coverage column is staged).
+    def _ms2_title(self, scan, peptide=None):
+        """Panel-3 MS2 title. Always shows the precursor isolation window +
+        RT (the MS1 scan parameters, so the plotted lines can be eyeballed);
+        prefixes the peptide once one is picked in Table 2."""
+        low, high = scan.get("iso_low"), scan.get("iso_high")
+        if low is None or high is None:
+            mz = scan.get("mz")
+            low, high = (mz - 0.5, mz + 0.5) if mz is not None else (None, None)
+        rt = scan.get("rt")
+        if low is not None and high is not None and rt is not None:
+            win = f"{low:.4f} - {high:.4f} at RT {rt:.3f}"
+        else:
+            win = ""
+        if peptide:
+            return f"{peptide}    {win}".strip()
+        return win or "MS2"
+
+    def populate_table2(self, scan, peak_mz=None):
+        # Candidate PSMs near this precursor m/z in the current file. The coverage
+        # column is computed from the SAME generate-and-match used to annotate the
+        # MS2 spectrum in panel 3 (fragments.peptide_fragment_ions ->
+        # annotate_spectrum -> coverage_metrics matchcounts), so the table value
+        # and the green ions in panel 3 always agree.
         prec = scan.get("mz")
+        peaks = np.asarray(peak_mz, dtype=float) if peak_mz is not None else None
+        ints = getattr(self, "_ms2_int", None)
+        low = scan.get("iso_low")
+        high = scan.get("iso_high")
+        if low is None or high is None:
+            base = prec or 0.0
+            low, high = base - 1.0, base + 1.0
+        # Candidates = the peptides the SEARCH would have considered for this
+        # precursor: any file PSM whose precursor m/z falls within the search
+        # precursor tolerance of this scan's precursor, allowing the search's
+        # isotope-error offsets (Sage precursor_tol + isotope_errors). No
+        # hard-coded Da window.
+        NEUTRON = 1.0033548
+        iso_lo, iso_hi = self.precursor_isotope_errors
         rows = []
         for r in self.file_psms():
             try:
@@ -1963,13 +2407,332 @@ class MSViewerTab(QMainWindow):
                 psm_mz = (row_mz / z + 1.007276) if row_mz else None
             except Exception:
                 psm_mz = None
-            if prec is None or (psm_mz is not None and abs(psm_mz - prec) < 3.0):
+            if prec is None:
                 rows.append(r)
-        self.table2.setRowCount(len(rows))
-        for i, r in enumerate(rows):
-            for j, key in enumerate(("peptide", "proteins", "percolator_q")):
-                self.table2.setItem(i, j, QTableWidgetItem(str(r.get(key, ""))))
-            self.table2.setItem(i, 3, QTableWidgetItem("(staged)"))
+                continue
+            if psm_mz is None:
+                continue
+            for k in range(iso_lo, iso_hi + 1):
+                target = prec + k * NEUTRON / z
+                if abs(psm_mz - target) <= target * self.precursor_ppm / 1e6:
+                    rows.append(r)
+                    break
+        # Compute each candidate's fragment coverage (matchcounts), then rank the
+        # peptides best-first so the most distinguishable candidate is at the top.
+        reports = []
+        for r in rows:
+            mc = 0
+            if peaks is not None and peaks.size and ints is not None:
+                seq = plain_seq(r.get("peptide", ""))
+                z = peptide_charge(r) or scan.get("charge") or 2
+                try:
+                    ents = seqfragments_module.peptide_fragment_ions(
+                        seq, z, low, high, dividingthreshold=0.1,
+                        subisotopomericdepth=0.5)
+                    matched, _ = seqfragments_module.annotate_spectrum(
+                        ents, peaks, ints, ppm=self.frag_ppm)
+                    labels = [row["ion"] for m in matched for row in m.get("rows", [])]
+                    mc = seqcoverage.coverage_metrics(seq, labels)["matchcounts"]
+                except Exception:
+                    mc = 0
+            reports.append((r, {"matchcounts": mc}))
+        # Rank by matchcounts (the reference's secondfinalmetrics): higher = more
+        # fragment coverage = more confident. Best-first by default.
+        reports.sort(key=lambda rr: rr[1]["matchcounts"], reverse=True)
+
+        # Disable sorting while filling so row indices stay put; the default
+        # best-first order shows once re-enabled (until the user clicks a header
+        # to re-sort).
+        self.table2.setSortingEnabled(False)
+        # Clear any selection-driven fragment overlay + theoretical MS1 overlay
+        # from a previous spectrum.
+        self._ms1_theo = None
+        self._draw_ms1_theo_overlay()
+        self.table2.clearSelection()
+        self.table2.setRowCount(len(reports))
+        for i, (r, rep) in enumerate(reports):
+            pep_item = QTableWidgetItem(str(r.get("peptide", "")))
+            pep_item.setData(Qt.UserRole, r)   # full PSM row for selection lookup
+            self.table2.setItem(i, 0, pep_item)
+            self.table2.setItem(i, 1, NumericItem(str(r.get("percolator_q", "")),
+                                                  safe_float(r.get("percolator_q"))))
+            if peaks is not None and peaks.size:
+                cov_val = rep.get("matchcounts", 0)
+                cov = str(cov_val)
+            else:
+                cov, cov_val = "", None
+            self.table2.setItem(i, 2, NumericItem(cov, cov_val))
+        self.table2.setSortingEnabled(True)
+
+    def _on_table2_peptide_selected(self):
+        """A candidate peptide was clicked in Table 2 -> overlay its theoretical
+        b/y fragment ions on the MS2 spectrum (green = matched, red = absent),
+        and set the panel-3 title to just that peptide."""
+        items = self.table2.selectedItems()
+        scan = getattr(self, "_ms2_scan", None)
+        if not items or scan is None or self._panel3_mode != "ms2":
+            return
+        row = items[0].row()
+        pep_item = self.table2.item(row, 0)
+        r = pep_item.data(Qt.UserRole) if pep_item is not None else None
+        if not r:
+            return
+        seq = plain_seq(r.get("peptide", ""))
+        if len(seq) < 2:
+            return
+        charge = peptide_charge(r) or scan.get("charge") or 2
+        # Auto-select the matching MS1 distribution in panel 2 (dotted border)
+        # WITHOUT flipping panel 3 back to its MS1 view (we stay on the MS2
+        # spectrum). The band + border survive panel-2 redraws.
+        self._select_distribution_for_candidate(r, charge, scan)
+        # Also overlay this peptide's theoretical MS1 distribution on panel 1.
+        self._ms1_theo = {"seq": seq, "charge": charge}
+        self._draw_ms1_theo_overlay()
+        low = scan.get("iso_low")
+        high = scan.get("iso_high")
+        if low is None or high is None:
+            # No isolation window in the mzML -> use a default ~1 m/z window so at
+            # least the monoisotopic precursor is included.
+            prec = scan.get("mz") or 0.0
+            low, high = prec - 1.0, prec + 1.0
+        self._frag_token = getattr(self, "_frag_token", 0) + 1
+        # Title stays the MS1 isolation window / RT (no peptide), so the plotted
+        # lines can be verified against the scan parameters.
+        self.p3.setTitle(self._ms2_title(scan), color=palette(self.theme)["fg"])
+        worker = FragmentWorker(
+            seq, charge, low, high,
+            getattr(self, "_ms2_mz", np.array([])),
+            getattr(self, "_ms2_int", np.array([])),
+            self.frag_ppm, self._frag_token,
+            dividing_threshold=0.1, subiso_depth=0.5)
+        worker.done.connect(self._on_fragments_ready)
+        self._frag_workers = [w for w in getattr(self, "_frag_workers", [])
+                              if w.isRunning()]
+        self._frag_workers.append(worker)
+        worker.start()
+
+    def _select_distribution_for_candidate(self, r, charge, scan):
+        """Select the MS1 distribution matching a Table-2 candidate (dotted border
+        on panel 2) without redrawing panel 3 (keeps the MS2 view up).
+
+        Targets the candidate's actual mono m/z (within the precursor tolerance)
+        and RT, and picks the CLOSEST distribution -- not just the highest-quality
+        one in a wide window, which otherwise stuck on the first selection."""
+        if self.db is None:
+            return
+        try:
+            neutral = peptide_mass(r)
+            if not neutral:
+                return
+            z = max(1, int(charge or 1))
+            mono_mz = neutral / z + 1.007276
+            rt = scan.get("rt")
+            if rt is None and isinstance(self.current, dict):
+                rt = self.current.get("rt")
+            if rt is None:
+                return
+            # Tight m/z window around the candidate's mono m/z (search precursor
+            # tolerance, with a small absolute floor for isotope/centroiding slack).
+            tol = max(mono_mz * self.precursor_ppm / 1e6, 0.02)
+            dists = self.db.distributions_in_window(
+                mz_min=mono_mz - tol, mz_max=mono_mz + tol,
+                rt_start=rt - self.rt_half, rt_end=rt + self.rt_half,
+                charge=z, limit=50)
+            # If this candidate maps to a distribution, select it. If NOT, keep
+            # whatever was already selected (don't clear it) -- the selection
+            # stays true while candidates for this precursor are compared; only a
+            # candidate that genuinely maps to a different distribution moves it.
+            if dists:
+                best = min(dists, key=lambda d: (
+                    abs((d.get("mono_mz") or mono_mz) - mono_mz),
+                    abs((d.get("rt_apex") or rt) - rt)))
+                # _set_selected only draws the border + anchors charge search; it
+                # does NOT touch panel 3, so the MS2 spectrum stays up.
+                self._set_selected(best["distribution_id"])
+        except Exception:
+            pass
+
+    def _on_ms1theo_changed(self):
+        """raw <-> summed switch for the theoretical MS1 overlay."""
+        self._draw_ms1_theo_overlay()
+
+    def _p1_experimental_max(self):
+        """Max experimental intensity currently drawn in panel 1 (2D)."""
+        ymax = 0.0
+        for scatter, _base in getattr(self, "_p1_scatters", []):
+            try:
+                ys = scatter.getData()[1]
+                if ys is not None and len(ys):
+                    ymax = max(ymax, float(np.nanmax(ys)))
+            except Exception:
+                pass
+        return ymax
+
+    def _distribution_experimental_max(self, did):
+        """Max experimental intensity of just ONE distribution's points (within
+        the visible window), used to normalize its theoretical MS1 overlay."""
+        points = getattr(self, "_last_points", None)
+        if did is None or not isinstance(points, dict):
+            return 0.0
+        mz = points.get("mz")
+        rt = points.get("rt")
+        inten = points.get("intensity")
+        if inten is None or mz is None or not len(inten):
+            return 0.0
+        if self.window is not None:
+            vmz0, vmz1, vrt0, vrt1 = self.window
+            vm = (mz >= vmz0) & (mz <= vmz1) & (rt >= vrt0) & (rt <= vrt1)
+        else:
+            vm = np.ones(mz.size, dtype=bool)
+        idx = np.zeros(mz.size, dtype=bool)
+        for g_did, _color, feat_masks in ((self._groups or []) + (self._rec_groups or [])):
+            if g_did == did:
+                for fm in feat_masks:
+                    idx |= fm
+                break
+        idx &= vm
+        return float(inten[idx].max()) if idx.any() else 0.0
+
+    def _draw_ms1_theo_overlay(self):
+        """Overlay the selected Table-2 peptide's theoretical MS1 isotope
+        distribution on panel 1 (2D only) as a 50%-opacity bar chart, normalized
+        so the tallest theoretical bar matches the tallest experimental peak of
+        the DISTRIBUTION it matched (not all the data visible in the plot)."""
+        if getattr(self, "_ms1_theo_item", None) is not None:
+            try:
+                self.p1_2d.removeItem(self._ms1_theo_item)
+            except Exception:
+                pass
+            self._ms1_theo_item = None
+        # 2D only.
+        if (self._ms1_theo is None
+                or getattr(self, "p1_stack", None) is None
+                or self.p1_stack.currentIndex() != 0):
+            return
+        # Normalize to the matched distribution's max; fall back to the overall
+        # visible max, then to the current y-range top, so the overlay ALWAYS
+        # shows (even when a distribution is selected / data is sparse).
+        exp_max = self._distribution_experimental_max(
+            getattr(self, "_selected_dist_id", None))
+        if exp_max <= 0:
+            exp_max = self._p1_experimental_max()
+        if exp_max <= 0:
+            try:
+                exp_max = float(self.p1_2d.getViewBox().viewRange()[1][1])
+            except Exception:
+                exp_max = 1.0
+        if exp_max <= 0:
+            exp_max = 1.0
+        try:
+            mode = self.ms1theo_toggle.key()
+            mzs, abund = isotopes.peptide_isotope_bars(
+                self._ms1_theo["seq"], self._ms1_theo["charge"], mode=mode,
+                dividing_threshold=0.1)
+        except Exception:
+            return
+        if mzs is None or len(mzs) == 0:
+            return
+        theo_max = float(np.max(abund)) or 1.0
+        # Normalize: tallest theoretical bar == tallest experimental peak.
+        heights = np.asarray(abund, dtype=float) * (exp_max / theo_max)
+        # 50%-opacity theme-adaptive bars (white on the dark plot, near-black on
+        # the light plot), drawn BENEATH the experimental data so the measured
+        # points sit visually in front.
+        shade = 255 if self.theme == "dark" else 20
+        bars = pg.BarGraphItem(x=np.asarray(mzs, dtype=float), height=heights,
+                               width=0.02, brush=pg.mkBrush(shade, shade, shade, 128),
+                               pen=pg.mkPen(shade, shade, shade, 128))
+        bars.setZValue(0)   # beneath the experimental scatters (z=1), above bg
+        self.p1_2d.addItem(bars)
+        self._ms1_theo_item = bars
+
+    def _on_fragments_ready(self, result):
+        if result.get("token") != getattr(self, "_frag_token", 0):
+            return
+        if result.get("error"):
+            return
+        matched = result.get("matched", [])
+        unmatched = result.get("unmatched", (np.array([]), np.array([])))
+        # Remember it so a theme redraw (which rebuilds the spectrum) can restore
+        # the green/red annotation without re-running the worker.
+        self._last_frag = (matched, unmatched)
+        self._draw_fragment_overlay(matched, unmatched)
+
+    def _clear_fragment_overlay(self):
+        for item in getattr(self, "_frag_overlay", []):
+            try:
+                self.p3.removeItem(item)
+            except Exception:
+                pass
+        self._frag_overlay = []
+
+    @staticmethod
+    def _sticks(mzs, ints):
+        """NaN-separated (x, y) for drawing baseline-grounded spectrum sticks."""
+        mzs = np.asarray(mzs, dtype=float)
+        ints = np.asarray(ints, dtype=float)
+        if mzs.size == 0:
+            return np.array([]), np.array([])
+        x = np.empty(mzs.size * 3)
+        y = np.empty(mzs.size * 3)
+        x[0::3] = mzs
+        x[1::3] = mzs
+        x[2::3] = np.nan
+        y[0::3] = 0.0
+        y[1::3] = ints
+        y[2::3] = np.nan
+        return x, y
+
+    def _draw_fragment_overlay(self, matched, unmatched):
+        """Recolour the ACTUAL MS2 spectrum: peaks matched by a theoretical b/y
+        fragment ion are drawn green (and labelled with the ion + the MS1
+        isotope it came from); the remaining real peaks are drawn red.
+        Theoretical ions with no experimental match are not drawn."""
+        self._clear_fragment_overlay()
+        pal = palette(self.theme)
+        fg = pal["fg"]
+        dark = self.theme == "dark"
+        green = (90, 220, 120) if dark else (0, 150, 0)
+        red = (235, 90, 90) if dark else (205, 0, 0)
+        overlay = []
+
+        um_mz, um_int = unmatched
+        ux, uy = self._sticks(um_mz, um_int)
+        if ux.size:
+            red_curve = pg.PlotCurveItem(ux, uy, pen=pg.mkPen(*red, width=1),
+                                         connect="finite")
+            red_curve.setZValue(18)
+            self.p3.addItem(red_curve)
+            overlay.append(red_curve)
+
+        if matched:
+            mx, my = self._sticks([m["mz"] for m in matched],
+                                  [m["intensity"] for m in matched])
+            green_curve = pg.PlotCurveItem(mx, my, pen=pg.mkPen(*green, width=2),
+                                           connect="finite")
+            green_curve.setZValue(20)
+            self.p3.addItem(green_curve)
+            overlay.append(green_curve)
+            for m in matched:
+                # Every ion that matched this peak is its own row (already sorted
+                # by decreasing ppm error), with the ppm error to the right of the
+                # M+N label. Stacked as one multi-line label above the peak.
+                lines = []
+                for row in m.get("rows", []):
+                    isos = row.get("isotopes", [])
+                    iso_txt = ",".join(f"M+{i}" for i in isos) if isos else ""
+                    z = row.get("charge", 1)
+                    ztxt = "" if z == 1 else f"({z}+)"
+                    lines.append(
+                        f"{row['ion']}{ztxt} {iso_txt}  {row['ppm']:+.1f} ppm".strip())
+                if not lines:
+                    continue
+                label = pg.TextItem("\n".join(lines), color=fg, anchor=(0.5, 1.0))
+                label.setPos(m["mz"], m["intensity"])
+                label.setZValue(21)
+                self.p3.addItem(label)
+                overlay.append(label)
+        self._frag_overlay = overlay
 
     # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
@@ -1983,7 +2746,11 @@ class MSViewerTab(QMainWindow):
                 return True
             return super().eventFilter(obj, event)
         p1 = getattr(self, "p1_2d", None)
+        p2 = getattr(self, "p2", None)
         p3 = getattr(self, "p3", None)
+        # Panel 1 / panel 3 intensity (y-axis strip) zoom: wheel over the left
+        # axis scrolls intensity with the baseline pinned at 0. Panel 1's
+        # intensity behaviour is intentionally left untouched.
         target = None
         if p1 is not None and obj is p1.viewport():
             target = self.p1_2d
@@ -1999,7 +2766,55 @@ class MSViewerTab(QMainWindow):
                 # the top of the y range moves, so the data baseline never lifts.
                 vb.setYRange(0.0, y1 * factor, padding=0)
                 return True
+
+        # Panels 1 & 2 plot area: plain wheel pans the window (m/z on panel 1's
+        # x-axis; m/z / time on panel 2), Ctrl+wheel falls through to pyqtgraph's
+        # default zoom. Panel 1's intensity (y) axis is excluded above.
+        pan_target = None
+        if p1 is not None and obj is p1.viewport():
+            pan_target = self.p1_2d
+        elif p2 is not None and obj is p2.viewport():
+            pan_target = self.p2
+        if pan_target is not None and event.type() == QEvent.Wheel:
+            if event.modifiers() & Qt.ControlModifier:
+                # Let pyqtgraph zoom (current behaviour).
+                return super().eventFilter(obj, event)
+            vb = pan_target.getViewBox()
+            dy = event.angleDelta().y()
+            dx = event.angleDelta().x()
+            if pan_target is self.p1_2d:
+                # Panel 1: vertical wheel pans m/z (x). Intensity y stays fixed.
+                self._pan_axis(vb, 0, dy)
+            else:
+                # Panel 2: horizontal wheel, Shift+wheel, or a wheel over the
+                # bottom m/z axis pans m/z (x); vertical wheel over the plot
+                # pans time (y).
+                bottom = pan_target.getPlotItem().getAxis("bottom")
+                plot_h = pan_target.viewport().height()
+                over_mz_axis = event.position().y() > (plot_h - bottom.height())
+                if (event.modifiers() & Qt.ShiftModifier) or over_mz_axis:
+                    self._pan_axis(vb, 0, dy or dx)
+                elif abs(dx) > abs(dy):
+                    self._pan_axis(vb, 0, dx)
+                else:
+                    self._pan_axis(vb, 1, dy)
+            return True
         return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _pan_axis(vb, axis, delta):
+        """Pan a viewbox along one axis (0=x, 1=y) by a fraction of the visible
+        range proportional to the wheel delta. Positive delta moves the window
+        toward higher values."""
+        if not delta:
+            return
+        lo, hi = vb.viewRange()[axis]
+        span = hi - lo
+        shift = span * 0.10 * (delta / 120.0)
+        if axis == 0:
+            vb.setXRange(lo + shift, hi + shift, padding=0)
+        else:
+            vb.setYRange(lo + shift, hi + shift, padding=0)
 
     def _on_p1_clicked(self, event):
         # Double-click re-fits panel 1's intensity (y) axis to the visible data,
@@ -2084,25 +2899,71 @@ class MSViewerTab(QMainWindow):
             self.p3_title.setText(title)
 
     def render_table1(self, cur):
-        rows = []
         cur["distribution_id"] = None
-        if self.db is not None and cur["rt"] is not None and cur["charge"]:
-            mz_min, mz_max = cur["mz_center"] - self.mz_half, cur["mz_center"] + self.mz_half
-            dists = self.db.distributions_in_window(
-                mz_min=mz_min, mz_max=mz_max,
-                rt_start=cur["rt"] - self.rt_half, rt_end=cur["rt"] + self.rt_half,
-                charge=cur["charge"], limit=1,
-            )
-            if dists:
-                cur["distribution_id"] = dists[0]["distribution_id"]
-                rows = self.db.distribution_members(dists[0]["distribution_id"])
-        self._fill_table1(rows)
+        if self.db is None or cur["rt"] is None or not cur["charge"]:
+            self._fill_table1([])
+            return
+        window = {
+            "mz_min": cur["mz_center"] - self.mz_half,
+            "mz_max": cur["mz_center"] + self.mz_half,
+            "rt_start": cur["rt"] - self.rt_half,
+            "rt_end": cur["rt"] + self.rt_half,
+            "charge": cur["charge"],
+        }
+        # Window mode discovers the distribution id, which panel 3's charge grid
+        # also needs -> let the worker result redraw panel 3 if it arrives late.
+        self._start_table1_worker(window=window, redraw_panel3=True)
 
     def table1_for_distribution(self, distribution_id):
         """Fill table 1 with a specific distribution's line metrics (used when a
         distribution is clicked directly in panel 2)."""
-        rows = self.db.distribution_members(distribution_id) if self.db is not None else []
-        self._fill_table1(rows)
+        if self.db is None:
+            self._fill_table1([])
+            return
+        self._start_table1_worker(distribution_id=distribution_id)
+
+    def _start_table1_worker(self, distribution_id=None, window=None,
+                             redraw_panel3=False):
+        """Load Table 1's rows on a background thread (latest-wins by token)."""
+        self._table1_token = getattr(self, "_table1_token", 0) + 1
+        self._table1_redraw_panel3 = redraw_panel3
+        # Show a 'loading…' placeholder row while the query runs.
+        self.table1.setRowCount(1)
+        self.table1.setItem(0, 0, QTableWidgetItem("loading…"))
+        for j in range(1, self.table1.columnCount()):
+            self.table1.setItem(0, j, QTableWidgetItem(""))
+        worker = Table1Worker(str(self.db.path), self._table1_token,
+                              distribution_id=distribution_id, window=window)
+        worker.done.connect(self._on_table1_loaded)
+        # Keep a reference so the QThread isn't garbage-collected mid-run.
+        self._table1_workers = [w for w in getattr(self, "_table1_workers", [])
+                                if w.isRunning()]
+        self._table1_workers.append(worker)
+        self._table_loading(1)
+        worker.start()
+
+    def _table_loading(self, delta):
+        """Ref-counted 'loading…' indicator on the Table-1 tab row."""
+        self._table_loading_count = max(
+            0, getattr(self, "_table_loading_count", 0) + delta)
+        if getattr(self, "table1_loading", None) is not None:
+            self.table1_loading.setText(
+                "<b>loading…</b>" if self._table_loading_count > 0 else "")
+
+    def _on_table1_loaded(self, result):
+        self._table_loading(-1)
+        # Ignore results from a superseded selection.
+        if result.get("token") != getattr(self, "_table1_token", 0):
+            return
+        did = result.get("distribution_id")
+        if self.current is not None:
+            self.current["distribution_id"] = did
+        self._fill_table1(result.get("rows", []))
+        # If panel 3 drew its MS1 view before the id was known (the sqlite query
+        # finished after the mzML read), rebuild it now that we have the id.
+        if (self._table1_redraw_panel3 and self._panel3_mode == "ms1"
+                and did != getattr(self, "_grid_dist_id", None)):
+            self._redraw_panel3()
 
     def _fill_table1(self, rows):
         self.table1.setRowCount(len(rows))
@@ -2112,14 +2973,39 @@ class MSViewerTab(QMainWindow):
 
     # ---- table-1 tabs: lines / distributions / charge distributions -------
 
+    def _eager_load_table1_tabs(self):
+        """Populate the distributions / charge-distributions tabs in the
+        background on open (not lazily), showing 'loading…' until they arrive."""
+        if self.db is None or getattr(self, "dists_model", None) is None:
+            return
+        self._table1_tab_token = getattr(self, "_table1_tab_token", 0) + 1
+        # Mark them loaded so a tab click doesn't ALSO trigger the synchronous
+        # lazy path while the background load is in flight.
+        self._table1_loaded.update({"distributions", "charge distributions"})
+        self._table1_tab_workers = []
+        for kind, model in (("distributions", self.dists_model),
+                            ("charge", self.charge_model)):
+            model.set_loading(True)
+            worker = DbTableWorker(str(self.db.path), kind, self._table1_tab_token)
+            worker.done.connect(self._on_table1_tab_loaded)
+            self._table1_tab_workers.append(worker)
+            self._table_loading(1)
+            worker.start()
+
+    def _on_table1_tab_loaded(self, result):
+        self._table_loading(-1)
+        if result.get("token") != getattr(self, "_table1_tab_token", 0):
+            return
+        rows = result.get("rows", [])
+        if result.get("kind") == "distributions":
+            self.dists_model.set_rows(rows)
+        elif result.get("kind") == "charge":
+            self.charge_model.set_rows(rows)
+
     def reset_table1_tabs(self):
-        """Forget loaded tab data (call when the file/db changes)."""
+        """Reload tab data in the background (call when the file/db changes)."""
         self._table1_loaded = set()
-        if getattr(self, "dists_model", None) is not None:
-            self.dists_model.set_rows([])
-            self.charge_model.set_rows([])
-        if getattr(self, "table1_tabs", None) is not None:
-            self._on_table1_tab_changed(self.table1_tabs.currentIndex())
+        self._eager_load_table1_tabs()
 
     def _reload_current_tab(self):
         """'All' button: reload the full list for whichever tab is active."""
@@ -2345,11 +3231,9 @@ class MSViewerTab(QMainWindow):
                 ax.setPen(pg.mkPen(fg)); ax.setTextPen(pg.mkPen(fg))
                 ax.enableAutoSIPrefix(False)   # no "1e6"-style SI prefixes
             if ri == 0:
-                d = group[charges[ci]].get("distribution") or {}
-                badge = " ⚠" if d.get("status") == "ambiguous" else ""
-                iso = d.get("iso_score")
-                extra = f"  iso {iso:.2f}" if iso is not None else ""
-                p.setTitle(f"z={charges[ci]}{badge}{extra}", color=fg)
+                # Just the charge per column (the iso-score / ambiguous badge were
+                # dropped per the user).
+                p.setTitle(f"z={charges[ci]}", color=fg)
 
             # Y axis: only the leftmost column carries the axis (labels + values);
             # the other columns get a ZERO-width axis so there's no empty gap
@@ -2688,6 +3572,8 @@ class MSViewerTab(QMainWindow):
         # Build the 3D view lazily on first switch (it's skipped while 2D shows).
         if to_3d and HAVE_GL and getattr(self, "_p1_3d_inputs", None) is not None:
             self.draw_panel1_3d(*self._p1_3d_inputs)
+        # The theoretical MS1 overlay is 2D-only.
+        self._draw_ms1_theo_overlay()
 
     def _recenter_window(self):
         if self.center is None:

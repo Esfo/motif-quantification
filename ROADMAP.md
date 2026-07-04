@@ -17,7 +17,7 @@ Status legend: ✅ done · 🟡 partial · ⬜ todo.
 | `examples/chargehandling.py` | Distribution generation — **stage 3**, charge-state grouping into analytes |
 | `examples/peptidefragmentscoring.py` | **MS2** fragment isotopic distributions (b/y ion compositions, fragment descending-products, ion scoring) |
 | `examples/libraryadditions.py` | **MS1** peptide isotopic distributions (`descending_partial_products`) |
-| `examples/sequencecoverageconcept.py` | **Panel 3 MS2 sequence coverage** + **Table 2** coverage concept (which residues each matched ion covers, the coverage/divider-string logic). **NOT Tab 2's protein coverage — that is a different concept.** ⬜ *file to be added by the user* |
+| `examples/sequencecoverageconcept.py` | **Panel 3 MS2 sequence coverage** + **Table 2** coverage concept (which residues each matched ion covers, the coverage/divider-string logic). **NOT Tab 2's protein coverage — that is a different concept.** ✅ *file provided; ported to `viewer/coverage.py`* |
 
 The faithful reference algorithm is the authority for the pipeline; the active
 `distributions/index_ms1.py` must be made to reproduce it (keeping the sqlite output).
@@ -68,7 +68,7 @@ data the pipeline produces. The four founding goals:
 - ✅ **Bounded region** — the profile/region view is the ID's ± m/z / ± RT window, **never the
   entire spectrum** (which was unreadable).
 - ✅ Removed the **orange 3D background** (was the height-color shader).
-- ✅ **No UI freeze** — selection reads run on a worker thread; rapid changes are latest-wins. The per-scan reads inside `extract_region`/`extract_points` are now **read in parallel** (a thread pool of independent mzML readers — the base64+zlib decode releases the GIL, so this genuinely parallelises), speeding up the initial load and every grow/zoom/move. (Threads rather than processes: avoids per-process file re-indexing and array IPC, while still parallelising the decode.)
+- ✅ **No UI freeze** — selection reads run on a worker thread; rapid changes are latest-wins. **Table 1's line-metric query** (distribution lookup + members on the sqlite) also runs on its **own background thread** (`Table1Worker`, latest-wins by token, opens its own read-only connection); panel 3's charge grid redraws if the distribution id resolves after it first drew. The per-scan reads inside `extract_region`/`extract_points` are now **read in parallel** (a thread pool of independent mzML readers — the base64+zlib decode releases the GIL, so this genuinely parallelises), speeding up the initial load and every grow/zoom/move. (Threads rather than processes: avoids per-process file re-indexing and array IPC, while still parallelising the decode.)
 - ✅ Sync model decision: **"forget the old generic sync"** — synchronization is now per-shared-
   axis (Panel 1↔2 m/z; Panel 3 columns on mass), not a single global lock.
 - ✅ Pipeline driver runs from a **top-level `.py`** (`index-distributions.py`) via `execution.xsh`,
@@ -131,9 +131,9 @@ data the pipeline produces. The four founding goals:
 
 ## 1.5 MS2 strip (left of Panel 2)
 - ✅ A **tall thin plot just to the left of Panel 2**. It shares Panel 2's **time (y) axis** and is **the sole RT ruler** for the row: Panel 2's own left axis is value-less, so the two RT axes **can never overlap** and this left strip is always visible.
-- ✅ MS2 scans shown as **horizontal lines that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.**
+- ✅ MS2 scans shown as **horizontal lines that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.** Lines are **green** when the scan has a PSM passing the FDR acceptance criteria and **red** otherwise; the FDR % is an editable "acceptance criteria" field on the panel-1 bar (default 0.1%).
 - ✅ The strip **only shows MS2 scans visible within Panel 2's current view** — RT *and* precursor-m/z both inside the view (`_refresh_ms2_visible`, updated on every zoom/pan). This fixes the "tons of MS2 lines" (it was showing every scan in the padded RT range regardless of precursor m/z).
-- ✅ **Hovering** an MS2 line places a **star at its (m/z, RT) location on Panel 2**, in the same orange as the strip, so you can see where that scan's precursor sits in the map.
+- ✅ **Hovering** an MS2 line draws a **yellow/orange isolation band on Panel 2** (replacing the earlier star): a 3 px horizontal band at the scan's RT (same width as the left strip's RT bands) spanning the **exact isolation m/z range** the MS2 selected for (read from the mzML), in the strip orange at ~50% opacity.
 - ✅ The MS2 lines' **thickness inverse-scales with RT zoom** (thicker as you zoom in, fixed minimum) so they never fade to nothing.
 - ✅ **Bug fixed:** the MS2 RT lines are now **solid horizontal lines** (one NaN-separated `PlotCurveItem`, fixed **3 px** width) spanning the strip at each RT. Fixed-pixel width keeps them **always visible and a consistent size at any zoom** (they never collapse to dots or vanish); zooming in just **spreads them apart** so individual scans become distinguishable. (The earlier data-space `LinearRegionItem` bands resized inconsistently across reloads — replaced.) Selection = **click anywhere on the strip → nearest line by RT**.
 
@@ -190,7 +190,7 @@ data the pipeline produces. The four founding goals:
 - ✅ Panel 3 MS2 is triggered by the user **clicking a sampled MS2 point** on the **left MS2 RT strip** (1.5). The MS2 spectrum is **grounded at y=0** (baseline pinned to the bottom of the axis, no gap).
 - ⬜ **MS2 trigger markers live on the left MS2 RT strip only** — per the user, they must **not** sit inside the Panel 2 plot (an earlier Panel-2 red-triangle overlay was wrong and has been removed). Overlaying clickable MS2 points on the 2D/3D Panel 1 is still open but, if added, must follow this same "distinct start-point" rule without cluttering the data plots.
 - ⬜ When an **identified peptide is assigned to that MS2 spectrum OR to the distribution sampled during that MS2 scan** (link the two via the search info if not already linked), **visualize the theoretical distribution of that specific MS1 progenitor**.
-- ⬜ Label the **MS1 progenitor isotopic distribution** and its **fragment isotopic compositions**, labeling the **ions by both type and number** (use `examples/peptidefragmentscoring.py`).
+- 🟡 Label the **MS1 progenitor isotopic distribution** and its **fragment isotopic compositions**, labeling the **ions by both type and number** (use `examples/peptidefragmentscoring.py`). ✅ Selecting a candidate in **Table 2** annotates the **actual MS2 spectrum**: ported `fragment_element_binomial_walk` / `fragment_descending_partial_products` + `nearest_neighbors_ppm_tolerance` into `viewer/fragments.py` (dividingthreshold 0.1, subisotopomericdepth 0.5). Only the **precursor isotopes inside the MS2 isolation window** (from the mzML) seed the fragment-isotope walk; the theoretical b/y ions are matched to the **real peaks** via nearest-neighbour at the **search fragment ppm (20)**. Matched **real** peaks plot **green** (labelled ion + the MS1 `M+k` isotope it came from, theme fg); the remaining real peaks plot **red**; unmatched theoretical ions are **not** drawn. The **Table 2 coverage column uses the SAME generate-and-match** (fragments → annotate → matchcounts), so the value and the green ions always agree. Fragment generation always includes the **monoisotopic** ions (the isolation window only ADDS co-isolated M+1/M+2), so a candidate is never spuriously zeroed. Selecting a candidate also **auto-selects its MS1 distribution** in panel 2 (dotted border) without leaving the MS2 view, and the **isolation band stays** on panel 2 (persistent, not hover-only). ✅ Selecting a candidate also overlays that peptide's **theoretical MS1 isotope distribution on panel 1 (2D only)** — a 50%-opacity bar chart at the theoretical m/z, height-normalized so the tallest theoretical bar matches the tallest experimental peak, with a **raw ⇄ summed-M+N** switch (`viewer/isotopes.peptide_isotope_bars`, learned from `libraryadditions.py`). ⬜ the MS1 progenitor envelope twin-plot for the *charge-grid* panel-3 path is still pending (1.10).
 - ⬜ Below the MS2 plot: **sequence coverage** of the peptide (the coverage/divider-string logic —
   `coverage_print`-style), per **`examples/sequencecoverageconcept.py`** (reference to be added by the
   user). This is the **MS2 fragment coverage**, distinct from Tab 2's protein coverage.
@@ -198,14 +198,21 @@ data the pipeline produces. The four founding goals:
   could have matched to** (the other candidate PSMs) **with their relevant sequence coverage**, so
   the user can judge whether one peptide is distinguishable from another. Optional panel. 🟡 dock +
   candidate listing exists, and **Table 2 now only appears when Panel 3 is in MS2 mode** (hidden for
-  MS1 so the MS1 view takes the full space); ⬜ "could-have-matched" candidate logic; ⬜ the **coverage
-  column** per **`examples/sequencecoverageconcept.py`** (reference to be added by the user) — the MS2
-  fragment coverage concept, **distinct from Tab 2's protein coverage**.
+  MS1 so the MS1 view takes the full space); ⬜ "could-have-matched" candidate logic; ✅ the **coverage
+  column + score** per **`examples/sequencecoverageconcept.py`** — ported to `viewer/coverage.py`: each
+  candidate peptide's theoretical b/y fragment ions are matched (±ppm, charges 1–2) against the MS2
+  spectrum, rendered as the divider string (`PEP|T|I|DER`) with matched-ion count + residue coverage,
+  and scored by the reference's **`secondfinalmetrics` = `matchcounts`** (unique matched ions + Σ
+  segment-length·cover-count) — higher = more/longer/more-redundant coverage = more confident. Table 2
+  columns are **peptide / q / coverage**, where coverage IS the matchcounts value, ranked highest-first
+  (header-click re-sorts). The MS2 fragment coverage concept, **distinct from Tab 2's protein
+  coverage**. ⬜ modified residues are matched on their plain (unmodified) mass for now — a modified
+  identified peptide can therefore read 0 until mod mass shifts are applied.
 
 ## 1.12 Top-bar controls
 - ✅ ± m/z and ± RT window controls (live).
 - ✅ charge ◀/▶ + history ⟲/⟳; ✅ theme toggle. (Removed the top-bar **Reset zoom** and the **duplicate Align-3D** button — the 3D align button lives above the 3D plot.)
-- 🟡 **Color settings**: ✅ a **log/linear colour-scale switch** for the 3D intensity colouring (fixed-size toggle on the Panel 1 bar, same style as 2D/3D & profile/centroid); ⬜ full color-settings drop-down still to do (selected/other-distribution colours, 3D gradient min/max pickers).
+- 🟡 **Color settings**: ✅ a **log/linear colour-scale switch** for the 3D intensity colouring (fixed-size toggle on the Panel 1 bar, same style as 2D/3D & profile/centroid); ✅ a **raw ⇄ summed-M+N switch** for the theoretical MS1 overlay (same FlipButton style); ⬜ full color-settings drop-down still to do (selected/other-distribution colours, 3D gradient min/max pickers).
 - ⬜ Manual **charge** entry field; ✅ **"align/reset 3D"** button (top bar + Panel 1 toolbar).
 - 🟡 **"loading… <context>"** label (rendered in **black**, not the old amber) now shown above **Panel 1, Panel 2, and Panel 3** while the evidence worker runs, cleared when drawn (`_set_loading`); ⬜ Panel 3 MS2 / charge-grid sub-loads not yet separately labelled.
 

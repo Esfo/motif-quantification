@@ -3,7 +3,6 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QSettings, Qt
 from PySide6.QtWidgets import (
     QApplication,
-    QDoubleSpinBox,
     QFileDialog,
     QLabel,
     QMainWindow,
@@ -69,7 +68,6 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("motif-quantification", "viewer")
 
         self.build_menu()
-        self.build_toolbar()
         QApplication.instance().installEventFilter(self)
         self.restore_geometry()
         self.load_session(reorganized)
@@ -105,46 +103,11 @@ class MainWindow(QMainWindow):
         reset_layout = view_menu.addAction("Reset &panel layout")
         reset_layout.triggered.connect(self.reset_layout)
 
-    def build_toolbar(self):
-        bar = self.addToolBar("controls")
-        bar.setMovable(False)
-        bar.addWidget(QLabel(" ± m/z "))
-        self.mz_spin = self._spin(0.1, 25.0, 2, 2.5, 0.5, self.on_mz_changed)
-        bar.addWidget(self.mz_spin)
-        bar.addWidget(QLabel("  ± RT "))
-        self.rt_spin = self._spin(0.02, 10.0, 2, self.xics_rt_window, 0.1, self.on_rt_changed)
-        bar.addWidget(self.rt_spin)
-        bar.addSeparator()
-        # charge-search arrows moved to panel 1's button bar (right-aligned).
-        hist_back = bar.addAction("⟲")
-        hist_back.setToolTip("navigation history: back")
-        hist_back.triggered.connect(lambda: self.ms_tab and self.ms_tab.nav_back())
-        hist_fwd = bar.addAction("⟳")
-        hist_fwd.setToolTip("navigation history: forward")
-        hist_fwd.triggered.connect(lambda: self.ms_tab and self.ms_tab.nav_forward())
-
-        # Reset-layout and Light-mode toolbar buttons removed: theme toggle now
-        # lives in panel 1's bar (right of "align 3D"); layout reset stays in the
-        # View menu.
-
-    def _spin(self, lo, hi, decimals, value, step, handler):
-        spin = QDoubleSpinBox()
-        spin.setRange(lo, hi)
-        spin.setDecimals(decimals)
-        spin.setSingleStep(step)
-        spin.setValue(value)
-        spin.valueChanged.connect(handler)
-        return spin
-
-    # ---- toolbar handlers ------------------------------------------------
-
-    def on_mz_changed(self, value):
-        if self.ms_tab is not None:
-            self.ms_tab.set_mz_half(value)
-
-    def on_rt_changed(self, value):
-        if self.ms_tab is not None:
-            self.ms_tab.set_rt_half(value)
+    # The top controls toolbar (± m/z, ± RT spinboxes and navigation-history
+    # buttons) was removed to reclaim vertical space: the ± m/z / ± RT controls
+    # are gone, and navigation history moved into panel 1's button bar (left of
+    # the charge-search arrows). Theme toggle lives in panel 1's bar; layout
+    # reset stays in the View menu.
 
     def on_reset_zoom(self):
         if self.ms_tab is not None:
@@ -230,12 +193,14 @@ class MainWindow(QMainWindow):
         self.experimental = ExperimentalSetup.load(setup_path) if setup_path else ExperimentalSetup([])
 
         self.ms_tab = MSViewerTab(self.session, distributions_db=db,
-                                  xics_ppm=self.xics_ppm, xics_rt_window=self.rt_spin.value(),
+                                  xics_ppm=self.xics_ppm, xics_rt_window=self.xics_rt_window,
                                   theme=self.theme)
         self.ms_tab.on_theme_toggle = self.toggle_theme   # panel-1 Light/Dark button
 
         tabs = QTabWidget()
-        tabs.addTab(self.ms_tab, "MS viewing")
+        # 'loading' now shows as a badge on top of panels 1/2 and as a row within
+        # Table 1 (driven inside MSViewerTab), not in the tab bar.
+        tabs.addTab(self.ms_tab, "MS Data")
         tabs.addTab(self._placeholder("Protein viewing",
                     "Whole-protein sequences with peptide coverage coloured by q-value "
                     "(shared q-value colour scale). Single-file or verticalized side-by-side "
