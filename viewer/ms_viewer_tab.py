@@ -2926,12 +2926,18 @@ class MSViewerTab(QMainWindow):
         distribution on panel 1 (2D only) as a 50%-opacity bar chart, normalized
         so the tallest theoretical bar matches the tallest experimental peak of
         the DISTRIBUTION it matched (not all the data visible in the plot)."""
-        if getattr(self, "_ms1_theo_item", None) is not None:
-            try:
-                self.p1_2d.removeItem(self._ms1_theo_item)
-            except Exception:
-                pass
-            self._ms1_theo_item = None
+        # Remove EVERY theoretical bar on panel 1, not just the last-tracked one.
+        # The overlay is the only BarGraphItem panel 1 ever holds (experimental
+        # data are ScatterPlotItems), so sweeping all bars guarantees a single
+        # overlay even if a prior draw left a stray (e.g. an item orphaned by a
+        # plot clear() whose tracked reference was then overwritten).
+        try:
+            for it in [i for i in self.p1_2d.getPlotItem().items
+                       if isinstance(i, pg.BarGraphItem)]:
+                self.p1_2d.removeItem(it)
+        except Exception:
+            pass
+        self._ms1_theo_item = None
         # 2D only.
         if (self._ms1_theo is None
                 or getattr(self, "p1_stack", None) is None
