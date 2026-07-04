@@ -2486,11 +2486,11 @@ class MSViewerTab(QMainWindow):
         did = points[0].data()
         if did is None:
             return
-        # Bump the distribution-click sequence so the deferred empty-space check
-        # in _on_p2_clicked knows a distribution was hit during this dispatch
-        # (robust to scatter/scene signal ordering, and to panel-1 dot clicks
-        # which route here too but fire no panel-2 scene click).
-        self._dist_click_seq = getattr(self, "_dist_click_seq", 0) + 1
+        # Flag that a distribution was hit this dispatch so the deferred
+        # empty-space check in _on_p2_clicked doesn't deselect it. A flag (set
+        # here, consumed in the deferred check) is order-independent: it works
+        # whether the scatter's sigClicked fires before or after the scene click.
+        self._p2_dist_hit = True
         # A raw distribution is now selected (may be unidentified): a later charge
         # step should build its theoretical from the distribution's neutral mass,
         # not the last peptide's sequence.
@@ -2517,21 +2517,22 @@ class MSViewerTab(QMainWindow):
 
     def _on_p2_clicked(self, event):
         """Panel-2 scene click. A click on a distribution's dots is handled by
-        the scatter's sigClicked (on_panel2_dist_clicked), which bumps
-        _dist_click_seq; anything else is empty space -> deselect. Deferred to
-        the next event-loop tick so the scatter signal (fired in the same click
+        the scatter's sigClicked (on_panel2_dist_clicked), which sets
+        _p2_dist_hit; anything else is empty space -> deselect. Deferred to the
+        next event-loop tick so the scatter signal (fired in the same click
         dispatch, order unspecified) is accounted for before we decide."""
         try:
             if event.double() or event.button() != Qt.LeftButton:
                 return
         except Exception:
             pass
-        seq = getattr(self, "_dist_click_seq", 0)
-        QTimer.singleShot(0, lambda: self._resolve_p2_click(seq))
+        QTimer.singleShot(0, self._resolve_p2_click)
 
-    def _resolve_p2_click(self, seq):
-        # A distribution was clicked during this dispatch iff the sequence moved.
-        if getattr(self, "_dist_click_seq", 0) != seq:
+    def _resolve_p2_click(self):
+        # A distribution scatter set the flag during this dispatch -> keep the
+        # selection; consume the flag. Otherwise it was empty space -> deselect.
+        if getattr(self, "_p2_dist_hit", False):
+            self._p2_dist_hit = False
             return
         self._deselect_distribution()
 
