@@ -24,7 +24,8 @@ sqlite and the experimental-setup file.
 | `app.py` | CLI entry, `QApplication`, SIGINT→quit |
 | `main_window.py` | window chrome, 4-tab shell, folder open/reload, theme, dock-layout persistence, distributions/experimental auto-detect |
 | `ms_viewer_tab.py` | **Tab 1** dock workspace (lists, panels 1–3, table 1) |
-| `session.py` | reads the `reorganized/` tables (files, PSMs, peptides, proteins, quant) |
+| `proteins_tab.py` | **Tab 2** protein sequence viewer: file selector + FDR + protein list, panel 1 (horizontal sequence, peptide rectangles coloured by q-value, All button) over panel 2 (same protein verticalized per-file, click a column to load it in panel 1) |
+| `session.py` | reads the `reorganized/` tables (files, PSMs, peptides, proteins, quant) + the project FASTA (protein sequences) and in-silico tryptic digestion (Tab 2) |
 | `mzml_store.py` | indexed mzML reader: metadata (no array decode), random-access scans, `extract_xics`, `extract_region` |
 | `region_view.py` | standalone bounded 2D heatmap + 3D region (`RegionWorker` thread is reused by Tab 1) |
 | `plots.py` | pyqtgraph helpers (spectrum sticks, points, traces, bars, short labels) |

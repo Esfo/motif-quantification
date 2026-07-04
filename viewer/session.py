@@ -138,6 +138,97 @@ def peptide_rt(row):
     return None
 
 
+def read_fasta(path):
+    """Yield (header, sequence) pairs from a FASTA file (whitespace-collapsed)."""
+    path = Path(path)
+    if not path.exists():
+        return []
+
+    entries = []
+    header = None
+    seq = []
+
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if header is not None and seq:
+                entries.append((header, "".join(seq)))
+            header = line[1:]
+            seq = []
+        else:
+            seq.append(line)
+
+    if header is not None and seq:
+        entries.append((header, "".join(seq)))
+
+    return entries
+
+
+def protein_keys(header):
+    """Identifier aliases for a FASTA header, matching execution.xsh so the
+    reorganized proteins.tsv ``protein_id`` (a Sage/Percolator accession) maps
+    back to its sequence. e.g. ``sp|P12345|NAME_HUMAN foo`` → the full header,
+    the first token, and the ``|``-split parts (incl. the bare accession)."""
+    first = header.split()[0]
+    keys = {header, first}
+
+    if "|" in first:
+        parts = first.split("|")
+        keys.update(parts)
+
+    return {k for k in keys if k}
+
+
+# In-silico digestion parameters mirror the Sage ``enzyme`` block in
+# execution.xsh (trypsin: cleave after K/R but not before P, up to 2 missed
+# cleavages, peptides 7–50 residues). These define which peptides the search
+# *attempted* to identify — the outlined rectangles in the Proteins tab.
+DIGEST_CLEAVE_AT = "KR"
+DIGEST_RESTRICT = "P"
+DIGEST_MISSED_CLEAVAGES = 2
+DIGEST_MIN_LEN = 7
+DIGEST_MAX_LEN = 50
+
+
+def cleavage_sites(seq, cleave_at=DIGEST_CLEAVE_AT, restrict=DIGEST_RESTRICT):
+    sites = [0]
+    for i, aa in enumerate(seq[:-1]):
+        if aa in cleave_at and (not restrict or seq[i + 1] not in restrict):
+            sites.append(i + 1)
+    sites.append(len(seq))
+    return sites
+
+
+def digest_peptides(seq, missed_cleavages=DIGEST_MISSED_CLEAVAGES,
+                    min_len=DIGEST_MIN_LEN, max_len=DIGEST_MAX_LEN):
+    """All peptides the tryptic search attempted, as ``(start, end, peptide)``.
+
+    Ported from ``make_flank_index`` in execution.xsh: for each cleavage
+    window allow up to ``missed_cleavages`` skipped sites, keep peptides within
+    the search length bounds. ``start``/``end`` are 0-based residue indices into
+    ``seq`` (half-open), so the caller can position them on the sequence."""
+    if not seq:
+        return []
+    sites = cleavage_sites(seq)
+    out = []
+    seen = set()
+    for i in range(len(sites) - 1):
+        last = min(i + missed_cleavages + 1, len(sites) - 1)
+        for j in range(i, last):
+            start = sites[i]
+            end = sites[j + 1]
+            if end - start < min_len or end - start > max_len:
+                continue
+            key = (start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((start, end, seq[start:end]))
+    return out
+
+
 def isotope_mzs(neutral_mass, charge, n=6):
     mono_mz = neutral_mass / charge + PROTON
     step = C13_DELTA / charge
@@ -184,6 +275,9 @@ class ViewerSession:
         self._global_peptides = None
         self._global_proteins = None
         self._quant_cache = None
+        self._fasta_index = None
+        self._searches_manifest = None
+        self._peptide_q_cache = {}
 
     def files(self):
         return self.file_rows
@@ -226,6 +320,112 @@ class ViewerSession:
 
     def summary(self):
         return self.manifest
+
+    # ---- protein sequences (FASTA) --------------------------------------
+
+    @property
+    def searches_dir(self):
+        # reorganized = <project>/searches/reorganized, so searches = its parent.
+        return self.reorganized.parent if self.reorganized else None
+
+    def _searches_manifest_data(self):
+        if self._searches_manifest is None:
+            path = self.searches_dir / "manifest.json" if self.searches_dir else None
+            self._searches_manifest = read_json(path) if path else {}
+        return self._searches_manifest
+
+    def _find_fasta(self):
+        """Locate a protein FASTA for this project, most-portable first.
+
+        The reorganized tables carry no sequences, so the Proteins tab needs the
+        original FASTA. Prefer the in-project decoy FASTA (``searches/.decoy.fasta``,
+        written by execution.xsh — its forward entries are the real proteins),
+        then the paths recorded in ``searches/manifest.json``, then any ``*.fasta``
+        beside the searches dir. Returns ``(path, decoy_tag)`` or ``(None, None)``.
+        """
+        manifest = self._searches_manifest_data()
+        decoy_tag = manifest.get("decoy_tag") or "rev_"
+
+        candidates = []
+        if self.searches_dir:
+            candidates.append(self.searches_dir / ".decoy.fasta")
+        for key in ("decoy_fasta", "proteome_fasta"):
+            value = manifest.get(key)
+            if value:
+                candidates.append(Path(value))
+        if self.searches_dir and self.searches_dir.is_dir():
+            candidates.extend(sorted(self.searches_dir.glob("*.fasta")))
+            candidates.extend(sorted(self.searches_dir.glob("*.fa")))
+
+        for path in candidates:
+            try:
+                if path and Path(path).exists():
+                    return Path(path), decoy_tag
+            except Exception:
+                continue
+        return None, None
+
+    def fasta_index(self):
+        """Map every protein-id alias → its amino-acid sequence.
+
+        Decoy entries (headers starting with the decoy tag) are skipped so only
+        real proteins resolve. Built once and cached; empty when no FASTA found."""
+        if self._fasta_index is not None:
+            return self._fasta_index
+
+        index = {}
+        path, decoy_tag = self._find_fasta()
+        if path is not None:
+            for header, seq in read_fasta(path):
+                if decoy_tag and header.startswith(decoy_tag):
+                    continue
+                for key in protein_keys(header):
+                    index.setdefault(key, seq)
+
+        self._fasta_index = index
+        return index
+
+    @property
+    def has_sequences(self):
+        return bool(self.fasta_index())
+
+    def protein_sequence(self, protein_id):
+        """Amino-acid sequence for a reorganized ``protein_id``, or None.
+
+        Tries the id as-is, then its ``|``-split parts (the reorganized id may be
+        a bare accession while the FASTA header is ``sp|ACC|NAME``, or vice-versa)."""
+        if not protein_id:
+            return None
+        index = self.fasta_index()
+        seq = index.get(protein_id)
+        if seq is not None:
+            return seq
+        for part in str(protein_id).split("|"):
+            part = part.strip()
+            if part and part in index:
+                return index[part]
+        return None
+
+    def peptide_q_for_file(self, filename):
+        """Map plain peptide sequence → best percolator q-value in this file.
+
+        Drives the Proteins-tab colouring: an in-silico peptide that appears here
+        is coloured by its q-value, one that doesn't stays uncoloured."""
+        if filename in self._peptide_q_cache:
+            return self._peptide_q_cache[filename]
+
+        out = {}
+        for row in self.file_peptides(filename or ""):
+            plain = row.get("peptide_plain") or ""
+            if not plain:
+                continue
+            q = safe_float(row.get("best_percolator_q"))
+            if plain not in out:
+                out[plain] = q
+            elif q is not None and (out[plain] is None or q < out[plain]):
+                out[plain] = q
+        self._peptide_q_cache[filename] = out
+        return out
 
     def global_peptides(self):
         if self._global_peptides is None:

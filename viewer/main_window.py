@@ -18,12 +18,14 @@ try:
     from .session import ViewerSession
     from .theming import palette, style_plot
     from .ms_viewer_tab import MSViewerTab
+    from .proteins_tab import ProteinsTab
     from .distributions_db import DistributionsDB
     from .experimental import ExperimentalSetup
 except ImportError:
     from session import ViewerSession
     from theming import palette, style_plot
     from ms_viewer_tab import MSViewerTab
+    from proteins_tab import ProteinsTab
     from distributions_db import DistributionsDB
     from experimental import ExperimentalSetup
 
@@ -128,6 +130,8 @@ class MainWindow(QMainWindow):
             style_plot(widget, pal)
         if self.ms_tab is not None:
             self.ms_tab.apply_theme(theme)
+        if getattr(self, "proteins_tab", None) is not None:
+            self.proteins_tab.apply_theme(theme)
         self.theme_action.setText("Switch to &light mode" if theme == "dark" else "Switch to &dark mode")
 
     # ---- opening folders -------------------------------------------------
@@ -197,14 +201,22 @@ class MainWindow(QMainWindow):
                                   theme=self.theme)
         self.ms_tab.on_theme_toggle = self.toggle_theme   # panel-1 Light/Dark button
 
+        # Preserve whichever tab the user is on across open/reload (don't jump
+        # back to MS Data).
+        prev_index = 0
+        old_central = self.centralWidget()
+        if isinstance(old_central, QTabWidget):
+            prev_index = old_central.currentIndex()
+
         tabs = QTabWidget()
+        self.tabs = tabs
         # 'loading' now shows as a badge on top of panels 1/2 and as a row within
         # Table 1 (driven inside MSViewerTab), not in the tab bar.
         tabs.addTab(self.ms_tab, "MS Data")
-        tabs.addTab(self._placeholder("Protein viewing",
-                    "Whole-protein sequences with peptide coverage coloured by q-value "
-                    "(shared q-value colour scale). Single-file or verticalized side-by-side "
-                    "across files. — staged, see ARCHITECTURE.md"), "Proteins")
+        self.proteins_tab = ProteinsTab(self.session, theme=self.theme)
+        self.proteins_tab.on_navigate_to_ms = self._navigate_to_ms
+        self.proteins_tab.on_theme_toggle = self.toggle_theme
+        tabs.addTab(self.proteins_tab, "Proteins")
         tabs.addTab(self._placeholder("File-by-file comparison",
                     f"Quantitative comparison across files: time series + differential "
                     f"expression. Reads experimental-setup "
@@ -214,6 +226,8 @@ class MainWindow(QMainWindow):
                     "Time series + DE at the motif level; proteins grouped by shared skeleton "
                     "motif, with include/exclude refinement saved back to a motif-sets folder. "
                     "— staged, see ARCHITECTURE.md"), "Motifs")
+        if 0 <= prev_index < tabs.count():
+            tabs.setCurrentIndex(prev_index)
         self.setCentralWidget(tabs)
         # Restore the dock arrangement after the tab is laid out (sizes depend on
         # the final widget geometry), so opening a file doesn't reset it.
@@ -224,6 +238,17 @@ class MainWindow(QMainWindow):
         self.reload_action.setEnabled(not self.session.is_empty)
         title = "no folder open (double-click to open)" if self.session.is_empty else str(reorganized)
         self.setWindowTitle(f"Motif Quantification Viewer — {title}")
+
+    def _navigate_to_ms(self, filename, protein_id, peptide_plain):
+        """Proteins-tab → MS Data tab jump: switch to MS Data and focus the given
+        identification (double-clicking a peptide in the protein sequence)."""
+        if self.ms_tab is None:
+            return
+        self.tabs.setCurrentIndex(self.tabs.indexOf(self.ms_tab))
+        try:
+            self.ms_tab.focus_identification(filename, protein_id, peptide_plain)
+        except Exception:
+            pass
 
     def _placeholder(self, title, text):
         widget = QWidget()
@@ -248,6 +273,10 @@ class MainWindow(QMainWindow):
         if self.ms_tab is not None:
             self.settings.setValue("ms_tab_state", self.ms_tab.saveState())
             self.settings.setValue("ms_tab_layout_version", self.LAYOUT_VERSION)
+        if getattr(self, "proteins_tab", None) is not None:
+            h_state, v_state = self.proteins_tab.splitter_states()
+            self.settings.setValue("proteins_h_state", h_state)
+            self.settings.setValue("proteins_v_state", v_state)
 
     def restore_geometry(self):
         self._geometry_restored = False
@@ -277,6 +306,14 @@ class MainWindow(QMainWindow):
         if state is not None and str(version) == str(self.LAYOUT_VERSION):
             try:
                 self.ms_tab.restoreState(state)
+            except Exception:
+                pass
+        if getattr(self, "proteins_tab", None) is not None \
+                and str(version) == str(self.LAYOUT_VERSION):
+            try:
+                self.proteins_tab.restore_splitter_states(
+                    self.settings.value("proteins_h_state"),
+                    self.settings.value("proteins_v_state"))
             except Exception:
                 pass
 

@@ -218,11 +218,18 @@ data the pipeline produces. The four founding goals:
 
 ---
 
-# TAB 2 — PROTEIN VIEWING ⬜
-- ⬜ Show **entire protein sequences**; **peptide coverage** of individual proteins shown as **colored-in regions** of the protein sequence.
-- ⬜ Region color **represents q-value**, using the **same color scale used for the 3D points** in the profile plots (shared q-value gradient).
-- ⬜ View for a **single file**, OR the sequence **verticalized and displayed side-by-side against all other files**.
-- ⬜ If the per-residue sequence is too hard to see, display **block chunks proportionate to the peptide length** they represent; peptides can be **zoomed in on** to clarify.
+# TAB 2 — PROTEIN VIEWING 🟡
+- ✅ Show **entire protein sequences** (from the project FASTA — reorganized tables carry none); each **tryptic peptide the search attempted** is an outlined rectangle (protease cut segments), with the letters written inside. Segments outside the search length bounds carry no rectangle (plain letters = "not searched").
+- ✅ Rectangle **background represents q-value** on a green(best)→red(worst) gradient (`proteins_tab.q_color`); attempted-but-unidentified peptides stay uncoloured. *(Not yet wired to the shared 3D-points color-settings dropdown — see 0.2; standalone gradient for now.)*
+- ✅ Same as MS Data: **file selector** + a scrollable **FDR spin box** (near the left, default = search `q_max`) governing the protein list, and a single **protein list**.
+- ✅ **Panel 1** (horizontal, wrapping, click-drag to scroll) over **panel 2** (same protein **verticalized side-by-side across every file**, N→C top-to-bottom, centred, file names on a 45° slant; click-drag scrolls, click a column to load that file). Panel 1's bar holds the **All** button, the **FDR** spin box, and a **Light/Dark** toggle (right of the FDR); the **colour-bar legend** (q-value/FDR → colour) floats inside panel 1's top-right.
+- ✅ **Double-click a peptide in panel 1** → jump to the MS Data tab reconstructed on that identification: panel 3 MS2 spectrum, panel 1 theoretical-MS1 overlay, panel 2 distribution selected + MS2 isolation band. In All mode it targets the best file for that peptide.
+- ✅ **Every** tryptic peptide is boxed in both panels (searched → solid outline, outside the search length bounds → dotted); identified peptides are filled by q-value, the rest left unfilled.
+- ✅ Panel 2 **zooms** (Ctrl-wheel) all the way down to fit the whole protein — residues collapse to filled colour blocks (FDR colour preserved) while **file names stay full size**.
+- ✅ **Lin/Log colour** toggle (like MS Data's) rescales the FDR colour gradient; the colour bar's percentage ticks move with it.
+- ✅ **Light/dark** adaptive colours for the panels only (the left file list keeps the app palette); theme stays in sync across tabs.
+- ✅ Panel sizes are **remembered** (h/v splitters persisted by the main window, like the MS Data dock layout); opening/reloading a folder keeps the current tab.
+- ✅ Protein **table** (sorted value | protein name) with a "Sort By" row (metric dropdown + asc/desc toggle): % Coverage, Protein Length, Total Identified Peptides, FDR, Spectral Count (PSMs). Changing the sort jumps the view to the top.
 
 ---
 

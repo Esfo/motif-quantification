@@ -1431,6 +1431,105 @@ class MSViewerTab(QMainWindow):
             self.p3_title.setText(f"evidence error: {exc}")
             traceback.print_exc()
 
+    def focus_identification(self, filename, protein_id, peptide_plain, show_ms2=True):
+        """Drive the lists to a specific identification, as if the user had
+        clicked file → protein → peptide → PSM. Used by the Proteins tab when a
+        peptide is double-clicked.
+
+        With ``show_ms2`` the full MS2 evidence view is reconstructed once the
+        (async) window load finishes: panel 3 shows the PSM's MS2 spectrum, panel
+        1 gets the peptide's theoretical MS1 overlay, and panel 2 selects the
+        matching distribution and draws the MS2 isolation band (see
+        ``_apply_ms2_focus``, run from ``on_evidence_done``)."""
+        if filename:
+            idx = self.file_combo.findData(filename)
+            if idx >= 0 and idx != self.file_combo.currentIndex():
+                self.file_combo.setCurrentIndex(idx)   # triggers repopulate
+            else:
+                self.repopulate_active_list()
+        # protein
+        if protein_id:
+            for i in range(self.protein_list.count()):
+                if self.protein_list.item(i).text() == protein_id:
+                    self.protein_list.setCurrentRow(i)   # populates peptide list
+                    break
+        # peptide (match on the plain, modification-stripped sequence)
+        if peptide_plain:
+            for i in range(self.peptide_list.count()):
+                row = self.peptide_list.item(i).data(Qt.UserRole) or {}
+                if plain_seq(row.get("peptide", "")) == peptide_plain:
+                    self.peptide_list.setCurrentRow(i)
+                    self.peptide_list.scrollToItem(self.peptide_list.item(i))
+                    break
+
+        # Pick the PSM to load: the best-scoring one for this peptide (lowest q).
+        target_row, target_i = None, -1
+        for i in range(self.psm_list.count()):
+            row = self.psm_list.item(i).data(Qt.UserRole) or {}
+            if plain_seq(row.get("peptide", "")) != peptide_plain:
+                continue
+            q = safe_float(row.get("percolator_q"))
+            if target_row is None or (q is not None and
+                                      (safe_float(target_row.get("percolator_q")) is None
+                                       or q < safe_float(target_row.get("percolator_q")))):
+                target_row, target_i = row, i
+        if target_i < 0 and self.psm_list.count():
+            target_row, target_i = self.psm_list.item(0).data(Qt.UserRole), 0
+
+        # Arm the MS2 reconstruction BEFORE loading so on_evidence_done applies it
+        # when the window finishes extracting.
+        if show_ms2 and target_row is not None:
+            self._pending_focus = {
+                "scan": str(target_row.get("scan", "") or ""),
+                "seq": peptide_plain,
+                "charge": peptide_charge(target_row),
+                "row": target_row,
+            }
+        else:
+            self._pending_focus = None
+
+        if target_i >= 0:
+            if self.psm_list.currentRow() == target_i:
+                self.on_psm_selected()   # re-load even if already selected
+            else:
+                self.psm_list.setCurrentRow(target_i)   # triggers on_psm_selected
+
+    def _apply_ms2_focus(self, pf):
+        """Reconstruct the MS2 evidence view for a Proteins-tab jump: render the
+        PSM's MS2 spectrum, overlay the peptide's theoretical MS1 on panel 1, and
+        select the matching distribution + MS2 band on panel 2. Runs after the
+        window load so ``self._ms2_all`` is populated."""
+        scan_no = pf.get("scan")
+        scan = None
+        for m in getattr(self, "_ms2_all", []):
+            if str(m.get("number", "")) == scan_no:
+                scan = m
+                break
+        if scan is None:
+            # nearest MS2 by RT as a fallback so something relevant shows
+            if getattr(self, "_ms2_all", None) and isinstance(self.current, dict):
+                rt = self.current.get("rt")
+                if rt is not None:
+                    scan = min(self._ms2_all,
+                               key=lambda m: abs((m.get("rt") or 0.0) - rt))
+        if scan is None:
+            return
+        self.render_ms2(scan)
+        seq = pf.get("seq") or ""
+        charge = pf.get("charge") or scan.get("charge") or 2
+        if len(seq) >= 2:
+            # Select the matching distribution FIRST so the theoretical overlay
+            # normalizes to it, then set the overlay and force a panel-1 redraw
+            # (draw_panel1 re-adds the overlay) so it reliably appears.
+            row = pf.get("row") or {}
+            try:
+                self._select_distribution_for_candidate(row, charge, scan)
+            except Exception:
+                pass
+            self._ms1_theo = {"seq": seq, "charge": charge}
+            self._redraw_panel1_view()
+            self._draw_ms1_theo_overlay()
+
     # ---- store access ----------------------------------------------------
 
     def centroid_store(self, filename):
@@ -1753,6 +1852,17 @@ class MSViewerTab(QMainWindow):
         else:
             self.draw_panel3_ms1(cur, scan_mz, scan_int)
         self._set_loading(False)
+
+        # A Proteins-tab jump armed an MS2 reconstruction: apply it now that the
+        # window (and self._ms2_all) is loaded.
+        pf = getattr(self, "_pending_focus", None)
+        if pf is not None:
+            self._pending_focus = None
+            try:
+                self._apply_ms2_focus(pf)
+            except Exception:
+                import traceback
+                traceback.print_exc()
 
     def draw_panel1(self, points, region, mz_min, mz_max, rt_start, rt_end):
         self.p1_2d.clear()
