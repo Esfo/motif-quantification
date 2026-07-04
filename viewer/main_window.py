@@ -18,12 +18,14 @@ try:
     from .session import ViewerSession
     from .theming import palette, style_plot
     from .ms_viewer_tab import MSViewerTab
+    from .proteins_tab import ProteinsTab
     from .distributions_db import DistributionsDB
     from .experimental import ExperimentalSetup
 except ImportError:
     from session import ViewerSession
     from theming import palette, style_plot
     from ms_viewer_tab import MSViewerTab
+    from proteins_tab import ProteinsTab
     from distributions_db import DistributionsDB
     from experimental import ExperimentalSetup
 
@@ -128,6 +130,8 @@ class MainWindow(QMainWindow):
             style_plot(widget, pal)
         if self.ms_tab is not None:
             self.ms_tab.apply_theme(theme)
+        if getattr(self, "proteins_tab", None) is not None:
+            self.proteins_tab.apply_theme(theme)
         self.theme_action.setText("Switch to &light mode" if theme == "dark" else "Switch to &dark mode")
 
     # ---- opening folders -------------------------------------------------
@@ -201,10 +205,8 @@ class MainWindow(QMainWindow):
         # 'loading' now shows as a badge on top of panels 1/2 and as a row within
         # Table 1 (driven inside MSViewerTab), not in the tab bar.
         tabs.addTab(self.ms_tab, "MS Data")
-        tabs.addTab(self._placeholder("Protein viewing",
-                    "Whole-protein sequences with peptide coverage coloured by q-value "
-                    "(shared q-value colour scale). Single-file or verticalized side-by-side "
-                    "across files. — staged, see ARCHITECTURE.md"), "Proteins")
+        self.proteins_tab = ProteinsTab(self.session, theme=self.theme)
+        tabs.addTab(self.proteins_tab, "Proteins")
         tabs.addTab(self._placeholder("File-by-file comparison",
                     f"Quantitative comparison across files: time series + differential "
                     f"expression. Reads experimental-setup "
