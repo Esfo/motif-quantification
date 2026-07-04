@@ -233,10 +233,12 @@ data the pipeline produces. The four founding goals:
 
 ---
 
-# TAB 3 — FILE-BY-FILE COMPARISON ⬜
-- ⬜ Quantitative data **comparing peptides and proteins across files** — this is where the **quant work** is done.
-- ⬜ **Time series** and **differential expression** analysis.
-- ⬜ Reads the `experimental-setup` file (`filename,condition,fraction,replicate,pair_id`) to compare files; **modulate columns across files** as any treatment vs any other; **group multiple treatments hierarchically** to compare them any way.
+# TAB 3 — QUANTITATIVE COMPARISONS 🟡
+- ✅ Quantitative data **comparing peptides and proteins across files** — the **quant work**. `quant_model.py` builds a feature×file quantity matrix at the **peptide** level (charge/mod variants summed on `peptide_plain`) or **protein** level (roll-up: sum / median / unique-peptides). A **Peptides⇄Proteins** switch across the bottom-half table re-analyzes everything above.
+- ✅ **Differential expression**: Welch's (default) or **paired** t-test on **log2** quantities + **Benjamini-Hochberg FDR**, all pure-Python (`de_stats.py`, Student-t p via incomplete beta — no scipy). **Volcano** plot (log2FC vs -log10 FDR) on the top-right; click a point to select the feature. DE results fill the sortable feature table (mean A, mean B, log2FC, p, FDR).
+- ✅ Reads `experimental-setup` and lets **any** column take a **role** — Group / Series-axis / Replicate / Pair / Ignore — so the contrast is user-defined, not hard-coded. **Restrict-to** filters on the other Group columns give the **hierarchical** grouping; the contrast picks any Group column's value A vs value B (**any treatment vs any other**).
+- ✅ **Titration / time-series**: assign a column the **Series-axis** role and the visualization plots quantity **along** it (x = ordered series values, one line per group, replicate dots) — e.g. "fraction is the Group, replicate is the Series-axis" groups by fraction then orders along replicate. No Series-axis → per-group strip+mean plot.
+- ⬜ Run DE on a **worker thread** for large peptide sets (currently synchronous); **save named contrasts / narrowed feature sets**; add MA-plot / clustered-heatmap views; per-feature link into the MS Data tab.
 
 ---
 
