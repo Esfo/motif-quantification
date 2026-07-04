@@ -1431,6 +1431,32 @@ class MSViewerTab(QMainWindow):
             self.p3_title.setText(f"evidence error: {exc}")
             traceback.print_exc()
 
+    def focus_identification(self, filename, protein_id, peptide_plain):
+        """Drive the lists to a specific identification, as if the user had
+        clicked file → protein → peptide. Used by the Proteins tab to jump here
+        when a peptide is double-clicked. Selecting the peptide auto-loads its
+        PSM (via on_peptide_selected) when it resolves to one."""
+        if filename:
+            idx = self.file_combo.findData(filename)
+            if idx >= 0 and idx != self.file_combo.currentIndex():
+                self.file_combo.setCurrentIndex(idx)   # triggers repopulate
+            else:
+                self.repopulate_active_list()
+        # protein
+        if protein_id:
+            for i in range(self.protein_list.count()):
+                if self.protein_list.item(i).text() == protein_id:
+                    self.protein_list.setCurrentRow(i)   # populates peptide list
+                    break
+        # peptide (match on the plain, modification-stripped sequence)
+        if peptide_plain:
+            for i in range(self.peptide_list.count()):
+                row = self.peptide_list.item(i).data(Qt.UserRole) or {}
+                if plain_seq(row.get("peptide", "")) == peptide_plain:
+                    self.peptide_list.setCurrentRow(i)
+                    self.peptide_list.scrollToItem(self.peptide_list.item(i))
+                    break
+
     # ---- store access ----------------------------------------------------
 
     def centroid_store(self, filename):

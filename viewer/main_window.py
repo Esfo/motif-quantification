@@ -202,10 +202,12 @@ class MainWindow(QMainWindow):
         self.ms_tab.on_theme_toggle = self.toggle_theme   # panel-1 Light/Dark button
 
         tabs = QTabWidget()
+        self.tabs = tabs
         # 'loading' now shows as a badge on top of panels 1/2 and as a row within
         # Table 1 (driven inside MSViewerTab), not in the tab bar.
         tabs.addTab(self.ms_tab, "MS Data")
         self.proteins_tab = ProteinsTab(self.session, theme=self.theme)
+        self.proteins_tab.on_navigate_to_ms = self._navigate_to_ms
         tabs.addTab(self.proteins_tab, "Proteins")
         tabs.addTab(self._placeholder("File-by-file comparison",
                     f"Quantitative comparison across files: time series + differential "
@@ -226,6 +228,17 @@ class MainWindow(QMainWindow):
         self.reload_action.setEnabled(not self.session.is_empty)
         title = "no folder open (double-click to open)" if self.session.is_empty else str(reorganized)
         self.setWindowTitle(f"Motif Quantification Viewer — {title}")
+
+    def _navigate_to_ms(self, filename, protein_id, peptide_plain):
+        """Proteins-tab → MS Data tab jump: switch to MS Data and focus the given
+        identification (double-clicking a peptide in the protein sequence)."""
+        if self.ms_tab is None:
+            return
+        self.tabs.setCurrentIndex(self.tabs.indexOf(self.ms_tab))
+        try:
+            self.ms_tab.focus_identification(filename, protein_id, peptide_plain)
+        except Exception:
+            pass
 
     def _placeholder(self, title, text):
         widget = QWidget()

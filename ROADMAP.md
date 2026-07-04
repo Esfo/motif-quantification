@@ -222,8 +222,9 @@ data the pipeline produces. The four founding goals:
 - ✅ Show **entire protein sequences** (from the project FASTA — reorganized tables carry none); each **tryptic peptide the search attempted** is an outlined rectangle (protease cut segments), with the letters written inside. Segments outside the search length bounds carry no rectangle (plain letters = "not searched").
 - ✅ Rectangle **background represents q-value** on a green(best)→red(worst) gradient (`proteins_tab.q_color`); attempted-but-unidentified peptides stay uncoloured. *(Not yet wired to the shared 3D-points color-settings dropdown — see 0.2; standalone gradient for now.)*
 - ✅ Same as MS Data: **file selector** + a scrollable **FDR spin box** (near the left, default = search `q_max`) governing the protein list, and a single **protein list**.
-- ✅ **Panel 1** (horizontal, wrapping) over **panel 2** (same protein **verticalized side-by-side across every file**, N→C top-to-bottom, file names on a 45° slant); click a panel-2 column to bring that file into panel 1. Panel 1 has an **All** button that combines identifications across all files into one consensus colouring.
-- ⬜ If the per-residue sequence is too hard to see, display **block chunks proportionate to the peptide length** they represent; peptides can be **zoomed in on** to clarify.
+- ✅ **Panel 1** (horizontal, wrapping) over **panel 2** (same protein **verticalized side-by-side across every file**, N→C top-to-bottom, file names on a 45° slant); click a panel-2 column to bring that file into panel 1. Panel 1's bar holds the **All** button, the **FDR** spin box (right of All) and a **colour-bar legend** (q-value/FDR → colour). **Double-click a peptide in panel 1** to jump to the MS Data tab focused on that identification (best file when in All mode).
+- 🟡 Panel 2 **zooms** (± buttons / Ctrl-wheel): zooming out drops the residue letters to filled colour bands while **file names stay full size**. *(Panel-1 per-peptide block-chunk zoom still ⬜.)*
+- ✅ **Light/dark** adaptive colours across the tab (panels, colour bar, list/combo chrome).
 
 ---
 
