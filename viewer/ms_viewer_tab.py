@@ -2177,10 +2177,12 @@ class MSViewerTab(QMainWindow):
             pass
 
     def _on_fdr_changed(self):
-        """FDR spin box changed: update the threshold and recolor the MS2 strip."""
+        """FDR spin box changed: update the threshold and recolor both the MS2
+        strip lines AND the on-panel-2 isolation band."""
         self._fdr_threshold = max(0.0, self.fdr_edit.value()) / 100.0
         self._ident_cache_key = None   # invalidate cache
         self._refresh_ms2_visible()
+        self._apply_ms2_band()
 
     def _identified_scans(self):
         """Set of MS2 scan numbers that have a PSM passing the FDR acceptance
