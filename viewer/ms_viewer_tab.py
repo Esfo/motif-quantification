@@ -3035,9 +3035,19 @@ class MSViewerTab(QMainWindow):
         # oxidation) lines up with its real precursor instead of sitting
         # ~mod_mass/z Th to the left.
         mod_mass = float(self._ms1_theo.get("mod_mass", 0.0) or 0.0)
+        z = max(1, int(self._ms1_theo["charge"] or 1))
+        mzs = np.asarray(mzs, dtype=float)
+        abund = np.asarray(abund, dtype=float)
         if mod_mass:
-            z = max(1, int(self._ms1_theo["charge"] or 1))
-            mzs = np.asarray(mzs, dtype=float) + mod_mass / z
+            mzs = mzs + mod_mass / z
+        # Merge isotopomer bars that fall within a bar width of each other. In
+        # raw mode, isotopomers sharing a nominal M+N (e.g. a 13C vs a 15N
+        # substitution) sit ~0.002 Th apart -- unresolvable and rendered as two
+        # overlapping bars at the same spot, which reads as the distribution
+        # being "plotted twice". Collapse each cluster into one abundance-summed
+        # bar so a position is only ever drawn once. Summed mode has no such
+        # near-duplicates, so this leaves it unchanged.
+        mzs, abund = self._merge_close_bars(mzs, abund, tol=0.02)
         theo_max = float(np.max(abund)) or 1.0
         # Normalize: tallest theoretical bar == tallest experimental peak.
         heights = np.asarray(abund, dtype=float) * (exp_max / theo_max)
@@ -3051,6 +3061,33 @@ class MSViewerTab(QMainWindow):
         bars.setZValue(0)   # beneath the experimental scatters (z=1), above bg
         self.p1_2d.addItem(bars)
         self._ms1_theo_item = bars
+
+    @staticmethod
+    def _merge_close_bars(mzs, abund, tol=0.02):
+        """Collapse bars closer than ``tol`` m/z into one abundance-summed bar at
+        their abundance-weighted mean m/z (so visually-coincident isotopomers
+        aren't drawn on top of each other)."""
+        if mzs is None or len(mzs) == 0:
+            return mzs, abund
+        order = np.argsort(mzs)
+        mzs = np.asarray(mzs, dtype=float)[order]
+        abund = np.asarray(abund, dtype=float)[order]
+        out_mz, out_ab = [], []
+        cluster_mz = [mzs[0]]
+        cluster_ab = [abund[0]]
+        for m, a in zip(mzs[1:], abund[1:]):
+            if m - cluster_mz[-1] <= tol:
+                cluster_mz.append(m)
+                cluster_ab.append(a)
+            else:
+                tot = sum(cluster_ab) or 1.0
+                out_mz.append(sum(mm * aa for mm, aa in zip(cluster_mz, cluster_ab)) / tot)
+                out_ab.append(sum(cluster_ab))
+                cluster_mz, cluster_ab = [m], [a]
+        tot = sum(cluster_ab) or 1.0
+        out_mz.append(sum(mm * aa for mm, aa in zip(cluster_mz, cluster_ab)) / tot)
+        out_ab.append(sum(cluster_ab))
+        return np.array(out_mz), np.array(out_ab)
 
     def _on_fragments_ready(self, result):
         if result.get("token") != getattr(self, "_frag_token", 0):
@@ -4197,6 +4234,7 @@ class MSViewerTab(QMainWindow):
             if self._panel3_mode == "ms2":
                 self._pending_charge_refocus = True
             self._fit_to_selected()
+            self._draw_ms1_theo_overlay()   # show the new-charge overlay at once
             return
         # Otherwise no distribution exists at this charge: show a RED box where the
         # hypothetical distribution would be, and fit to it.
