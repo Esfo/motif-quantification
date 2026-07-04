@@ -33,6 +33,7 @@ from PySide6.QtCore import (
     QSortFilterProxyModel,
     Qt,
     QThread,
+    QTimer,
     Signal,
 )
 from PySide6.QtWidgets import (
@@ -1059,6 +1060,11 @@ class MSViewerTab(QMainWindow):
         self.p1_2d.setXLink(self.p2)
         self.p2.sigXRangeChanged.connect(self.on_view_range_changed)
         self.p2.sigYRangeChanged.connect(self.on_view_range_changed)
+        # Clicking empty space in panel 2 deselects the distribution (and clears
+        # the theoretical overlay). A click ON a distribution's dots is handled
+        # by the scatter's sigClicked (on_panel2_dist_clicked); the two are
+        # disambiguated in _on_p2_clicked via a deferred check.
+        self.p2.scene().sigMouseClicked.connect(self._on_p2_clicked)
         # Plain wheel over panel 2 pans the window (m/z / time); Ctrl+wheel zooms
         # (handled in eventFilter).
         self.p2.viewport().installEventFilter(self)
@@ -2476,6 +2482,15 @@ class MSViewerTab(QMainWindow):
         did = points[0].data()
         if did is None:
             return
+        # Bump the distribution-click sequence so the deferred empty-space check
+        # in _on_p2_clicked knows a distribution was hit during this dispatch
+        # (robust to scatter/scene signal ordering, and to panel-1 dot clicks
+        # which route here too but fire no panel-2 scene click).
+        self._dist_click_seq = getattr(self, "_dist_click_seq", 0) + 1
+        # A real distribution is now selected: any theoretical overlay from a
+        # prior peptide / charge-scroll hypothetical goes away.
+        self._ms1_theo = None
+        self._draw_ms1_theo_overlay()
         # Select it: dotted border + charge-search anchor (no view move on click).
         self._set_selected(did)
         # Selecting an MS1 distribution returns panel 3 to its MS1 view.
@@ -2491,6 +2506,37 @@ class MSViewerTab(QMainWindow):
         self.draw_panel3_ms1(self.current,
                              getattr(self, "_last_scan_mz", None),
                              getattr(self, "_last_scan_int", None))
+
+    def _on_p2_clicked(self, event):
+        """Panel-2 scene click. A click on a distribution's dots is handled by
+        the scatter's sigClicked (on_panel2_dist_clicked), which bumps
+        _dist_click_seq; anything else is empty space -> deselect. Deferred to
+        the next event-loop tick so the scatter signal (fired in the same click
+        dispatch, order unspecified) is accounted for before we decide."""
+        try:
+            if event.double() or event.button() != Qt.LeftButton:
+                return
+        except Exception:
+            pass
+        seq = getattr(self, "_dist_click_seq", 0)
+        QTimer.singleShot(0, lambda: self._resolve_p2_click(seq))
+
+    def _resolve_p2_click(self, seq):
+        # A distribution was clicked during this dispatch iff the sequence moved.
+        if getattr(self, "_dist_click_seq", 0) != seq:
+            return
+        self._deselect_distribution()
+
+    def _deselect_distribution(self):
+        """Drop the current distribution selection: remove the panel-2 border,
+        clear the charge-search anchor, and hide the theoretical MS1 overlay."""
+        self._selected_dist_id = None
+        self._selected_charge_group = None
+        self._selected_bbox = None
+        self._border_color = None
+        self._clear_selection()          # removes the dotted border
+        self._ms1_theo = None            # theoretical distributions disappear
+        self._draw_ms1_theo_overlay()
 
     def draw_ms2_strip(self, ms2):
         # Keep every loaded MS2 scan; the strip only shows the ones whose RT *and*
@@ -4131,15 +4177,19 @@ class MSViewerTab(QMainWindow):
         step = 1 if delta > 0 else -1
         base = self.current.get("charge") or self.assumed_charge or 1
         target = max(1, base + step)
+        # Follow the new charge on panel 1's theoretical overlay in BOTH cases
+        # (a linked distribution or a hypothetical one): the theoretical MS1 is
+        # the current peptide's isotope pattern at the target charge, i.e. it
+        # sits at the presumed m/z for that charge and scales its abundances the
+        # same way as any other theoretical overlay. Rebuild it from the peptide
+        # if a prior action cleared it.
+        self._set_theo_for_charge(target)
         grp = getattr(self, "_selected_charge_group", None)
         # If the selected distribution's analyte has a distribution at the target
         # charge, lock onto it: transfer the dotted border and auto-fit to it.
         if grp and target in grp and grp[target].get("distribution"):
             did = grp[target]["distribution"]["distribution_id"]
             self._set_selected(did, keep_group=True)
-            # Follow the new charge state on panel 1's theoretical overlay too.
-            if isinstance(self._ms1_theo, dict):
-                self._ms1_theo = {**self._ms1_theo, "charge": target}
             # Fitting reloads the region (async); if the MS2 view is up, tell
             # on_evidence_done to shift panel 3 to THIS distribution's MS2
             # instead of re-rendering the old scan. (The MS1 view already
@@ -4154,6 +4204,23 @@ class MSViewerTab(QMainWindow):
         if isinstance(self.current, dict):
             self.current["charge"] = target
         self._set_hypothetical(target)
+        # No distribution here, so no async reload is guaranteed to redraw the
+        # overlay -- draw it now at the hypothetical charge's presumed m/z.
+        self._draw_ms1_theo_overlay()
+
+    def _set_theo_for_charge(self, charge):
+        """Point the panel-1 theoretical MS1 overlay at the current peptide at
+        ``charge`` (used by charge stepping). Rebuilds _ms1_theo from the current
+        PSM if it was cleared, so scrolling into a charge with no distribution
+        still shows a theoretical distribution at that charge's presumed m/z."""
+        if isinstance(self._ms1_theo, dict):
+            self._ms1_theo = {**self._ms1_theo, "charge": charge}
+            return
+        row = self.current.get("row", {}) if isinstance(self.current, dict) else {}
+        plain = plain_seq(row.get("peptide", ""))
+        if len(plain) >= 2:
+            self._ms1_theo = {"seq": plain, "charge": charge,
+                              "mod_mass": peptide_mod_mass(row.get("peptide", ""))}
 
     def set_charge(self, z):
         if self.current is None:
