@@ -2667,6 +2667,7 @@ class MSViewerTab(QMainWindow):
             # Ground the baseline at 0 (no gap below the sticks).
             top = float(np.max(inten)) * 1.05 if len(inten) else 1.0
             self.p3.getViewBox().setYRange(0.0, top, padding=0)
+            self._fit_p3_ms2_xrange()   # fit m/z to the data (labels added later)
             self.p3_title.setText(
                 f"MS2 scan {scan.get('number','')}  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
             self.populate_table2(scan, mz)
@@ -3074,6 +3075,42 @@ class MSViewerTab(QMainWindow):
                 self.p3.addItem(label)
                 overlay.append(label)
         self._frag_overlay = overlay
+        # Widen the m/z axis so edge labels aren't clipped (below).
+        self._fit_p3_ms2_xrange()
+
+    def _fit_p3_ms2_xrange(self):
+        """Set the MS2 plot's m/z bounds to whichever reaches further -- the peak
+        data or the fragment-ion text labels. Labels are screen-fixed size and
+        anchored (centred) on their peak, so a label on an edge peak overhangs
+        the data; convert its pixel half-width to m/z and extend the range to
+        fit. The m/z-per-pixel is referenced to the DATA span (not the live view)
+        so widening can't feed back into a wider label and diverge."""
+        if self._panel3_mode != "ms2":
+            return
+        mz = getattr(self, "_ms2_mz", None)
+        if mz is None or not len(mz):
+            return
+        data_lo, data_hi = float(np.min(mz)), float(np.max(mz))
+        span = max(data_hi - data_lo, 1e-9)
+        vb = self.p3.getViewBox()
+        try:
+            px_w = float(vb.width())
+        except Exception:
+            px_w = 0.0
+        xscale = span / px_w if px_w > 1 else 0.0
+        lo, hi = data_lo, data_hi
+        for it in getattr(self, "_frag_overlay", []):
+            if not isinstance(it, pg.TextItem):
+                continue
+            try:
+                x = float(it.pos().x())
+                half = it.boundingRect().width() * xscale / 2.0   # anchor 0.5
+                lo = min(lo, x - half)
+                hi = max(hi, x + half)
+            except Exception:
+                pass
+        pad = span * 0.02
+        vb.setXRange(lo - pad, hi + pad, padding=0)
 
     # Wheel over a plot's y-axis strip scrolls intensity (y zoom) with the
     # baseline pinned at 0, even though y-drag inside the plot is disabled. Used
