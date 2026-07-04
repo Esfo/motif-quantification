@@ -748,6 +748,10 @@ class MSViewerTab(QMainWindow):
         self.p1_load_overlay = self._make_loading_overlay(self.p1_2d)
         self.p1_2d.setLabel("bottom", "m/z")
         self.p1_2d.setLabel("left", "intensity")
+        # No "x0.000#" SI-prefix multiplier on the m/z axis: with no data loaded
+        # the default range makes pyqtgraph pick a tiny prefix and append it to
+        # the label. m/z is an absolute value, never scaled.
+        self.p1_2d.getAxis("bottom").enableAutoSIPrefix(False)
         # NOTE: clip-to-view + 'peak' auto-downsampling was culling scatter points
         # as you zoomed in (they "disappeared"). Disabled so every datapoint stays
         # drawn at any zoom; the window is bounded so the point count stays sane.
@@ -989,6 +993,7 @@ class MSViewerTab(QMainWindow):
         self.p2_load_overlay = self._make_loading_overlay(self.p2)
         self.p2.setLabel("bottom", "m/z")
         self.p2.setLabel("left", "RT", units="min")
+        self.p2.getAxis("bottom").enableAutoSIPrefix(False)   # no "x0.000#" on m/z
         self.p2.getAxis("left").setWidth(P2_AXIS_W)
         self.p2_image = pg.ImageItem()
         if self._cmap is not None:
@@ -2747,7 +2752,13 @@ class MSViewerTab(QMainWindow):
             mzs, abund = isotopes.peptide_isotope_bars(
                 self._ms1_theo["seq"], self._ms1_theo["charge"], mode=mode,
                 dividing_threshold=0.1)
-        except Exception:
+        except Exception as exc:
+            # Don't silently drop the overlay: a computation failure (e.g. a
+            # residue with no atomic composition) otherwise looks identical to
+            # "no distribution here". Surface it so it's diagnosable.
+            import sys
+            print(f"[ms1-theo] no overlay for "
+                  f"{self._ms1_theo.get('seq')!r}: {exc}", file=sys.stderr)
             return
         if mzs is None or len(mzs) == 0:
             return
