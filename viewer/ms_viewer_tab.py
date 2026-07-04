@@ -914,6 +914,7 @@ class MSViewerTab(QMainWindow):
         self.p1_2d.getPlotItem().hideButtons()
 
         container = QWidget()
+        container.setObjectName("panel1_frame")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.addLayout(bar)
@@ -1046,6 +1047,7 @@ class MSViewerTab(QMainWindow):
         row.addWidget(self.p2, stretch=1)
 
         container = QWidget()
+        container.setObjectName("panel2_frame")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 0, 2, 2)
         # p2_loading is intentionally NOT added to the layout: its row was the
@@ -1094,6 +1096,7 @@ class MSViewerTab(QMainWindow):
         self.p3_loading.setStyleSheet("color: black;")
 
         container = QWidget()
+        container.setObjectName("panel3_frame")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.addWidget(self.p3_stack, stretch=1)
@@ -1245,6 +1248,14 @@ class MSViewerTab(QMainWindow):
         # blends in (instead of an awkward blank gap next to panel 2's strip).
         if getattr(self, "_p1_2d_spacer", None) is not None:
             self._p1_2d_spacer.setStyleSheet(f"background-color: {pal['bg']};")
+        # Outline each panel (1/2/3) so their boundaries are visible -- black on
+        # the light theme, light grey on the dark theme. Scoped by objectName so
+        # the border doesn't cascade onto the child plot widgets.
+        border = "#000000" if theme == "light" else "#9a9a9a"
+        for name in ("panel1_frame", "panel2_frame", "panel3_frame"):
+            w = self.findChild(QWidget, name)
+            if w is not None:
+                w.setStyleSheet(f"QWidget#{name} {{ border: 1px solid {border}; }}")
         self._recolor_gl(pal)   # 3D side labels (exist with or without GL)
         if HAVE_GL:
             style_gl(self.p1_3d, pal)
@@ -2454,10 +2465,9 @@ class MSViewerTab(QMainWindow):
             prec = scan.get("mz") or 0.0
             low, high = prec - 1.0, prec + 1.0
         self._frag_token = getattr(self, "_frag_token", 0) + 1
-        # Title = peptide + the MS1 isolation window / RT (so the lines can be
-        # visually verified against the scan parameters).
-        self.p3.setTitle(self._ms2_title(scan, peptide=str(r.get("peptide", ""))),
-                         color=palette(self.theme)["fg"])
+        # Title stays the MS1 isolation window / RT (no peptide), so the plotted
+        # lines can be verified against the scan parameters.
+        self.p3.setTitle(self._ms2_title(scan), color=palette(self.theme)["fg"])
         worker = FragmentWorker(
             seq, charge, low, high,
             getattr(self, "_ms2_mz", np.array([])),
