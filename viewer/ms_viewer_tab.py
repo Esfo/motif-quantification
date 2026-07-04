@@ -1512,16 +1512,21 @@ class MSViewerTab(QMainWindow):
                 if rt is not None:
                     scan = min(self._ms2_all,
                                key=lambda m: abs((m.get("rt") or 0.0) - rt))
-        if scan is None:
-            return
-        self.render_ms2(scan)
+
+        # The theoretical MS1 overlay on panel 1 needs only the peptide's
+        # sequence + charge, so draw it FIRST -- independent of whether an MS2
+        # scan can be located. A validated ID whose MS2 scan isn't in the loaded
+        # window (or whose stored scan number doesn't match) must still show its
+        # MS1 isotope distribution. The MS2-dependent reconstruction below is
+        # gated on ``scan`` separately.
         seq = pf.get("seq") or ""
-        charge = pf.get("charge") or scan.get("charge") or 2
+        charge = pf.get("charge") or (scan.get("charge") if scan else None) or 2
         if len(seq) >= 2:
+            row = pf.get("row") or {}
             # Select the matching distribution FIRST so the theoretical overlay
             # normalizes to it, then set the overlay and force a panel-1 redraw
-            # (draw_panel1 re-adds the overlay) so it reliably appears.
-            row = pf.get("row") or {}
+            # (draw_panel1 re-adds the overlay) so it reliably appears. With no
+            # MS2 scan the distribution is matched off the PSM's own RT.
             try:
                 self._select_distribution_for_candidate(row, charge, scan)
             except Exception:
@@ -1529,6 +1534,10 @@ class MSViewerTab(QMainWindow):
             self._ms1_theo = {"seq": seq, "charge": charge}
             self._redraw_panel1_view()
             self._draw_ms1_theo_overlay()
+
+        if scan is None:
+            return
+        self.render_ms2(scan)
 
     # ---- store access ----------------------------------------------------
 
@@ -2636,7 +2645,7 @@ class MSViewerTab(QMainWindow):
                 return
             z = max(1, int(charge or 1))
             mono_mz = neutral / z + 1.007276
-            rt = scan.get("rt")
+            rt = scan.get("rt") if scan else None
             if rt is None and isinstance(self.current, dict):
                 rt = self.current.get("rt")
             if rt is None:
