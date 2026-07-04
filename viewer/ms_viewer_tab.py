@@ -745,6 +745,7 @@ class MSViewerTab(QMainWindow):
 
     def build_panel1_dock(self):
         self.p1_2d = pg.PlotWidget()
+        self.p1_load_overlay = self._make_loading_overlay(self.p1_2d)
         self.p1_2d.setLabel("bottom", "m/z")
         self.p1_2d.setLabel("left", "intensity")
         # NOTE: clip-to-view + 'peak' auto-downsampling was culling scatter points
@@ -985,6 +986,7 @@ class MSViewerTab(QMainWindow):
         # Panel 2: m/z on x (aligned with panel 1), RT on its own real left axis
         # (fixed width) sitting to the right of the band strip.
         self.p2 = pg.PlotWidget()
+        self.p2_load_overlay = self._make_loading_overlay(self.p2)
         self.p2.setLabel("bottom", "m/z")
         self.p2.setLabel("left", "RT", units="min")
         self.p2.getAxis("left").setWidth(P2_AXIS_W)
@@ -1179,9 +1181,9 @@ class MSViewerTab(QMainWindow):
         all_btn.setFixedWidth(44)
         all_btn.clicked.connect(self._reload_current_tab)
         self.table1_tabs.setCornerWidget(all_btn, Qt.TopRightCorner)
-        # 'loading…' indicator on the left of the tab row while a table query runs.
-        self.table1_loading = QLabel("")
-        self.table1_tabs.setCornerWidget(self.table1_loading, Qt.TopLeftCorner)
+        # 'loading…' shows as a placeholder row WITHIN each table (models /
+        # QTableWidget), not as a tab-corner widget (which pushed the tabs over).
+        self.table1_loading = None
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_table1")
@@ -1655,17 +1657,30 @@ class MSViewerTab(QMainWindow):
         self._set_loading(True, cur["row"].get("peptide", "") or "region")
         self._start_evidence()
 
+    def _make_loading_overlay(self, parent):
+        """A 'loading' badge floated ON TOP of a plot, hidden until shown."""
+        lbl = QLabel("loading", parent)
+        lbl.setStyleSheet(
+            "background: rgba(0,0,0,150); color: white; padding: 3px 10px;"
+            " border-radius: 4px; font-weight: bold;")
+        lbl.hide()
+        return lbl
+
     def _set_loading(self, on, context=""):
-        """Show/clear a bold "loading" line above every panel 1/2/3 plot while a
-        data worker runs (per the spec: must happen everywhere)."""
-        text = "<b>loading…</b>" if on else ""
-        # Loading now surfaces in the tab bar (set by main_window), not above
-        # panel 1; the p2/p3 sinks are kept for compatibility.
-        for label in (getattr(self, "tab_loading_label", None),
-                      getattr(self, "p2_loading", None),
-                      getattr(self, "p3_loading", None)):
-            if label is not None:
-                label.setText(text)
+        """Show/clear a 'loading' badge on top of panels 1 & 2 while the data
+        worker runs."""
+        for ov in (getattr(self, "p1_load_overlay", None),
+                   getattr(self, "p2_load_overlay", None)):
+            if ov is None:
+                continue
+            if on:
+                ov.adjustSize()
+                pw = ov.parent().width()
+                ov.move(max(4, (pw - ov.width()) // 2), 6)
+                ov.show()
+                ov.raise_()
+            else:
+                ov.hide()
 
     def _start_evidence(self):
         if self.worker is not None and self.worker.isRunning():
@@ -2408,7 +2423,7 @@ class MSViewerTab(QMainWindow):
                         subisotopomericdepth=0.5)
                     matched, _ = seqfragments_module.annotate_spectrum(
                         ents, peaks, ints, ppm=self.frag_ppm)
-                    labels = [m["ion"] for m in matched]
+                    labels = [row["ion"] for m in matched for row in m.get("rows", [])]
                     mc = seqcoverage.coverage_metrics(seq, labels)["matchcounts"]
                 except Exception:
                     mc = 0
@@ -2687,12 +2702,20 @@ class MSViewerTab(QMainWindow):
             self.p3.addItem(green_curve)
             overlay.append(green_curve)
             for m in matched:
-                isos = m.get("isotopes", [])
-                iso_txt = ",".join(f"M+{i}" for i in isos) if isos else ""
-                z = m.get("charge", 1)
-                ztxt = "" if z == 1 else f"({z}+)"
-                label = pg.TextItem(f"{m['ion']}{ztxt} {iso_txt}".strip(),
-                                    color=fg, anchor=(0.5, 1.0))
+                # Every ion that matched this peak is its own row (already sorted
+                # by decreasing ppm error), with the ppm error to the right of the
+                # M+N label. Stacked as one multi-line label above the peak.
+                lines = []
+                for row in m.get("rows", []):
+                    isos = row.get("isotopes", [])
+                    iso_txt = ",".join(f"M+{i}" for i in isos) if isos else ""
+                    z = row.get("charge", 1)
+                    ztxt = "" if z == 1 else f"({z}+)"
+                    lines.append(
+                        f"{row['ion']}{ztxt} {iso_txt}  {row['ppm']:+.1f} ppm".strip())
+                if not lines:
+                    continue
+                label = pg.TextItem("\n".join(lines), color=fg, anchor=(0.5, 1.0))
                 label.setPos(m["mz"], m["intensity"])
                 label.setZValue(21)
                 self.p3.addItem(label)

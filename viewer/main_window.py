@@ -198,14 +198,8 @@ class MainWindow(QMainWindow):
         self.ms_tab.on_theme_toggle = self.toggle_theme   # panel-1 Light/Dark button
 
         tabs = QTabWidget()
-        # "loading" indicator lives in the tab bar's top-right corner (moved out
-        # of the panel-1 button bar); the MS tab drives it via tab_loading_label.
-        loading_label = QLabel("")
-        loading_label.setContentsMargins(0, 0, 8, 0)
-        fg = "#f0f0f0" if self.theme == "dark" else "#101010"
-        loading_label.setStyleSheet(f"color: {fg}; padding: 0 8px;")
-        tabs.setCornerWidget(loading_label, Qt.TopRightCorner)
-        self.ms_tab.tab_loading_label = loading_label
+        # 'loading' now shows as a badge on top of panels 1/2 and as a row within
+        # Table 1 (driven inside MSViewerTab), not in the tab bar.
         tabs.addTab(self.ms_tab, "MS Data")
         tabs.addTab(self._placeholder("Protein viewing",
                     "Whole-protein sequences with peptide coverage coloured by q-value "

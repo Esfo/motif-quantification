@@ -601,10 +601,24 @@ def annotate_spectrum(entries, peak_mz, peak_int, ppm=20.0):
     matched = []
     for fi in sorted(flyann):
         anns = flyann[fi]
-        rep = min(anns, key=lambda a: abs(a["mz"] - fly[fi]))
-        isos = sorted({a["isotope_index"] for a in anns if a["ion"] == rep["ion"]})
-        matched.append({"mz": float(fly[fi]), "intensity": float(fint[fi]),
-                        "ion": rep["ion"], "charge": rep["charge"], "isotopes": isos})
+        peak = float(fly[fi])
+        # ALL ions that hit this peak, each its own row: group by ion+charge+m/z
+        # (so a fragment's M+0/M+1 that collapse to the same mass merge into one
+        # row with a combined M+N label), compute the ppm error, sort by
+        # DECREASING ppm error.
+        groups = {}
+        for a in anns:
+            key = (a["ion"], a["charge"], round(a["mz"], 4))
+            g = groups.setdefault(key, {"ion": a["ion"], "charge": a["charge"],
+                                        "theo_mz": a["mz"], "isos": set()})
+            g["isos"].add(a["isotope_index"])
+        rows = []
+        for g in groups.values():
+            ppm_err = (peak - g["theo_mz"]) / g["theo_mz"] * 1e6
+            rows.append({"ion": g["ion"], "charge": g["charge"],
+                         "isotopes": sorted(g["isos"]), "ppm": ppm_err})
+        rows.sort(key=lambda r: abs(r["ppm"]), reverse=True)
+        matched.append({"mz": peak, "intensity": float(fint[fi]), "rows": rows})
 
     matched_set = set(flyann)
     keep = np.array([i for i in range(fly.size) if i not in matched_set], dtype=int)
