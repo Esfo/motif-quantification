@@ -1254,6 +1254,8 @@ class MSViewerTab(QMainWindow):
             if isinstance(getattr(self, "_last_points", None), dict):
                 self._redraw_from_cache()
             self._redraw_panel3()   # rebuilds the charge grid with the new theme
+        # Recolor the theoretical MS1 overlay for the new theme.
+        self._draw_ms1_theo_overlay()
 
     def _redraw_panel3(self):
         """Re-draw whatever panel 3 is currently showing (MS2 spectrum / MS1
@@ -2592,11 +2594,13 @@ class MSViewerTab(QMainWindow):
         theo_max = float(np.max(abund)) or 1.0
         # Normalize: tallest theoretical bar == tallest experimental peak.
         heights = np.asarray(abund, dtype=float) * (exp_max / theo_max)
-        # 50%-opacity white, drawn BENEATH the experimental data (negative z) so
-        # the measured points sit visually in front of the theoretical bars.
+        # 50%-opacity theme-adaptive bars (white on the dark plot, near-black on
+        # the light plot), drawn BENEATH the experimental data so the measured
+        # points sit visually in front.
+        shade = 255 if self.theme == "dark" else 20
         bars = pg.BarGraphItem(x=np.asarray(mzs, dtype=float), height=heights,
-                               width=0.02, brush=pg.mkBrush(255, 255, 255, 128),
-                               pen=pg.mkPen(255, 255, 255, 128))
+                               width=0.02, brush=pg.mkBrush(shade, shade, shade, 128),
+                               pen=pg.mkPen(shade, shade, shade, 128))
         bars.setZValue(0)   # beneath the experimental scatters (z=1), above bg
         self.p1_2d.addItem(bars)
         self._ms1_theo_item = bars
