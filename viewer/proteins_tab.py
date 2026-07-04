@@ -29,7 +29,7 @@ mirror the Sage enzyme config in execution.xsh.
 
 import math
 
-from PySide6.QtCore import QEvent, Qt, QRectF, Signal
+from PySide6.QtCore import Qt, QRectF, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox,
@@ -170,49 +170,57 @@ def _short_name(filename):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
             break
-    return name if len(name) <= 28 else name[:25] + "…"
+    return name if len(name) <= 40 else name[:38] + "…"
 
 
-class QColorBar(QWidget):
-    """A small horizontal legend: q-value/FDR → colour, matching ``q_color``."""
+class VerticalColorBar(QWidget):
+    """A vertical q-value/FDR → colour legend (matching ``q_color``) with a
+    percentage y-axis. Best (green, low FDR) at the top, worst (red) at the
+    bottom. Adaptive to light/dark. Occupies its own column beside panel 1."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._fg = QColor("#e6e6e6")
-        self.setFixedHeight(34)
-        self.setMinimumWidth(190)
+        self._bg = QColor("#101216")
+        self.setFixedWidth(74)
 
-    def set_theme(self, fg):
+    def set_theme(self, fg, bg):
         self._fg = QColor(fg)
+        self._bg = QColor(bg)
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        w = self.width()
-        bar_h = 12
-        pad = 6
-        y = 2
-        # gradient across the useful FDR band (left = best/green, right = worst/red)
-        grad = QLinearGradient(pad, 0, w - pad, 0)
+        painter.fillRect(self.rect(), self._bg)
+        pad_top, pad_bot = 18, 12
+        bar_w = 16
+        x = 8
+        h = self.height() - pad_top - pad_bot
+        if h <= 0:
+            painter.end()
+            return
+        # vertical gradient: top = best (green, 0.01%), bottom = worst (red, 5%)
+        grad = QLinearGradient(0, pad_top, 0, pad_top + h)
         for k in range(21):
             t = k / 20.0
             log_q = _Q_LOG_LO + t * (_Q_LOG_HI - _Q_LOG_LO)
             grad.setColorAt(t, q_color(10 ** log_q, alpha=255))
-        painter.fillRect(QRectF(pad, y, w - 2 * pad, bar_h), grad)
+        painter.fillRect(QRectF(x, pad_top, bar_w, h), grad)
         painter.setPen(QPen(self._fg, 1))
-        painter.drawRect(QRectF(pad, y, w - 2 * pad, bar_h))
+        painter.drawRect(QRectF(x, pad_top, bar_w, h))
 
-        # ticks at 0.01%, 0.1%, 1%, 5%
+        # title + percentage ticks
         font = QFont()
         font.setPointSize(7)
         painter.setFont(font)
+        painter.setPen(QPen(self._fg, 1))
+        painter.drawText(QRectF(0, 2, self.width(), 14), Qt.AlignHCenter, "FDR")
         for q, label in ((1e-4, "0.01%"), (1e-3, "0.1%"), (1e-2, "1%"), (5e-2, "5%")):
             t = (math.log10(q) - _Q_LOG_LO) / (_Q_LOG_HI - _Q_LOG_LO)
-            x = pad + t * (w - 2 * pad)
-            painter.setPen(QPen(self._fg, 1))
-            painter.drawLine(int(x), y, int(x), y + bar_h + 3)
-            painter.drawText(QRectF(x - 20, y + bar_h + 2, 40, 14),
-                             Qt.AlignHCenter | Qt.AlignTop, label)
+            y = pad_top + t * h
+            painter.drawLine(int(x + bar_w), int(y), int(x + bar_w + 3), int(y))
+            painter.drawText(QRectF(x + bar_w + 4, y - 7, self.width() - x - bar_w - 4, 14),
+                             Qt.AlignLeft | Qt.AlignVCenter, label)
         painter.end()
 
 
@@ -358,10 +366,9 @@ class VerticalMultiFileView(QWidget):
 
     file_clicked = Signal(str)
 
-    HEADER_H = 116
-
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.HEADER_H = 116
         self._seq = ""
         self._segments = []
         self._files = []          # [(filename, qs, hit)]
@@ -411,6 +418,12 @@ class VerticalMultiFileView(QWidget):
         for filename, qmap in files_qmaps:
             qs, hit = residue_q(self._seq, qmap or {})
             self._files.append((filename, qs, hit))
+        # Header tall enough for the longest 45°-slanted file name (so names are
+        # never cut off at the top).
+        fm = QFontMetrics(self._label_font)
+        maxw = max((fm.horizontalAdvance(_short_name(f)) for f, _q, _h in self._files),
+                   default=0)
+        self.HEADER_H = int(16 + maxw * 0.7071)
         self._recompute_size()
         self.update()
 
@@ -437,7 +450,8 @@ class VerticalMultiFileView(QWidget):
 
     def _recompute_size(self):
         n = len(self._seq)
-        width = 2 * self.margin + max(1, len(self._files)) * self._col_pitch()
+        # extra right margin so the last column's slanted label isn't clipped
+        width = 2 * self.margin + max(1, len(self._files)) * self._col_pitch() + 60
         height = self.HEADER_H + n * self.ch + self.margin
         self.setMinimumSize(int(width), int(height))
 
@@ -525,7 +539,12 @@ class VerticalMultiFileView(QWidget):
                 y_bot = self.HEADER_H + b * ch
                 if y_bot < exposed.top() or y_top > exposed.bottom():
                     continue
-                rect = QRectF(x0, y_top + 1, col_w, (b - a) * ch - 2)
+                # Keep a positive height even when zoomed way out, so every
+                # peptide's outline stays visible (a tiny inset only when there's
+                # room). Otherwise (b-a)*ch - 2 could go negative → nothing drawn.
+                seg_h = (b - a) * ch
+                inset = 1 if seg_h > 5 else 0
+                rect = QRectF(x0, y_top + inset, col_w, max(1.0, seg_h - 2 * inset))
                 if covered:
                     painter.fillRect(rect, fill)
                 painter.setPen(QPen(self._fg, 1))
@@ -642,28 +661,15 @@ class ProteinsTab(QWidget):
         self.p1_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.panel1.scroll_area = self.p1_scroll
 
-        # The q-value colour bar lives INSIDE panel 1 (floating top-right over the
-        # sequence), not in the toolbar. It is a child of the viewport so it stays
-        # put while the sequence scrolls.
-        self.color_bar = QColorBar(self.p1_scroll.viewport())
-        self.color_bar.setFixedSize(210, 34)
-        self.color_bar.raise_()
-        self.p1_scroll.viewport().installEventFilter(self)
-
-        # panel-2 zoom bar
-        z_bar = QHBoxLayout()
-        z_bar.setContentsMargins(4, 2, 4, 2)
-        z_bar.addWidget(QLabel("across files"))
-        z_bar.addStretch(1)
-        z_bar.addWidget(QLabel("zoom"))
-        self.zoom_out_btn = QPushButton("−")
-        self.zoom_out_btn.setFixedWidth(28)
-        self.zoom_out_btn.clicked.connect(lambda: self.panel2.zoom(1 / 1.25))
-        self.zoom_in_btn = QPushButton("+")
-        self.zoom_in_btn.setFixedWidth(28)
-        self.zoom_in_btn.clicked.connect(lambda: self.panel2.zoom(1.25))
-        z_bar.addWidget(self.zoom_out_btn)
-        z_bar.addWidget(self.zoom_in_btn)
+        # Panel 1 gets the sequence on the left and the vertical q-value/FDR colour
+        # bar in its own column on the right (no overlap with the sequence).
+        p1_row = QWidget()
+        p1_h = QHBoxLayout(p1_row)
+        p1_h.setContentsMargins(0, 0, 0, 0)
+        p1_h.setSpacing(0)
+        p1_h.addWidget(self.p1_scroll, stretch=1)
+        self.color_bar = VerticalColorBar()
+        p1_h.addWidget(self.color_bar)
 
         self.panel2 = VerticalMultiFileView()
         self.panel2.file_clicked.connect(self._on_panel2_file)
@@ -672,16 +678,10 @@ class ProteinsTab(QWidget):
         self.p2_scroll.setWidget(self.panel2)
         self.panel2.scroll_area = self.p2_scroll
 
-        p2_wrap = QWidget()
-        p2_layout = QVBoxLayout(p2_wrap)
-        p2_layout.setContentsMargins(0, 0, 0, 0)
-        p2_layout.addLayout(z_bar)
-        p2_layout.addWidget(self.p2_scroll, stretch=1)
-
         splitter = QSplitter(Qt.Vertical)
         splitter.setHandleWidth(2)   # a plain horizontal divider, like MS Data
-        splitter.addWidget(self.p1_scroll)
-        splitter.addWidget(p2_wrap)
+        splitter.addWidget(p1_row)
+        splitter.addWidget(self.p2_scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
         right_layout.addWidget(splitter, stretch=1)
@@ -850,18 +850,6 @@ class ProteinsTab(QWidget):
 
     # ---- theme -----------------------------------------------------------
 
-    def eventFilter(self, obj, event):
-        # keep the floating colour bar pinned to panel 1's top-right corner
-        if obj is self.p1_scroll.viewport() and event.type() == QEvent.Resize:
-            self._reposition_color_bar()
-        return super().eventFilter(obj, event)
-
-    def _reposition_color_bar(self):
-        vp = self.p1_scroll.viewport()
-        cb = self.color_bar
-        cb.move(max(6, vp.width() - cb.width() - 10), 6)
-        cb.raise_()
-
     def apply_theme(self, theme):
         self._apply_theme(theme)
 
@@ -869,18 +857,21 @@ class ProteinsTab(QWidget):
         self.theme = theme
         pal = THEMES.get(theme, THEMES["dark"])
         fg, bg = pal["fg"], pal["bg"]
-        # Theme ONLY the sequence panels (and their scroll viewports) + colour
-        # bar. The left file-list column keeps the default app palette so it does
-        # not turn dark — the theming is "just for the panels".
+        # Theme ONLY the sequence panels (+ their viewports) and the colour bar.
+        # The left file-list column keeps the default app palette so it does not
+        # turn dark — the theming is "just for the panels".
         self.panel1.set_theme(fg, bg)
         self.panel2.set_theme(fg, bg)
-        self.color_bar.set_theme(fg)
+        self.color_bar.set_theme(fg, bg)
+        # Panels get the same 1px frame the MS Data plots show (dark in light
+        # mode, light in dark mode = the fg colour).
         for area in (self.p1_scroll, self.p2_scroll):
-            area.setStyleSheet(f"QScrollArea {{ background: {bg}; border: none; }}")
+            area.setStyleSheet(
+                f"QScrollArea {{ background: {bg}; border: 1px solid {fg}; }}")
             area.viewport().setStyleSheet(f"background: {bg};")
+        self.color_bar.setStyleSheet(f"border: 1px solid {fg}; border-left: none;")
         if getattr(self, "theme_btn", None) is not None:
             self.theme_btn.setText("Light Mode" if theme_is_dark(theme) else "Dark Mode")
-        self._reposition_color_bar()
 
 
 def _safe_float(value):

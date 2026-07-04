@@ -1518,13 +1518,17 @@ class MSViewerTab(QMainWindow):
         seq = pf.get("seq") or ""
         charge = pf.get("charge") or scan.get("charge") or 2
         if len(seq) >= 2:
-            self._ms1_theo = {"seq": seq, "charge": charge}
-            self._draw_ms1_theo_overlay()
+            # Select the matching distribution FIRST so the theoretical overlay
+            # normalizes to it, then set the overlay and force a panel-1 redraw
+            # (draw_panel1 re-adds the overlay) so it reliably appears.
             row = pf.get("row") or {}
             try:
                 self._select_distribution_for_candidate(row, charge, scan)
             except Exception:
                 pass
+            self._ms1_theo = {"seq": seq, "charge": charge}
+            self._redraw_panel1_view()
+            self._draw_ms1_theo_overlay()
 
     # ---- store access ----------------------------------------------------
 
