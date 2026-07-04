@@ -64,6 +64,9 @@ AMINO_ACID_COMPOSITION = {
     "V": {"C": 5, "H": 9, "N": 1, "O": 1},
     "U": {"C": 3, "H": 5, "N": 1, "O": 1, "Se": 1},  # selenocysteine
     "O": {"C": 12, "H": 19, "N": 3, "O": 2},  # pyrrolysine
+    # J = Leu/Ile ambiguity; both have the SAME atomic composition, so this is
+    # exact (some search engines emit J for the indistinguishable pair).
+    "J": {"C": 6, "H": 11, "N": 1, "O": 1},
 }
 
 # n-/c-terminal fragment composition deltas relative to the cumulative residue sum
@@ -113,7 +116,12 @@ def peptide_atomic_composition(sequence):
 
     composition = Counter()
     for residue in sequence:
-        composition += Counter(AMINO_ACID_COMPOSITION[residue])
+        try:
+            composition += Counter(AMINO_ACID_COMPOSITION[residue])
+        except KeyError:
+            raise ValueError(
+                f"unknown residue {residue!r} in peptide {sequence!r} "
+                f"(no atomic composition)") from None
 
     composition["H"] += 2
     composition["O"] += 1
