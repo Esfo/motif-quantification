@@ -118,6 +118,25 @@ def plain_seq(peptide):
     return re.sub(r"[^A-Za-z]", "", value).upper()
 
 
+def peptide_mod_mass(peptide):
+    """Total modification delta mass encoded in a peptide string, e.g. the
+    +15.994915 in ``DVFLGM[+15.994915]FLYEYAR`` (oxidation) or the +57.021465
+    of a fixed carbamidomethyl. Sums every signed number inside [], () or {}.
+
+    The theoretical MS1 overlay is computed from the bare (modification-stripped)
+    sequence, so its isotope m/z must be shifted by mod_mass / charge or it
+    lands ~mod_mass/z Th away from the real, modified precursor."""
+    total = 0.0
+    for token in re.findall(r"[\[\(\{]([^\]\)\}]*)[\]\)\}]", peptide or ""):
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", token)
+        if m:
+            try:
+                total += float(m.group(0))
+            except ValueError:
+                pass
+    return total
+
+
 class EvidenceWorker(QThread):
     """Reads everything a selection needs from the mzML off the UI thread.
 
@@ -1115,12 +1134,21 @@ class MSViewerTab(QMainWindow):
         self._syncing_p3_tabs = False
         self.p3_tabs.currentChanged.connect(self._on_panel3_tab_changed)
 
+        # Dropdown of every MS2 scan taken on the current MS1 distribution (like
+        # the file combo). Only shown in MS2 mode; picking one renders it and
+        # highlights it on panel 2. Populated by _populate_ms2_combo.
+        self.p3_ms2_combo = QComboBox()
+        self.p3_ms2_combo.setVisible(False)
+        self._syncing_ms2_combo = False
+        self.p3_ms2_combo.currentIndexChanged.connect(self._on_ms2_combo_changed)
+
         container = QWidget()
         container.setObjectName("panel3_frame")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
         layout.addWidget(self.p3_tabs)
+        layout.addWidget(self.p3_ms2_combo)
         layout.addWidget(self.p3_stack, stretch=1)
 
         dock = QDockWidget("", self)
@@ -1334,17 +1362,103 @@ class MSViewerTab(QMainWindow):
             return None
         return min(ms2, key=lambda m: abs((m.get("rt") or 0.0) - rt))
 
+    def _ms2_scans_on_distribution(self):
+        """Every loaded MS2 scan taken ON the selected MS1 distribution: its
+        precursor isolation window overlaps the distribution's m/z span and its
+        RT falls inside the distribution's RT band. Sorted by RT. Falls back to
+        the whole loaded window's RT if no distribution bbox is known."""
+        ms2 = getattr(self, "_ms2_all", None)
+        if not ms2:
+            return []
+        bbox = getattr(self, "_selected_bbox", None)
+        if bbox is not None:
+            mz0, mz1, rt0, rt1 = bbox
+        elif self.window is not None:
+            mz0, mz1, rt0, rt1 = self.window
+        else:
+            return []
+        out = []
+        for m in ms2:
+            rt = m.get("rt")
+            if rt is None or not (rt0 <= rt <= rt1):
+                continue
+            lo, hi = m.get("iso_low"), m.get("iso_high")
+            pmz = m.get("mz")
+            if lo is not None and hi is not None:
+                if hi < mz0 or lo > mz1:      # isolation window misses the dist
+                    continue
+            elif pmz is not None and not (mz0 <= pmz <= mz1):
+                continue
+            out.append(m)
+        return sorted(out, key=lambda m: (m.get("rt") or 0.0))
+
+    def _default_ms2_scan(self):
+        """The MS2 scan to show first when entering the MS2 view: the
+        identification's own scan if it's on the distribution, else the first
+        scan on the distribution, else the nearest-by-RT fallback."""
+        scans = self._ms2_scans_on_distribution()
+        if isinstance(self.current, dict):
+            scan_no = str(self.current.get("scan", "") or "")
+            for m in scans:
+                if str(m.get("number", "")) == scan_no:
+                    return m
+        if scans:
+            return scans[0]
+        return self._ms2_scan_for_current()
+
+    def _populate_ms2_combo(self, current):
+        """Fill the MS2-scan dropdown with the scans on the current distribution
+        and select ``current`` (a scan dict). No-op-safe; guarded so filling it
+        doesn't fire the change handler."""
+        combo = getattr(self, "p3_ms2_combo", None)
+        if combo is None:
+            return
+        scans = self._ms2_scans_on_distribution()
+        if current is not None and not any(
+                str(m.get("number", "")) == str(current.get("number", ""))
+                for m in scans):
+            scans = [current] + scans   # always include the shown scan
+        self._syncing_ms2_combo = True
+        combo.clear()
+        sel = 0
+        for i, m in enumerate(scans):
+            rt = m.get("rt")
+            combo.addItem(
+                f"scan {m.get('number', '?')}   rt={rt:.2f}   m/z={m.get('mz')}"
+                if rt is not None else f"scan {m.get('number', '?')}", m)
+            if current is not None and str(m.get("number", "")) == str(
+                    current.get("number", "")):
+                sel = i
+        if combo.count():
+            combo.setCurrentIndex(sel)
+        self._syncing_ms2_combo = False
+
+    def _on_ms2_combo_changed(self, index):
+        """User picked a different MS2 scan from the dropdown: render it (which
+        also moves the panel-2 isolation band to that scan)."""
+        if getattr(self, "_syncing_ms2_combo", False) or index < 0:
+            return
+        m = self.p3_ms2_combo.itemData(index)
+        if m is not None:
+            self.render_ms2(m)
+
     def _sync_panel3_tab(self):
         """Reflect _panel3_mode in the MS1/MS2 tab bar without re-triggering the
-        change handler. MS2 is disabled when no MS2 scan is available."""
+        change handler, and show the MS2-scan dropdown only in MS2 mode. MS2 is
+        disabled when no MS2 scan is available for the distribution."""
         tabs = getattr(self, "p3_tabs", None)
         if tabs is None:
             return
-        has_ms2 = self._ms2_scan is not None or self._ms2_scan_for_current() is not None
+        has_ms2 = (self._ms2_scan is not None
+                   or bool(self._ms2_scans_on_distribution())
+                   or self._ms2_scan_for_current() is not None)
         self._syncing_p3_tabs = True
         tabs.setTabEnabled(1, has_ms2)
         tabs.setCurrentIndex(1 if self._panel3_mode == "ms2" else 0)
         self._syncing_p3_tabs = False
+        combo = getattr(self, "p3_ms2_combo", None)
+        if combo is not None:
+            combo.setVisible(self._panel3_mode == "ms2" and combo.count() > 0)
 
     def _on_panel3_tab_changed(self, index):
         """User clicked the MS1 / MS2 tab: switch panel 3's view for the current
@@ -1352,7 +1466,7 @@ class MSViewerTab(QMainWindow):
         if self._syncing_p3_tabs or self.current is None:
             return
         if index == 1:   # MS2
-            scan = self._ms2_scan or self._ms2_scan_for_current()
+            scan = self._ms2_scan or self._default_ms2_scan()
             if scan is None:
                 self._sync_panel3_tab()   # nothing to show -> snap back to MS1
                 return
@@ -1597,7 +1711,8 @@ class MSViewerTab(QMainWindow):
                 self._select_distribution_for_candidate(row, charge, scan)
             except Exception:
                 pass
-            self._ms1_theo = {"seq": seq, "charge": charge}
+            self._ms1_theo = {"seq": seq, "charge": charge,
+                              "mod_mass": peptide_mod_mass(row.get("peptide", ""))}
             self._redraw_panel1_view()
             self._draw_ms1_theo_overlay()
 
@@ -1670,7 +1785,8 @@ class MSViewerTab(QMainWindow):
         # jump). draw_panel1 re-adds it after the async extract, and
         # _on_table1_loaded re-normalizes it once the distribution is known.
         plain = plain_seq(row.get("peptide", ""))
-        self._ms1_theo = ({"seq": plain, "charge": charge or 1}
+        self._ms1_theo = ({"seq": plain, "charge": charge or 1,
+                           "mod_mass": peptide_mod_mass(row.get("peptide", ""))}
                           if len(plain) >= 2 else None)
         self.render_table1(self.current)
         # Initialize the window from the ± controls and snap the views to it.
@@ -2556,6 +2672,9 @@ class MSViewerTab(QMainWindow):
             self.populate_table2(scan, mz)
         except Exception as exc:
             self.p3_title.setText(f"MS2 load error: {exc}")
+        # Refresh the MS2-scan dropdown to the distribution's scans, selecting
+        # the one now shown. (Guarded so it doesn't re-enter render_ms2.)
+        self._populate_ms2_combo(scan)
         self._sync_panel3_tab()
 
     def _ms2_title(self, scan, peptide=None):
@@ -2692,7 +2811,8 @@ class MSViewerTab(QMainWindow):
         # spectrum). The band + border survive panel-2 redraws.
         self._select_distribution_for_candidate(r, charge, scan)
         # Also overlay this peptide's theoretical MS1 distribution on panel 1.
-        self._ms1_theo = {"seq": seq, "charge": charge}
+        self._ms1_theo = {"seq": seq, "charge": charge,
+                          "mod_mass": peptide_mod_mass(r.get("peptide", ""))}
         self._draw_ms1_theo_overlay()
         low = scan.get("iso_low")
         high = scan.get("iso_high")
@@ -2844,6 +2964,14 @@ class MSViewerTab(QMainWindow):
             return
         if mzs is None or len(mzs) == 0:
             return
+        # The bars come from the bare sequence; shift them by the peptide's
+        # modification delta mass / charge so a modified peptide (e.g. +15.99
+        # oxidation) lines up with its real precursor instead of sitting
+        # ~mod_mass/z Th to the left.
+        mod_mass = float(self._ms1_theo.get("mod_mass", 0.0) or 0.0)
+        if mod_mass:
+            z = max(1, int(self._ms1_theo["charge"] or 1))
+            mzs = np.asarray(mzs, dtype=float) + mod_mass / z
         theo_max = float(np.max(abund)) or 1.0
         # Normalize: tallest theoretical bar == tallest experimental peak.
         heights = np.asarray(abund, dtype=float) * (exp_max / theo_max)
@@ -3100,6 +3228,11 @@ class MSViewerTab(QMainWindow):
         if plain and set(plain) <= set("ACDEFGHIJKLMNPQRSTVWYUO"):
             try:
                 t_mz, t_norm = isotopes.peptide_isotope_mzs(plain, charge)
+                # Shift by the peptide's modification mass so the theoretical
+                # envelope matches the modified precursor (same fix as panel 1).
+                mod_mass = peptide_mod_mass(cur["row"].get("peptide", ""))
+                if mod_mass:
+                    t_mz = np.asarray(t_mz, dtype=float) + mod_mass / max(1, int(charge))
                 t_y = t_norm * exp_peak
                 x = np.empty(t_mz.size * 3); y = np.empty(t_mz.size * 3)
                 x[0::3] = t_mz; x[1::3] = t_mz; x[2::3] = np.nan
@@ -3181,6 +3314,9 @@ class MSViewerTab(QMainWindow):
         if did is not None and self.db is not None:
             self._set_selected(did)
             self._draw_ms1_theo_overlay()
+            # Now that the distribution (and its bbox) is known, refresh the
+            # MS1/MS2 tab enable + scan dropdown for the scans on it.
+            self._sync_panel3_tab()
         # If panel 3 drew its MS1 view before the id was known (the sqlite query
         # finished after the mzML read), rebuild it now that we have the id.
         if (self._table1_redraw_panel3 and self._panel3_mode == "ms1"
