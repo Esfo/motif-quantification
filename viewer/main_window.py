@@ -198,7 +198,13 @@ class MainWindow(QMainWindow):
         self.ms_tab.on_theme_toggle = self.toggle_theme   # panel-1 Light/Dark button
 
         tabs = QTabWidget()
-        tabs.addTab(self.ms_tab, "MS viewing")
+        # "loading" indicator lives in the tab bar's top-right corner (moved out
+        # of the panel-1 button bar); the MS tab drives it via tab_loading_label.
+        loading_label = QLabel("")
+        loading_label.setContentsMargins(0, 0, 8, 0)
+        tabs.setCornerWidget(loading_label, Qt.TopRightCorner)
+        self.ms_tab.tab_loading_label = loading_label
+        tabs.addTab(self.ms_tab, "MS Data")
         tabs.addTab(self._placeholder("Protein viewing",
                     "Whole-protein sequences with peptide coverage coloured by q-value "
                     "(shared q-value colour scale). Single-file or verticalized side-by-side "

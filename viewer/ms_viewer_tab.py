@@ -498,6 +498,51 @@ class FlipButton(QPushButton):
         self.setText(self._states[self._idx][1])
 
 
+class ArrowCycle(QWidget):
+    """A ◀ label ▶ cycler: the same state machine as FlipButton, but driven by
+    left/right arrows with a plain (non-button) label showing the current state.
+    Exposes key()/index()/set_index() so it's a drop-in for FlipButton."""
+
+    def __init__(self, states, on_change=None, parent=None):
+        super().__init__(parent)
+        self._states = list(states)
+        self._idx = 0
+        self._on_change = on_change
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.setFixedWidth(22)
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setFixedWidth(22)
+        self.label = QLabel(self._states[0][1])
+        self.label.setAlignment(Qt.AlignCenter)
+        fm = self.label.fontMetrics()
+        self.label.setFixedWidth(
+            max(fm.horizontalAdvance(lbl) for _, lbl in self._states) + 10)
+        self.prev_btn.clicked.connect(lambda: self._step(-1))
+        self.next_btn.clicked.connect(lambda: self._step(1))
+        lay.addWidget(self.prev_btn)
+        lay.addWidget(self.label)
+        lay.addWidget(self.next_btn)
+
+    def _step(self, delta):
+        self._idx = (self._idx + delta) % len(self._states)
+        self.label.setText(self._states[self._idx][1])
+        if self._on_change is not None:
+            self._on_change()
+
+    def key(self):
+        return self._states[self._idx][0]
+
+    def index(self):
+        return self._idx
+
+    def set_index(self, i):
+        self._idx = i % len(self._states)
+        self.label.setText(self._states[self._idx][1])
+
+
 # Per-class noise rendering: brighter/larger for substantial noise lines, fainter
 # and smaller down to lone stray points. Keys match the _noise_class values.
 #   1 = noise line (a feature/line with >=5 points, in no distribution)
@@ -768,26 +813,27 @@ class MSViewerTab(QMainWindow):
         # on press -- no sunken 'pressed' look. dim/source/colour are binary; noise
         # cycles through four levels of progressively finer noise.
         self.dim_toggle = FlipButton([("2D", "2D"), ("3D", "3D")], on_change=self.toggle_dimension)
-        self.source_toggle = FlipButton([("centroid", "centroid"), ("profile", "profile")],
+        self.source_toggle = FlipButton([("centroid", "Centroid"), ("profile", "Profile")],
                                         on_change=self.refresh)
         # Noise levels: none -> noise lines -> + small lines -> + single points.
         # Levels: none -> recovered (less confident) distributions -> noise lines
-        # -> + small lines -> + single points. Each level is cumulative.
-        self.noise_toggle = FlipButton(
-            [("none", "no noise"), ("recovered", "less confident distributions"),
-             ("line", "line noise"), ("small", "small line noise"),
-             ("single", "single point noise")],
+        # -> + small lines -> + single points. Each level is cumulative. Driven by
+        # the ◀ ▶ arrows (not a button) -- see the bar layout below.
+        self.noise_toggle = ArrowCycle(
+            [("none", "No Noise"), ("recovered", "Less Confident Distributions"),
+             ("line", "Line Noise"), ("small", "Small Line Noise"),
+             ("single", "Single Point Noise")],
             on_change=self._on_noise_changed)
-        self.logcolor_toggle = FlipButton([("lin", "lin color"), ("log", "log color")],
+        self.logcolor_toggle = FlipButton([("lin", "Lin Color"), ("log", "Log Color")],
                                           on_change=self._on_logcolor)
         # Theoretical-MS1 overlay mode (only matters once a Table-2 peptide is
         # selected): 'raw' keeps every isotopomer separate; 'summed' merges all
         # isotopomers at the same M+N into one signal.
         self.ms1theo_toggle = FlipButton(
-            [("raw", "raw isotopomers"), ("summed", "summed M+N")],
+            [("raw", "Raw Isotopomers"), ("summed", "Summed M+N")],
             on_change=self._on_ms1theo_changed)
         # Snap the 3D view to the aligned top-down (2D-like) orientation.
-        self.reset3d_button = QPushButton("align 3D")
+        self.reset3d_button = QPushButton("Align 3D")
         self.reset3d_button.setFixedWidth(70)
         self.reset3d_button.setToolTip("align the 3D view to a top-down, panel-2-aligned 2D view")
         self.reset3d_button.clicked.connect(self.reset_3d_view)
@@ -796,13 +842,13 @@ class MSViewerTab(QMainWindow):
         # Theme toggle, to the right of "align 3D". main_window wires
         # on_theme_toggle; the label tracks the current theme.
         self.on_theme_toggle = None
-        self.theme_btn = QPushButton("Light mode" if self.theme == "dark" else "Dark mode")
+        self.theme_btn = QPushButton("Light Mode" if self.theme == "dark" else "Dark Mode")
         self.theme_btn.setFixedWidth(80)
         self.theme_btn.clicked.connect(lambda: self.on_theme_toggle and self.on_theme_toggle())
 
-        # "loading… <context>" shown above panel 1 while its worker runs.
-        self.p1_loading = QLabel("")
-        self.p1_loading.setStyleSheet("color: black;")
+        # The "loading" indicator now lives in the tab bar (main_window sets
+        # self.tab_loading_label); nothing above panel 1 anymore.
+        self.tab_loading_label = None
 
         # Acceptance-criteria field for the MS2-strip green/red identification
         # gate: "acceptance criteria [0.1] % FDR". Value is a percentage.
@@ -839,13 +885,14 @@ class MSViewerTab(QMainWindow):
         bar = QHBoxLayout()
         bar.addWidget(self.dim_toggle)
         bar.addWidget(self.source_toggle)
-        bar.addWidget(self.noise_toggle)
         bar.addWidget(self.logcolor_toggle)
         bar.addWidget(self.ms1theo_toggle)
         bar.addWidget(self.reset3d_button)
         bar.addWidget(self.theme_btn)
-        bar.addSpacing(8)
-        bar.addWidget(self.p1_loading)
+        bar.addSpacing(10)
+        # Noise cycler (◀ label ▶): right of "Light Mode", left of the
+        # acceptance-criteria field. Replaces the old 'loading' text slot.
+        bar.addWidget(self.noise_toggle)
         bar.addStretch(1)
         bar.addWidget(self.fdr_label)
         bar.addWidget(self.fdr_edit)
@@ -1180,7 +1227,7 @@ class MSViewerTab(QMainWindow):
         self.theme = theme
         pal = palette(theme)
         if getattr(self, "theme_btn", None) is not None:
-            self.theme_btn.setText("Light mode" if theme == "dark" else "Dark mode")
+            self.theme_btn.setText("Light Mode" if theme == "dark" else "Dark Mode")
         for plot in (self.p1_2d, self.p2, self.p3, self.ms2_plot):
             style_plot(plot, pal)
         try:
@@ -1588,7 +1635,9 @@ class MSViewerTab(QMainWindow):
         """Show/clear a bold "loading" line above every panel 1/2/3 plot while a
         data worker runs (per the spec: must happen everywhere)."""
         text = "<b>loading</b>" if on else ""
-        for label in (getattr(self, "p1_loading", None),
+        # Loading now surfaces in the tab bar (set by main_window), not above
+        # panel 1; the p2/p3 sinks are kept for compatibility.
+        for label in (getattr(self, "tab_loading_label", None),
                       getattr(self, "p2_loading", None),
                       getattr(self, "p3_loading", None)):
             if label is not None:
