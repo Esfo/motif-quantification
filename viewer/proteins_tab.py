@@ -353,19 +353,17 @@ class HorizontalSequenceView(QWidget):
         painter.setFont(self._font)
 
         # 1) peptide rectangles (background fill + outline), behind the letters.
-        # EVERY tryptic peptide gets a rectangle; identified ones are filled by
-        # q-value, the rest are just outlined. Peptides outside the search length
-        # bounds (never searched) get a dotted, muted outline to set them apart.
-        for a, b, searchable in self._segments:
+        # EVERY tryptic peptide gets the SAME outline; identified ones are filled
+        # by q-value, the rest are just outlined (no fill).
+        for a, b, _searchable in self._segments:
             fill, _covered = _segment_fill(self._qs, self._hit, a, b, self._color_mode)
-            pen = QPen(self._fg, 1) if searchable else QPen(self._muted, 1, Qt.DotLine)
             for row, col, count in _row_runs(a, b, cols):
                 x = self.margin + col * self.cw
                 y = self.margin + row * self.ch
                 rect = QRectF(x, y + 2, count * self.cw, self.ch - 4)
                 if fill is not None:
                     painter.fillRect(rect, fill)
-                painter.setPen(pen)
+                painter.setPen(QPen(self._fg, 1))
                 painter.drawRect(rect)
 
         # 2) residue letters on top (clip to the exposed region for long proteins).
@@ -402,6 +400,7 @@ class VerticalMultiFileView(QWidget):
         self._color_mode = "log"
         self._current = None
         self._scale = 1.0
+        self._label_overhang = 40
         self.scroll_area = None
         self._pan = None          # (start_x, start_y, h0, v0)
         self._dragged = False
@@ -424,12 +423,19 @@ class VerticalMultiFileView(QWidget):
 
     @property
     def ch(self):
-        # allow sub-pixel residue height so the whole protein can shrink to fit
+        # zoom changes ONLY the vertical residue size; allow sub-pixel height so
+        # the whole protein can shrink to fit.
         return max(0.1, self.base_ch * self._scale)
 
     @property
     def col_w(self):
-        return max(4.0, self.base_col_w * self._scale)
+        # columns FIT the panel width (zoom never changes width): divide the
+        # usable width (minus room for the slanted labels) evenly across files.
+        n = len(self._files)
+        if n <= 0:
+            return self.base_col_w
+        avail = self.width() - 2 * self.margin - self._label_overhang - (n - 1) * self.gap
+        return max(6.0, avail / n)
 
     def set_theme(self, fg, bg):
         self._fg = QColor(fg)
@@ -465,7 +471,10 @@ class VerticalMultiFileView(QWidget):
         fm = QFontMetrics(self._label_font)
         maxw = max((fm.horizontalAdvance(_short_name(f)) for f, _q, _h in self._files),
                    default=0)
+        # header tall enough, and right padding wide enough, for the longest
+        # 45°-slanted file name (so names are never cut off top or right).
         self.HEADER_H = int(16 + maxw * 0.7071)
+        self._label_overhang = int(maxw * 0.7071) + 8
         self._recompute_size()
         self.update()
 
@@ -486,17 +495,18 @@ class VerticalMultiFileView(QWidget):
         return self.col_w + self.gap
 
     def _content_x0(self):
-        """Left edge of the first column, centring the columns when the whole
-        block is narrower than the widget."""
-        content = len(self._files) * self._col_pitch()
-        return max(self.margin, (self.width() - content) / 2.0)
+        # columns fill the width starting at the left margin (no centring — the
+        # width is fully used, only the vertical size zooms).
+        return float(self.margin)
 
     def _recompute_size(self):
         n = len(self._seq)
-        # extra right margin so the last column's slanted label isn't clipped
-        width = 2 * self.margin + max(1, len(self._files)) * self._col_pitch() + 60
+        # Width fits the panel (columns divide the viewport width), so keep the
+        # minimum width tiny and let widgetResizable stretch us to the viewport;
+        # only the height (from the zoomable residue size) drives scrolling.
         height = self.HEADER_H + n * self.ch + self.margin
-        self.setMinimumSize(int(width), int(height))
+        self.setMinimumSize(0, int(height))
+        self.setMaximumWidth(16777215)
 
     def wheelEvent(self, event):
         # Ctrl-wheel zooms; a plain wheel scrolls the enclosing scroll area.
@@ -588,17 +598,11 @@ class VerticalMultiFileView(QWidget):
                 rect = QRectF(x0, y_top + inset, col_w, max(1.0, seg_h - 2 * inset))
                 if covered:
                     painter.fillRect(rect, fill)
+                # every peptide gets the SAME outline; identified ones are filled
+                # with their FDR colour, the rest are just outlined (no fill).
                 if seg_h >= 3:
-                    # room for an outline: every peptide boxed (searched → solid,
-                    # not-searched → dotted).
-                    painter.setPen(QPen(self._fg, 1) if searchable
-                                   else QPen(self._muted, 1, Qt.DotLine))
+                    painter.setPen(QPen(self._fg, 1))
                     painter.drawRect(rect)
-                elif not covered:
-                    # zoomed out: no room for an outline, so show unidentified
-                    # peptides as a faint block (identified ones keep their FDR
-                    # colour fill, which must not be overpainted by a border).
-                    painter.fillRect(rect, self._muted)
 
             if draw_letters:
                 for i, chr_ in enumerate(self._seq):
