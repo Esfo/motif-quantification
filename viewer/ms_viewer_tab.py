@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QTableView,
     QTableWidget,
     QTableWidgetItem,
+    QTabBar,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -1102,10 +1103,24 @@ class MSViewerTab(QMainWindow):
         self.p3_loading = QLabel("")
         self.p3_loading.setStyleSheet("color: black;")
 
+        # MS1 / MS2 selector for the current distribution: MS1 = isotope
+        # envelope / charge grid, MS2 = the identification's fragment spectrum.
+        # Reflects _panel3_mode (kept in sync by _sync_panel3_tab) and drives it
+        # on a click (_on_panel3_tab_changed).
+        self.p3_tabs = QTabBar()
+        self.p3_tabs.addTab("MS1")   # index 0
+        self.p3_tabs.addTab("MS2")   # index 1
+        self.p3_tabs.setExpanding(False)
+        self.p3_tabs.setDrawBase(False)
+        self._syncing_p3_tabs = False
+        self.p3_tabs.currentChanged.connect(self._on_panel3_tab_changed)
+
         container = QWidget()
         container.setObjectName("panel3_frame")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+        layout.addWidget(self.p3_tabs)
         layout.addWidget(self.p3_stack, stretch=1)
 
         dock = QDockWidget("", self)
@@ -1302,6 +1317,52 @@ class MSViewerTab(QMainWindow):
             self.draw_panel3_ms1(self.current,
                                  getattr(self, "_last_scan_mz", None),
                                  getattr(self, "_last_scan_int", None))
+
+    def _ms2_scan_for_current(self):
+        """The MS2 scan for the current identification: the PSM's own scan if
+        it's in the loaded window, else the nearest MS2 by RT. Mirrors the
+        lookup in _apply_ms2_focus. Returns None when no MS2 is loaded."""
+        ms2 = getattr(self, "_ms2_all", None)
+        if not ms2 or not isinstance(self.current, dict):
+            return None
+        scan_no = str(self.current.get("scan", "") or "")
+        for m in ms2:
+            if str(m.get("number", "")) == scan_no:
+                return m
+        rt = self.current.get("rt")
+        if rt is None:
+            return None
+        return min(ms2, key=lambda m: abs((m.get("rt") or 0.0) - rt))
+
+    def _sync_panel3_tab(self):
+        """Reflect _panel3_mode in the MS1/MS2 tab bar without re-triggering the
+        change handler. MS2 is disabled when no MS2 scan is available."""
+        tabs = getattr(self, "p3_tabs", None)
+        if tabs is None:
+            return
+        has_ms2 = self._ms2_scan is not None or self._ms2_scan_for_current() is not None
+        self._syncing_p3_tabs = True
+        tabs.setTabEnabled(1, has_ms2)
+        tabs.setCurrentIndex(1 if self._panel3_mode == "ms2" else 0)
+        self._syncing_p3_tabs = False
+
+    def _on_panel3_tab_changed(self, index):
+        """User clicked the MS1 / MS2 tab: switch panel 3's view for the current
+        distribution."""
+        if self._syncing_p3_tabs or self.current is None:
+            return
+        if index == 1:   # MS2
+            scan = self._ms2_scan or self._ms2_scan_for_current()
+            if scan is None:
+                self._sync_panel3_tab()   # nothing to show -> snap back to MS1
+                return
+            self.render_ms2(scan)
+        else:            # MS1
+            self._panel3_mode = "ms1"
+            self.draw_panel3_ms1(self.current,
+                                 getattr(self, "_last_scan_mz", None),
+                                 getattr(self, "_last_scan_int", None))
+            self._sync_panel3_tab()
 
     # ---- list population + cross-linking ---------------------------------
 
@@ -1779,8 +1840,13 @@ class MSViewerTab(QMainWindow):
         self._start_evidence()
 
     def _make_loading_overlay(self, parent):
-        """A 'loading' badge floated ON TOP of a plot, hidden until shown."""
-        lbl = QLabel("loading", parent)
+        """A 'loading' badge floated ON TOP of a plot, hidden until shown.
+
+        Parent it to the plot's VIEWPORT, not the PlotWidget (a QGraphicsView):
+        a widget parented to the view itself renders *behind* the viewport, so
+        the badge would be hidden by the plotted scene and never appear."""
+        host = parent.viewport() if hasattr(parent, "viewport") else parent
+        lbl = QLabel("Loading…", host)
         lbl.setStyleSheet(
             "background: rgba(0,0,0,150); color: white; padding: 3px 10px;"
             " border-radius: 4px; font-weight: bold;")
@@ -2484,6 +2550,7 @@ class MSViewerTab(QMainWindow):
             self.populate_table2(scan, mz)
         except Exception as exc:
             self.p3_title.setText(f"MS2 load error: {exc}")
+        self._sync_panel3_tab()
 
     def _ms2_title(self, scan, peptide=None):
         """Panel-3 MS2 title. Always shows the precursor isolation window +
@@ -2999,6 +3066,7 @@ class MSViewerTab(QMainWindow):
                     self.draw_charge_grid(group, cur)
                     self._grid_dist_id = dist_id
                 self.p3_stack.setCurrentIndex(1)
+                self._sync_panel3_tab()
                 return
         self._grid_dist_id = None
         self.p3_stack.setCurrentIndex(0)
@@ -3014,7 +3082,7 @@ class MSViewerTab(QMainWindow):
             plot_spectrum(self.p3, scan_mz, scan_int, title=title,
                           color=palette(self.theme)["fg"])
 
-        if plain and set(plain) <= set("ACDEFGHIKLMNPQRSTVWYUO"):
+        if plain and set(plain) <= set("ACDEFGHIJKLMNPQRSTVWYUO"):
             try:
                 t_mz, t_norm = isotopes.peptide_isotope_mzs(plain, charge)
                 t_y = t_norm * exp_peak
@@ -3027,6 +3095,7 @@ class MSViewerTab(QMainWindow):
                 self.p3_title.setText(f"{title}  (theory failed: {exc})")
         else:
             self.p3_title.setText(title)
+        self._sync_panel3_tab()
 
     def render_table1(self, cur):
         cur["distribution_id"] = None

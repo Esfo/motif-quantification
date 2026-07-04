@@ -221,7 +221,7 @@ class MainWindow(QMainWindow):
                     f"Quantitative comparison across files: time series + differential "
                     f"expression. Reads experimental-setup "
                     f"({'loaded: ' + str(len(self.experimental.rows)) + ' rows' if not self.experimental.is_empty() else 'not found'}). "
-                    "— staged, see ARCHITECTURE.md"), "File comparison")
+                    "— staged, see ARCHITECTURE.md"), "Quantitative Comparisons")
         tabs.addTab(self._placeholder("Motif quantification",
                     "Time series + DE at the motif level; proteins grouped by shared skeleton "
                     "motif, with include/exclude refinement saved back to a motif-sets folder. "
