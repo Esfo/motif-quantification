@@ -2769,10 +2769,11 @@ class MSViewerTab(QMainWindow):
         # best-first order shows once re-enabled (until the user clicks a header
         # to re-sort).
         self.table2.setSortingEnabled(False)
-        # Clear any selection-driven fragment overlay + theoretical MS1 overlay
-        # from a previous spectrum.
-        self._ms1_theo = None
-        self._draw_ms1_theo_overlay()
+        # Keep the current theoretical MS1 overlay on panel 1 when the MS2 view
+        # (re)loads -- e.g. switching to the MS2 tab -- so it persists from the
+        # selected peptide. It's replaced only when a new Table-2 candidate is
+        # picked (_on_table2_peptide_selected) or a new peptide is selected in
+        # the list (update_evidence), not dropped here.
         self.table2.clearSelection()
         self.table2.setRowCount(len(reports))
         for i, (r, rep) in enumerate(reports):
