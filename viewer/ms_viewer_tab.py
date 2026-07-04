@@ -1179,6 +1179,9 @@ class MSViewerTab(QMainWindow):
         all_btn.setFixedWidth(44)
         all_btn.clicked.connect(self._reload_current_tab)
         self.table1_tabs.setCornerWidget(all_btn, Qt.TopRightCorner)
+        # 'loading…' indicator on the left of the tab row while a table query runs.
+        self.table1_loading = QLabel("")
+        self.table1_tabs.setCornerWidget(self.table1_loading, Qt.TopLeftCorner)
 
         dock = QDockWidget("", self)
         dock.setObjectName("dock_table1")
@@ -1256,6 +1259,11 @@ class MSViewerTab(QMainWindow):
             w = self.findChild(QWidget, name)
             if w is not None:
                 w.setStyleSheet(f"QWidget#{name} {{ border: 1px solid {border}; }}")
+        # Keep the loading indicators legible against the tab-bar background.
+        for lbl in (getattr(self, "tab_loading_label", None),
+                    getattr(self, "table1_loading", None)):
+            if lbl is not None:
+                lbl.setStyleSheet(f"color: {pal['fg']}; padding: 0 8px;")
         self._recolor_gl(pal)   # 3D side labels (exist with or without GL)
         if HAVE_GL:
             style_gl(self.p1_3d, pal)
@@ -1650,7 +1658,7 @@ class MSViewerTab(QMainWindow):
     def _set_loading(self, on, context=""):
         """Show/clear a bold "loading" line above every panel 1/2/3 plot while a
         data worker runs (per the spec: must happen everywhere)."""
-        text = "<b>loading</b>" if on else ""
+        text = "<b>loading…</b>" if on else ""
         # Loading now surfaces in the tab bar (set by main_window), not above
         # panel 1; the p2/p3 sinks are kept for compatibility.
         for label in (getattr(self, "tab_loading_label", None),
@@ -2896,9 +2904,19 @@ class MSViewerTab(QMainWindow):
         self._table1_workers = [w for w in getattr(self, "_table1_workers", [])
                                 if w.isRunning()]
         self._table1_workers.append(worker)
+        self._table_loading(1)
         worker.start()
 
+    def _table_loading(self, delta):
+        """Ref-counted 'loading…' indicator on the Table-1 tab row."""
+        self._table_loading_count = max(
+            0, getattr(self, "_table_loading_count", 0) + delta)
+        if getattr(self, "table1_loading", None) is not None:
+            self.table1_loading.setText(
+                "<b>loading…</b>" if self._table_loading_count > 0 else "")
+
     def _on_table1_loaded(self, result):
+        self._table_loading(-1)
         # Ignore results from a superseded selection.
         if result.get("token") != getattr(self, "_table1_token", 0):
             return
@@ -2936,9 +2954,11 @@ class MSViewerTab(QMainWindow):
             worker = DbTableWorker(str(self.db.path), kind, self._table1_tab_token)
             worker.done.connect(self._on_table1_tab_loaded)
             self._table1_tab_workers.append(worker)
+            self._table_loading(1)
             worker.start()
 
     def _on_table1_tab_loaded(self, result):
+        self._table_loading(-1)
         if result.get("token") != getattr(self, "_table1_tab_token", 0):
             return
         rows = result.get("rows", [])

@@ -202,6 +202,8 @@ class MainWindow(QMainWindow):
         # of the panel-1 button bar); the MS tab drives it via tab_loading_label.
         loading_label = QLabel("")
         loading_label.setContentsMargins(0, 0, 8, 0)
+        fg = "#f0f0f0" if self.theme == "dark" else "#101010"
+        loading_label.setStyleSheet(f"color: {fg}; padding: 0 8px;")
         tabs.setCornerWidget(loading_label, Qt.TopRightCorner)
         self.ms_tab.tab_loading_label = loading_label
         tabs.addTab(self.ms_tab, "MS Data")
