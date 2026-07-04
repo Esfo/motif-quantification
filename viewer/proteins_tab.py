@@ -34,7 +34,6 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -58,19 +57,29 @@ except ImportError:
 # counts as the best (green).
 _Q_LOG_LO = -4.0
 _Q_LOG_HI = math.log10(0.05)
+_Q_LIN_MAX = 0.05
 
 
-def q_color(q, alpha=190):
+def q_to_t(q, mode="log"):
+    """Map a q-value to the 0..1 colour position. ``log`` spreads the useful
+    FDR band (1e-4…0.05) evenly; ``lin`` is linear in q over 0…0.05."""
     if q is None:
-        t = 0.0
-    else:
-        q = max(float(q), 1e-6)
-        t = (math.log10(q) - _Q_LOG_LO) / (_Q_LOG_HI - _Q_LOG_LO)
-        t = min(1.0, max(0.0, t))
-    # green (t=0) → yellow (t=0.5) → red (t=1)
+        return 0.0
+    q = max(float(q), 1e-6)
+    if mode == "lin":
+        return min(1.0, max(0.0, q / _Q_LIN_MAX))
+    return min(1.0, max(0.0, (math.log10(q) - _Q_LOG_LO) / (_Q_LOG_HI - _Q_LOG_LO)))
+
+
+def color_from_t(t, alpha=190):
+    # green (t=0, best) → yellow (t=0.5) → red (t=1, worst)
     r = int(255 * min(1.0, t * 2.0))
     g = int(255 * min(1.0, (1.0 - t) * 2.0))
     return QColor(r, g, 40, alpha)
+
+
+def q_color(q, alpha=190, mode="log"):
+    return color_from_t(q_to_t(q, mode), alpha)
 
 
 THEMES = {
@@ -140,7 +149,7 @@ def residue_q(seq, qmap):
     return qs, hit
 
 
-def _segment_fill(qs, hit, a, b):
+def _segment_fill(qs, hit, a, b, mode="log"):
     """(fill_colour_or_None, covered_bool) for the residue range [a, b)."""
     seg_q = None
     covered = False
@@ -149,7 +158,7 @@ def _segment_fill(qs, hit, a, b):
             covered = True
             if qs[i] is not None and (seg_q is None or qs[i] < seg_q):
                 seg_q = qs[i]
-    return (q_color(seg_q) if covered else None), covered
+    return (q_color(seg_q, mode=mode) if covered else None), covered
 
 
 def _row_runs(a, b, cols):
@@ -182,11 +191,16 @@ class VerticalColorBar(QWidget):
         super().__init__(parent)
         self._fg = QColor("#e6e6e6")
         self._bg = QColor("#101216")
+        self._mode = "log"
         self.setFixedWidth(74)
 
     def set_theme(self, fg, bg):
         self._fg = QColor(fg)
         self._bg = QColor(bg)
+        self.update()
+
+    def set_color_mode(self, mode):
+        self._mode = mode
         self.update()
 
     def paintEvent(self, event):
@@ -203,20 +217,19 @@ class VerticalColorBar(QWidget):
         grad = QLinearGradient(0, pad_top, 0, pad_top + h)
         for k in range(21):
             t = k / 20.0
-            log_q = _Q_LOG_LO + t * (_Q_LOG_HI - _Q_LOG_LO)
-            grad.setColorAt(t, q_color(10 ** log_q, alpha=255))
+            grad.setColorAt(t, color_from_t(t, alpha=255))
         painter.fillRect(QRectF(x, pad_top, bar_w, h), grad)
         painter.setPen(QPen(self._fg, 1))
         painter.drawRect(QRectF(x, pad_top, bar_w, h))
 
-        # title + percentage ticks
+        # title + percentage ticks (positions follow the lin/log mode)
         font = QFont()
         font.setPointSize(7)
         painter.setFont(font)
         painter.setPen(QPen(self._fg, 1))
         painter.drawText(QRectF(0, 2, self.width(), 14), Qt.AlignHCenter, "FDR")
         for q, label in ((1e-4, "0.01%"), (1e-3, "0.1%"), (1e-2, "1%"), (5e-2, "5%")):
-            t = (math.log10(q) - _Q_LOG_LO) / (_Q_LOG_HI - _Q_LOG_LO)
+            t = q_to_t(q, self._mode)
             y = pad_top + t * h
             painter.drawLine(int(x + bar_w), int(y), int(x + bar_w + 3), int(y))
             painter.drawText(QRectF(x + bar_w + 4, y - 7, self.width() - x - bar_w - 4, 14),
@@ -238,11 +251,17 @@ class HorizontalSequenceView(QWidget):
         self._hit = []
         self._fg = QColor("#e6e6e6")
         self._panel_bg = QColor("#101216")
+        self._muted = QColor("#808080")
+        self._color_mode = "log"
         self.scroll_area = None
         self._pan = None
         self.setMinimumHeight(80)
         self.setCursor(Qt.OpenHandCursor)
         self._metrics()
+
+    def set_color_mode(self, mode):
+        self._color_mode = mode
+        self.update()
 
     def _metrics(self):
         font = QFont("monospace")
@@ -257,6 +276,9 @@ class HorizontalSequenceView(QWidget):
     def set_theme(self, fg, bg):
         self._fg = QColor(fg)
         self._panel_bg = QColor(bg)
+        f = QColor(fg)
+        f.setAlpha(110)
+        self._muted = f
         self.update()
 
     def set_protein(self, seq, qmap):
@@ -331,17 +353,19 @@ class HorizontalSequenceView(QWidget):
         painter.setFont(self._font)
 
         # 1) peptide rectangles (background fill + outline), behind the letters.
+        # EVERY tryptic peptide gets a rectangle; identified ones are filled by
+        # q-value, the rest are just outlined. Peptides outside the search length
+        # bounds (never searched) get a dotted, muted outline to set them apart.
         for a, b, searchable in self._segments:
-            if not searchable:
-                continue
-            fill, _covered = _segment_fill(self._qs, self._hit, a, b)
+            fill, _covered = _segment_fill(self._qs, self._hit, a, b, self._color_mode)
+            pen = QPen(self._fg, 1) if searchable else QPen(self._muted, 1, Qt.DotLine)
             for row, col, count in _row_runs(a, b, cols):
                 x = self.margin + col * self.cw
                 y = self.margin + row * self.ch
                 rect = QRectF(x, y + 2, count * self.cw, self.ch - 4)
                 if fill is not None:
                     painter.fillRect(rect, fill)
-                painter.setPen(QPen(self._fg, 1))
+                painter.setPen(pen)
                 painter.drawRect(rect)
 
         # 2) residue letters on top (clip to the exposed region for long proteins).
@@ -374,6 +398,8 @@ class VerticalMultiFileView(QWidget):
         self._files = []          # [(filename, qs, hit)]
         self._fg = QColor("#e6e6e6")
         self._panel_bg = QColor("#101216")
+        self._muted = QColor("#808080")
+        self._color_mode = "log"
         self._current = None
         self._scale = 1.0
         self.scroll_area = None
@@ -398,7 +424,8 @@ class VerticalMultiFileView(QWidget):
 
     @property
     def ch(self):
-        return max(2.0, self.base_ch * self._scale)
+        # allow sub-pixel residue height so the whole protein can shrink to fit
+        return max(0.1, self.base_ch * self._scale)
 
     @property
     def col_w(self):
@@ -407,7 +434,22 @@ class VerticalMultiFileView(QWidget):
     def set_theme(self, fg, bg):
         self._fg = QColor(fg)
         self._panel_bg = QColor(bg)
+        f = QColor(fg)
+        f.setAlpha(110)
+        self._muted = f
         self.update()
+
+    def set_color_mode(self, mode):
+        self._color_mode = mode
+        self.update()
+
+    def fit_to_height(self, viewport_h):
+        """Scale so the whole protein column fits in ``viewport_h`` pixels."""
+        n = len(self._seq)
+        if n <= 0 or viewport_h <= 0:
+            return
+        avail = max(1, viewport_h - self.HEADER_H - self.margin)
+        self.set_scale(avail / (n * self.base_ch))
 
     def set_protein(self, seq, files_qmaps, current=None):
         """``files_qmaps`` = ``[(filename, qmap), ...]`` over every file."""
@@ -432,7 +474,8 @@ class VerticalMultiFileView(QWidget):
         self.update()
 
     def set_scale(self, scale):
-        self._scale = min(4.0, max(0.15, scale))
+        # allow very small scales so a whole (long) protein can be zoomed to fit
+        self._scale = min(4.0, max(0.01, scale))
         self._recompute_size()
         self.update()
 
@@ -532,9 +575,7 @@ class VerticalMultiFileView(QWidget):
 
             painter.setFont(self._font)
             for a, b, searchable in self._segments:
-                if not searchable:
-                    continue
-                fill, covered = _segment_fill(qs, hit, a, b)
+                fill, covered = _segment_fill(qs, hit, a, b, self._color_mode)
                 y_top = self.HEADER_H + a * ch
                 y_bot = self.HEADER_H + b * ch
                 if y_bot < exposed.top() or y_top > exposed.bottom():
@@ -547,8 +588,17 @@ class VerticalMultiFileView(QWidget):
                 rect = QRectF(x0, y_top + inset, col_w, max(1.0, seg_h - 2 * inset))
                 if covered:
                     painter.fillRect(rect, fill)
-                painter.setPen(QPen(self._fg, 1))
-                painter.drawRect(rect)
+                if seg_h >= 3:
+                    # room for an outline: every peptide boxed (searched → solid,
+                    # not-searched → dotted).
+                    painter.setPen(QPen(self._fg, 1) if searchable
+                                   else QPen(self._muted, 1, Qt.DotLine))
+                    painter.drawRect(rect)
+                elif not covered:
+                    # zoomed out: no room for an outline, so show unidentified
+                    # peptides as a faint block (identified ones keep their FDR
+                    # colour fill, which must not be overpainted by a border).
+                    painter.fillRect(rect, self._muted)
 
             if draw_letters:
                 for i, chr_ in enumerate(self._seq):
@@ -575,6 +625,7 @@ class ProteinsTab(QWidget):
         self.current_file = None
         self.current_protein = None
         self._combined = False   # panel 1 "All" mode
+        self._color_mode = "log"  # q-value colour scale: "log" or "lin"
         self._panel1_spans = []  # identified spans currently shown in panel 1
         self.on_navigate_to_ms = None
         self.on_theme_toggle = None
@@ -608,7 +659,6 @@ class ProteinsTab(QWidget):
         )
         self.protein_list.itemSelectionChanged.connect(self._on_protein_selected)
         left_layout.addWidget(self.protein_list, stretch=1)
-        left.setMaximumWidth(320)
 
         # right side: panel 1 over panel 2
         right = QWidget()
@@ -639,6 +689,15 @@ class ProteinsTab(QWidget):
         self.fdr_edit.valueChanged.connect(self._on_fdr_changed)
         bar.addWidget(self.fdr_edit)
         bar.addWidget(QLabel("% FDR"))
+
+        # q-value colour-scale toggle (like MS Data's Lin/Log colour button), but
+        # for the FDR colours.
+        self.colormode_btn = QPushButton("Log Color")
+        self.colormode_btn.setFixedWidth(84)
+        self.colormode_btn.setToolTip("Toggle the FDR colour scale between "
+                                      "logarithmic and linear in q-value")
+        self.colormode_btn.clicked.connect(self._on_colormode_toggle)
+        bar.addWidget(self.colormode_btn)
 
         # Light/Dark toggle — to the right of the FDR bits. Calls back into the
         # main window so the theme stays in sync across tabs.
@@ -678,19 +737,27 @@ class ProteinsTab(QWidget):
         self.p2_scroll.setWidget(self.panel2)
         self.panel2.scroll_area = self.p2_scroll
 
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setHandleWidth(2)   # a plain horizontal divider, like MS Data
-        splitter.addWidget(p1_row)
-        splitter.addWidget(self.p2_scroll)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        right_layout.addWidget(splitter, stretch=1)
+        # Vertical splitter (panel 1 over panel 2) — resizable + persisted, so the
+        # panel sizes are remembered like the MS Data tab's docks.
+        self.v_splitter = QSplitter(Qt.Vertical)
+        self.v_splitter.setHandleWidth(2)   # a plain horizontal divider, like MS Data
+        self.v_splitter.addWidget(p1_row)
+        self.v_splitter.addWidget(self.p2_scroll)
+        self.v_splitter.setStretchFactor(0, 1)
+        self.v_splitter.setStretchFactor(1, 1)
+        right_layout.addWidget(self.v_splitter, stretch=1)
 
-        root.addWidget(left)
-        divider = QFrame()
-        divider.setFrameShape(QFrame.VLine)
-        root.addWidget(divider)
-        root.addWidget(right, stretch=1)
+        # Horizontal splitter (left list column | right panels) — also resizable
+        # and persisted.
+        self.h_splitter = QSplitter(Qt.Horizontal)
+        self.h_splitter.setHandleWidth(2)
+        left.setMinimumWidth(160)
+        self.h_splitter.addWidget(left)
+        self.h_splitter.addWidget(right)
+        self.h_splitter.setStretchFactor(0, 0)
+        self.h_splitter.setStretchFactor(1, 1)
+        self.h_splitter.setSizes([280, 900])
+        root.addWidget(self.h_splitter)
 
     def _default_fdr_percent(self):
         q_max = self.session.summary().get("q_max") if self.session else None
@@ -698,6 +765,26 @@ class ProteinsTab(QWidget):
             return max(0.0, float(q_max) * 100.0)
         except (TypeError, ValueError):
             return 1.0
+
+    def _on_colormode_toggle(self):
+        self._color_mode = "lin" if self._color_mode == "log" else "log"
+        self.colormode_btn.setText("Lin Color" if self._color_mode == "lin" else "Log Color")
+        self.panel1.set_color_mode(self._color_mode)
+        self.panel2.set_color_mode(self._color_mode)
+        self.color_bar.set_color_mode(self._color_mode)
+
+    # ---- layout persistence ---------------------------------------------
+    # The panel sizes are persisted by the main window via h_splitter/v_splitter
+    # (mirrors how the MS Data dock layout is saved/restored).
+
+    def splitter_states(self):
+        return self.h_splitter.saveState(), self.v_splitter.saveState()
+
+    def restore_splitter_states(self, h_state, v_state):
+        if h_state is not None:
+            self.h_splitter.restoreState(h_state)
+        if v_state is not None:
+            self.v_splitter.restoreState(v_state)
 
     # ---- data ------------------------------------------------------------
 

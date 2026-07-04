@@ -264,6 +264,10 @@ class MainWindow(QMainWindow):
         if self.ms_tab is not None:
             self.settings.setValue("ms_tab_state", self.ms_tab.saveState())
             self.settings.setValue("ms_tab_layout_version", self.LAYOUT_VERSION)
+        if getattr(self, "proteins_tab", None) is not None:
+            h_state, v_state = self.proteins_tab.splitter_states()
+            self.settings.setValue("proteins_h_state", h_state)
+            self.settings.setValue("proteins_v_state", v_state)
 
     def restore_geometry(self):
         self._geometry_restored = False
@@ -293,6 +297,14 @@ class MainWindow(QMainWindow):
         if state is not None and str(version) == str(self.LAYOUT_VERSION):
             try:
                 self.ms_tab.restoreState(state)
+            except Exception:
+                pass
+        if getattr(self, "proteins_tab", None) is not None \
+                and str(version) == str(self.LAYOUT_VERSION):
+            try:
+                self.proteins_tab.restore_splitter_states(
+                    self.settings.value("proteins_h_state"),
+                    self.settings.value("proteins_v_state"))
             except Exception:
                 pass
 

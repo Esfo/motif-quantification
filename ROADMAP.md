@@ -224,8 +224,11 @@ data the pipeline produces. The four founding goals:
 - ✅ Same as MS Data: **file selector** + a scrollable **FDR spin box** (near the left, default = search `q_max`) governing the protein list, and a single **protein list**.
 - ✅ **Panel 1** (horizontal, wrapping, click-drag to scroll) over **panel 2** (same protein **verticalized side-by-side across every file**, N→C top-to-bottom, centred, file names on a 45° slant; click-drag scrolls, click a column to load that file). Panel 1's bar holds the **All** button, the **FDR** spin box, and a **Light/Dark** toggle (right of the FDR); the **colour-bar legend** (q-value/FDR → colour) floats inside panel 1's top-right.
 - ✅ **Double-click a peptide in panel 1** → jump to the MS Data tab reconstructed on that identification: panel 3 MS2 spectrum, panel 1 theoretical-MS1 overlay, panel 2 distribution selected + MS2 isolation band. In All mode it targets the best file for that peptide.
-- 🟡 Panel 2 **zooms** (± buttons / Ctrl-wheel): zooming out drops the residue letters to filled colour bands while **file names stay full size**. *(Panel-1 per-peptide block-chunk zoom still ⬜.)*
+- ✅ **Every** tryptic peptide is boxed in both panels (searched → solid outline, outside the search length bounds → dotted); identified peptides are filled by q-value, the rest left unfilled.
+- ✅ Panel 2 **zooms** (Ctrl-wheel) all the way down to fit the whole protein — residues collapse to filled colour blocks (FDR colour preserved) while **file names stay full size**.
+- ✅ **Lin/Log colour** toggle (like MS Data's) rescales the FDR colour gradient; the colour bar's percentage ticks move with it.
 - ✅ **Light/dark** adaptive colours for the panels only (the left file list keeps the app palette); theme stays in sync across tabs.
+- ✅ Panel sizes are **remembered** (h/v splitters persisted by the main window, like the MS Data dock layout).
 
 ---
 
