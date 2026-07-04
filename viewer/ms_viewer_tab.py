@@ -2590,8 +2590,17 @@ class MSViewerTab(QMainWindow):
         # hard-coded Da window.
         NEUTRON = 1.0033548
         iso_lo, iso_hi = self.precursor_isotope_errors
+        scan_no = str(scan.get("number", "") or "")
         rows = []
         for r in self.file_psms():
+            # A PSM identified FROM this exact scan is a candidate by definition:
+            # include it unconditionally, before any precursor-m/z math. This is
+            # what guarantees the identified peptide the user is looking at is in
+            # the table even when its row lacks calc/exp mass or its computed m/z
+            # drifts outside the precursor tolerance.
+            if scan_no and str(r.get("scan", "") or "") == scan_no:
+                rows.append(r)
+                continue
             try:
                 row_mz = peptide_mass(r)
                 z = peptide_charge(r) or 1
