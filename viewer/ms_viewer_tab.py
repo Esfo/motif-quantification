@@ -806,7 +806,7 @@ class MSViewerTab(QMainWindow):
 
         # Acceptance-criteria field for the MS2-strip green/red identification
         # gate: "acceptance criteria [0.1] % FDR". Value is a percentage.
-        self.fdr_label = QLabel("acceptance criteria")
+        self.fdr_label = QLabel("Acceptance Criteria")
         self.fdr_edit = QLineEdit("0.1")
         self.fdr_edit.setFixedWidth(48)
         self.fdr_edit.setToolTip("MS2 lines are green when a PSM passes this FDR "
@@ -851,11 +851,11 @@ class MSViewerTab(QMainWindow):
         bar.addWidget(self.fdr_edit)
         bar.addWidget(self.fdr_unit)
         bar.addSpacing(12)
-        bar.addWidget(QLabel("history:"))
+        bar.addWidget(QLabel("History"))
         bar.addWidget(self.hist_back_btn)
         bar.addWidget(self.hist_fwd_btn)
         bar.addSpacing(12)
-        bar.addWidget(QLabel("charge"))
+        bar.addWidget(QLabel("Charge"))
         bar.addWidget(self.charge_prev_btn)
         bar.addWidget(self.charge_next_btn)
 
@@ -1721,6 +1721,10 @@ class MSViewerTab(QMainWindow):
                         shown_max = max(shown_max, float(inten[nm].max()))
             if self._p1_scatters:
                 self.p1_2d.getViewBox().setYRange(0, (shown_max or 1.0) * 1.05, padding=0)
+            # Experimental points sit ABOVE the theoretical MS1 overlay (z=0), so
+            # give every scatter a positive z; the overlay stays visually behind.
+            for _sc, _base in self._p1_scatters:
+                _sc.setZValue(1)
         # No title on panel 1 (per the user).
         # Rescale dot sizes for the current zoom, then build the 3D if shown.
         self._rescale_points()
@@ -2150,13 +2154,25 @@ class MSViewerTab(QMainWindow):
         self._ident_cache = ident
         return ident
 
+    def _band_color(self, scan):
+        """Green if the scan has an identified peptide (passes FDR), else red;
+        50% opacity to match the strip lines."""
+        ident = self._identified_scans()
+        if scan is not None and str(scan.get("number", "")) in ident:
+            return (60, 200, 100, 150)
+        return (220, 70, 70, 150)
+
+    def _draw_band(self, low, high, rt, scan):
+        self.p2_ms2_band.setPen(pg.mkPen(*self._band_color(scan), width=3))
+        self.p2_ms2_band.setData([low, high], [rt, rt])
+
     def _apply_ms2_band(self):
         """(Re)draw the persistent isolation band on panel 2 for the current MS2
-        scan, or clear it when there is none."""
+        scan (coloured green/red by identification), or clear it when none."""
         band = getattr(self, "_ms2_band", None)
         if band is not None and band[0] is not None and band[2] is not None:
             low, high, rt = band
-            self.p2_ms2_band.setData([low, high], [rt, rt])
+            self._draw_band(low, high, rt, getattr(self, "_ms2_scan", None))
         else:
             self.p2_ms2_band.setData([], [])
 
@@ -2178,13 +2194,14 @@ class MSViewerTab(QMainWindow):
         rt_arr = np.array([rt for rt, _ in self._ms2_scans])
         i = int(np.argmin(np.abs(rt_arr - y)))
         scan = self._ms2_scans[i][1]
-        # m/z span = the isolation window; fall back to the precursor m/z.
+        # m/z span = the isolation window; fall back to a small default width.
         low = scan.get("iso_low")
         high = scan.get("iso_high")
         if low is None or high is None:
-            low = high = scan.get("mz")
+            mz = scan.get("mz")
+            low, high = (mz - 0.5, mz + 0.5) if mz is not None else (None, None)
         if abs(rt_arr[i] - y) <= max(abs(y1 - y0) * 0.03, 1e-4) and low is not None:
-            self.p2_ms2_band.setData([low, high], [scan["rt"], scan["rt"]])
+            self._draw_band(low, high, scan["rt"], scan)
         else:
             self._apply_ms2_band()
 
@@ -2242,7 +2259,7 @@ class MSViewerTab(QMainWindow):
             # Default title until a peptide is picked in Table 2 (then it becomes
             # just the peptide).
             plot_spectrum(self.p3, mz, inten, color=palette(self.theme)["fg"],
-                          title=f"MS2  rt={scan['rt']:.3f}  precursor m/z={scan.get('mz')}")
+                          title=self._ms2_title(scan))
             # Ground the baseline at 0 (no gap below the sticks).
             top = float(np.max(inten)) * 1.05 if len(inten) else 1.0
             self.p3.getViewBox().setYRange(0.0, top, padding=0)
@@ -2251,6 +2268,23 @@ class MSViewerTab(QMainWindow):
             self.populate_table2(scan, mz)
         except Exception as exc:
             self.p3_title.setText(f"MS2 load error: {exc}")
+
+    def _ms2_title(self, scan, peptide=None):
+        """Panel-3 MS2 title. Always shows the precursor isolation window +
+        RT (the MS1 scan parameters, so the plotted lines can be eyeballed);
+        prefixes the peptide once one is picked in Table 2."""
+        low, high = scan.get("iso_low"), scan.get("iso_high")
+        if low is None or high is None:
+            mz = scan.get("mz")
+            low, high = (mz - 0.5, mz + 0.5) if mz is not None else (None, None)
+        rt = scan.get("rt")
+        if low is not None and high is not None and rt is not None:
+            win = f"{low:.4f} - {high:.4f} at RT {rt:.3f}"
+        else:
+            win = ""
+        if peptide:
+            return f"{peptide}    {win}".strip()
+        return win or "MS2"
 
     def populate_table2(self, scan, peak_mz=None):
         # Candidate PSMs near this precursor m/z in the current file. The coverage
@@ -2370,8 +2404,10 @@ class MSViewerTab(QMainWindow):
             prec = scan.get("mz") or 0.0
             low, high = prec - 1.0, prec + 1.0
         self._frag_token = getattr(self, "_frag_token", 0) + 1
-        # Title becomes just the peptide once a candidate is selected.
-        self.p3.setTitle(str(r.get("peptide", "")), color=palette(self.theme)["fg"])
+        # Title = peptide + the MS1 isolation window / RT (so the lines can be
+        # visually verified against the scan parameters).
+        self.p3.setTitle(self._ms2_title(scan, peptide=str(r.get("peptide", ""))),
+                         color=palette(self.theme)["fg"])
         worker = FragmentWorker(
             seq, charge, low, high,
             getattr(self, "_ms2_mz", np.array([])),
@@ -2513,7 +2549,7 @@ class MSViewerTab(QMainWindow):
         bars = pg.BarGraphItem(x=np.asarray(mzs, dtype=float), height=heights,
                                width=0.02, brush=pg.mkBrush(255, 255, 255, 128),
                                pen=pg.mkPen(255, 255, 255, 128))
-        bars.setZValue(-10)   # beneath the experimental scatters (z=0)
+        bars.setZValue(0)   # beneath the experimental scatters (z=1), above bg
         self.p1_2d.addItem(bars)
         self._ms1_theo_item = bars
 
