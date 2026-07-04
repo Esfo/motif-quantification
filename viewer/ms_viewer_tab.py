@@ -1665,7 +1665,13 @@ class MSViewerTab(QMainWindow):
         self._ms2_scan = None
         self._ms2_band = None   # drop the isolation band
         self._apply_ms2_band()
-        self._ms1_theo = None   # drop any Table-2 theoretical MS1 overlay
+        # Overlay THIS peptide's theoretical MS1 isotope distribution on panel 1
+        # directly from the list selection (not only via a Table-2 / Proteins-tab
+        # jump). draw_panel1 re-adds it after the async extract, and
+        # _on_table1_loaded re-normalizes it once the distribution is known.
+        plain = plain_seq(row.get("peptide", ""))
+        self._ms1_theo = ({"seq": plain, "charge": charge or 1}
+                          if len(plain) >= 2 else None)
         self.render_table1(self.current)
         # Initialize the window from the ± controls and snap the views to it.
         rt_start = max(0.0, rt - self.rt_half) if rt is not None else 0.0
@@ -3167,6 +3173,14 @@ class MSViewerTab(QMainWindow):
         if self.current is not None:
             self.current["distribution_id"] = did
         self._fill_table1(result.get("rows", []))
+        # Auto-select the distribution this peptide was identified as: draw its
+        # selection border on panel 2 and re-normalize panel 1's theoretical MS1
+        # overlay to it. (Previously the id was only recorded, never selected,
+        # so a plain list click showed neither the highlight nor the overlay at
+        # the distribution's scale.)
+        if did is not None and self.db is not None:
+            self._set_selected(did)
+            self._draw_ms1_theo_overlay()
         # If panel 3 drew its MS1 view before the id was known (the sqlite query
         # finished after the mzML read), rebuild it now that we have the id.
         if (self._table1_redraw_panel3 and self._panel3_mode == "ms1"
