@@ -1271,12 +1271,20 @@ class MSViewerTab(QMainWindow):
             style_gl(self.p1_3d, pal)
         # Re-render the data-bearing panels so theme-coloured bits (panel 1/3
         # titles, the MS2 spectrum data, the charge-grid axes) follow the theme.
+        # The panel-3 rebuild routes through populate_table2, which clears the
+        # theoretical-MS1 selection -- save/restore it across the redraw.
+        saved_theo = self._ms1_theo
         if self.current is not None:
             if isinstance(getattr(self, "_last_points", None), dict):
                 self._redraw_from_cache()
             self._redraw_panel3()   # rebuilds the charge grid with the new theme
-        # Recolor the theoretical MS1 overlay for the new theme.
-        self._draw_ms1_theo_overlay()
+        self._ms1_theo = saved_theo
+        self._draw_ms1_theo_overlay()   # recolor the theoretical MS1 overlay
+        # The panel-3 redraw wiped the MS2 fragment green/red annotation; restore
+        # it from the last result (no need to re-run the worker).
+        if (self._panel3_mode == "ms2"
+                and getattr(self, "_last_frag", None) is not None):
+            self._draw_fragment_overlay(*self._last_frag)
 
     def _redraw_panel3(self):
         """Re-draw whatever panel 3 is currently showing (MS2 spectrum / MS1
@@ -2643,8 +2651,12 @@ class MSViewerTab(QMainWindow):
             return
         if result.get("error"):
             return
-        self._draw_fragment_overlay(result.get("matched", []),
-                                    result.get("unmatched", (np.array([]), np.array([]))))
+        matched = result.get("matched", [])
+        unmatched = result.get("unmatched", (np.array([]), np.array([])))
+        # Remember it so a theme redraw (which rebuilds the spectrum) can restore
+        # the green/red annotation without re-running the worker.
+        self._last_frag = (matched, unmatched)
+        self._draw_fragment_overlay(matched, unmatched)
 
     def _clear_fragment_overlay(self):
         for item in getattr(self, "_frag_overlay", []):
