@@ -131,7 +131,7 @@ data the pipeline produces. The four founding goals:
 
 ## 1.5 MS2 strip (left of Panel 2)
 - ✅ A **tall thin plot just to the left of Panel 2**. It shares Panel 2's **time (y) axis** and is **the sole RT ruler** for the row: Panel 2's own left axis is value-less, so the two RT axes **can never overlap** and this left strip is always visible.
-- ✅ MS2 scans shown as **horizontal lines that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.**
+- ✅ MS2 scans shown as **horizontal lines that align with the time axis**, clickable. **These are the only MS2 trigger markers — they live ONLY on this left strip, never inside the Panel 2 plot.** Lines are **green** when the scan has a PSM passing the FDR acceptance criteria and **red** otherwise; the FDR % is an editable "acceptance criteria" field on the panel-1 bar (default 0.1%).
 - ✅ The strip **only shows MS2 scans visible within Panel 2's current view** — RT *and* precursor-m/z both inside the view (`_refresh_ms2_visible`, updated on every zoom/pan). This fixes the "tons of MS2 lines" (it was showing every scan in the padded RT range regardless of precursor m/z).
 - ✅ **Hovering** an MS2 line draws a **yellow/orange isolation band on Panel 2** (replacing the earlier star): a 3 px horizontal band at the scan's RT (same width as the left strip's RT bands) spanning the **exact isolation m/z range** the MS2 selected for (read from the mzML), in the strip orange at ~50% opacity.
 - ✅ The MS2 lines' **thickness inverse-scales with RT zoom** (thicker as you zoom in, fixed minimum) so they never fade to nothing.
