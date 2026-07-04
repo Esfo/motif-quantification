@@ -208,6 +208,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.ms_tab, "MS Data")
         self.proteins_tab = ProteinsTab(self.session, theme=self.theme)
         self.proteins_tab.on_navigate_to_ms = self._navigate_to_ms
+        self.proteins_tab.on_theme_toggle = self.toggle_theme
         tabs.addTab(self.proteins_tab, "Proteins")
         tabs.addTab(self._placeholder("File-by-file comparison",
                     f"Quantitative comparison across files: time series + differential "

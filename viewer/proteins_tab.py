@@ -29,7 +29,7 @@ mirror the Sage enzyme config in execution.xsh.
 
 import math
 
-from PySide6.QtCore import Qt, QRectF, Signal
+from PySide6.QtCore import QEvent, Qt, QRectF, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox,
@@ -77,6 +77,10 @@ THEMES = {
     "dark": {"fg": "#e6e6e6", "bg": "#101216", "muted": "#8a8f98", "panel": "#16181d"},
     "light": {"fg": "#202020", "bg": "#fafafa", "muted": "#606060", "panel": "#ffffff"},
 }
+
+
+def theme_is_dark(theme):
+    return theme != "light"
 
 
 def base_segments(seq):
@@ -226,7 +230,10 @@ class HorizontalSequenceView(QWidget):
         self._hit = []
         self._fg = QColor("#e6e6e6")
         self._panel_bg = QColor("#101216")
+        self.scroll_area = None
+        self._pan = None
         self.setMinimumHeight(80)
+        self.setCursor(Qt.OpenHandCursor)
         self._metrics()
 
     def _metrics(self):
@@ -281,6 +288,25 @@ class HorizontalSequenceView(QWidget):
         i = self._residue_at(pos.x(), pos.y())
         if i >= 0:
             self.residue_double_clicked.emit(i)
+
+    # click-and-drag scrolls the (vertical) sequence, like grabbing the page
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.scroll_area is not None:
+            gp = event.globalPosition() if hasattr(event, "globalPosition") else None
+            y = gp.y() if gp is not None else event.globalY()
+            self._pan = (y, self.scroll_area.verticalScrollBar().value())
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._pan is not None and self.scroll_area is not None:
+            gp = event.globalPosition() if hasattr(event, "globalPosition") else None
+            y = gp.y() if gp is not None else event.globalY()
+            y0, v0 = self._pan
+            self.scroll_area.verticalScrollBar().setValue(int(v0 - (y - y0)))
+
+    def mouseReleaseEvent(self, event):
+        self._pan = None
+        self.setCursor(Qt.OpenHandCursor)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -343,7 +369,11 @@ class VerticalMultiFileView(QWidget):
         self._panel_bg = QColor("#101216")
         self._current = None
         self._scale = 1.0
+        self.scroll_area = None
+        self._pan = None          # (start_x, start_y, h0, v0)
+        self._dragged = False
         self._metrics()
+        self.setCursor(Qt.OpenHandCursor)
 
     def _metrics(self):
         font = QFont("monospace")
@@ -399,6 +429,12 @@ class VerticalMultiFileView(QWidget):
     def _col_pitch(self):
         return self.col_w + self.gap
 
+    def _content_x0(self):
+        """Left edge of the first column, centring the columns when the whole
+        block is narrower than the widget."""
+        content = len(self._files) * self._col_pitch()
+        return max(self.margin, (self.width() - content) / 2.0)
+
     def _recompute_size(self):
         n = len(self._seq)
         width = 2 * self.margin + max(1, len(self._files)) * self._col_pitch()
@@ -413,13 +449,40 @@ class VerticalMultiFileView(QWidget):
         else:
             event.ignore()
 
+    def _global_xy(self, event):
+        gp = event.globalPosition() if hasattr(event, "globalPosition") else None
+        return (gp.x(), gp.y()) if gp is not None else (event.globalX(), event.globalY())
+
     def mousePressEvent(self, event):
-        if not self._files:
+        if event.button() != Qt.LeftButton:
             return
-        x = event.position().x() if hasattr(event, "position") else event.x()
-        idx = int((x - self.margin) // self._col_pitch())
-        if 0 <= idx < len(self._files):
-            self.file_clicked.emit(self._files[idx][0])
+        self._dragged = False
+        gx, gy = self._global_xy(event)
+        if self.scroll_area is not None:
+            self._pan = (gx, gy,
+                         self.scroll_area.horizontalScrollBar().value(),
+                         self.scroll_area.verticalScrollBar().value())
+        self._press_x = event.position().x() if hasattr(event, "position") else event.x()
+        self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._pan is None or self.scroll_area is None:
+            return
+        gx, gy = self._global_xy(event)
+        x0, y0, h0, v0 = self._pan
+        if abs(gx - x0) + abs(gy - y0) > 4:
+            self._dragged = True
+        self.scroll_area.horizontalScrollBar().setValue(int(h0 - (gx - x0)))
+        self.scroll_area.verticalScrollBar().setValue(int(v0 - (gy - y0)))
+
+    def mouseReleaseEvent(self, event):
+        self.setCursor(Qt.OpenHandCursor)
+        self._pan = None
+        # a click (no drag) selects the column under the cursor → loads that file
+        if not self._dragged and self._files:
+            idx = int((self._press_x - self._content_x0()) // self._col_pitch())
+            if 0 <= idx < len(self._files):
+                self.file_clicked.emit(self._files[idx][0])
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -435,9 +498,10 @@ class VerticalMultiFileView(QWidget):
         pitch = self._col_pitch()
         ch = self.ch
         col_w = self.col_w
+        base_x0 = self._content_x0()
         draw_letters = ch >= 11 and col_w >= 11
         for fidx, (filename, qs, hit) in enumerate(self._files):
-            x0 = self.margin + fidx * pitch
+            x0 = base_x0 + fidx * pitch
 
             if filename == self._current:
                 painter.fillRect(QRectF(x0 - 3, 0, col_w + 6, self.height()),
@@ -494,6 +558,7 @@ class ProteinsTab(QWidget):
         self._combined = False   # panel 1 "All" mode
         self._panel1_spans = []  # identified spans currently shown in panel 1
         self.on_navigate_to_ms = None
+        self.on_theme_toggle = None
 
         self._build()
         self._populate_files()
@@ -556,12 +621,17 @@ class ProteinsTab(QWidget):
         bar.addWidget(self.fdr_edit)
         bar.addWidget(QLabel("% FDR"))
 
+        # Light/Dark toggle — to the right of the FDR bits. Calls back into the
+        # main window so the theme stays in sync across tabs.
+        self.theme_btn = QPushButton("Light Mode" if theme_is_dark(self.theme) else "Dark Mode")
+        self.theme_btn.setFixedWidth(90)
+        self.theme_btn.clicked.connect(lambda: self.on_theme_toggle and self.on_theme_toggle())
+        bar.addWidget(self.theme_btn)
+
         self.p1_title = QLabel("")
         bar.addSpacing(10)
         bar.addWidget(self.p1_title)
         bar.addStretch(1)
-        self.color_bar = QColorBar()
-        bar.addWidget(self.color_bar)
         right_layout.addLayout(bar)
 
         self.panel1 = HorizontalSequenceView()
@@ -570,6 +640,15 @@ class ProteinsTab(QWidget):
         self.p1_scroll.setWidgetResizable(True)
         self.p1_scroll.setWidget(self.panel1)
         self.p1_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.panel1.scroll_area = self.p1_scroll
+
+        # The q-value colour bar lives INSIDE panel 1 (floating top-right over the
+        # sequence), not in the toolbar. It is a child of the viewport so it stays
+        # put while the sequence scrolls.
+        self.color_bar = QColorBar(self.p1_scroll.viewport())
+        self.color_bar.setFixedSize(210, 34)
+        self.color_bar.raise_()
+        self.p1_scroll.viewport().installEventFilter(self)
 
         # panel-2 zoom bar
         z_bar = QHBoxLayout()
@@ -591,6 +670,7 @@ class ProteinsTab(QWidget):
         self.p2_scroll = QScrollArea()
         self.p2_scroll.setWidgetResizable(True)
         self.p2_scroll.setWidget(self.panel2)
+        self.panel2.scroll_area = self.p2_scroll
 
         p2_wrap = QWidget()
         p2_layout = QVBoxLayout(p2_wrap)
@@ -770,6 +850,18 @@ class ProteinsTab(QWidget):
 
     # ---- theme -----------------------------------------------------------
 
+    def eventFilter(self, obj, event):
+        # keep the floating colour bar pinned to panel 1's top-right corner
+        if obj is self.p1_scroll.viewport() and event.type() == QEvent.Resize:
+            self._reposition_color_bar()
+        return super().eventFilter(obj, event)
+
+    def _reposition_color_bar(self):
+        vp = self.p1_scroll.viewport()
+        cb = self.color_bar
+        cb.move(max(6, vp.width() - cb.width() - 10), 6)
+        cb.raise_()
+
     def apply_theme(self, theme):
         self._apply_theme(theme)
 
@@ -777,19 +869,18 @@ class ProteinsTab(QWidget):
         self.theme = theme
         pal = THEMES.get(theme, THEMES["dark"])
         fg, bg = pal["fg"], pal["bg"]
+        # Theme ONLY the sequence panels (and their scroll viewports) + colour
+        # bar. The left file-list column keeps the default app palette so it does
+        # not turn dark — the theming is "just for the panels".
         self.panel1.set_theme(fg, bg)
         self.panel2.set_theme(fg, bg)
         self.color_bar.set_theme(fg)
-        # adapt the surrounding chrome (labels, list, combo) to the theme
-        self.setStyleSheet(
-            f"QWidget {{ color: {fg}; }}"
-            f"QScrollArea {{ background: {bg}; border: none; }}"
-            f"QListWidget {{ background: {pal['panel']}; color: {fg}; }}"
-            "QListWidget::item:selected, QListWidget::item:selected:!active"
-            " { background-color: #2f6fb3; color: white; }"
-            f"QComboBox {{ background: {pal['panel']}; color: {fg}; }}"
-            f"QDoubleSpinBox {{ background: {pal['panel']}; color: {fg}; }}"
-        )
+        for area in (self.p1_scroll, self.p2_scroll):
+            area.setStyleSheet(f"QScrollArea {{ background: {bg}; border: none; }}")
+            area.viewport().setStyleSheet(f"background: {bg};")
+        if getattr(self, "theme_btn", None) is not None:
+            self.theme_btn.setText("Light Mode" if theme_is_dark(theme) else "Dark Mode")
+        self._reposition_color_bar()
 
 
 def _safe_float(value):
