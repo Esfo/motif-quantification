@@ -28,6 +28,7 @@ mirror the Sage enzyme config in execution.xsh.
 """
 
 import math
+import re
 
 from PySide6.QtCore import Qt, QRectF, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen
@@ -90,6 +91,21 @@ THEMES = {
 
 def theme_is_dark(theme):
     return theme != "light"
+
+
+# Protein-list sort metrics. Each is computed per (protein, file); the list sorts
+# on the value, then the asc/desc toggle chooses the direction. "descending"
+# means best/largest first for every metric (confidence uses -q so the most
+# confident protein sorts first when descending).
+SORT_OPTIONS = [
+    "% Coverage",
+    "Protein Length",
+    "Total Identified Peptides",
+    "Protein Confidence",
+    "Spectral Count (PSMs)",
+    "Best Peptide q-value",
+    "Accession (A–Z)",
+]
 
 
 def base_segments(seq):
@@ -434,7 +450,9 @@ class VerticalMultiFileView(QWidget):
         n = len(self._files)
         if n <= 0:
             return self.base_col_w
-        avail = self.width() - 2 * self.margin - self._label_overhang - (n - 1) * self.gap
+        # reserve the slanted-label overhang on BOTH sides so the centred block's
+        # rightmost label never clips.
+        avail = self.width() - 2 * self.margin - 2 * self._label_overhang - (n - 1) * self.gap
         return max(6.0, avail / n)
 
     def set_theme(self, fg, bg):
@@ -495,9 +513,10 @@ class VerticalMultiFileView(QWidget):
         return self.col_w + self.gap
 
     def _content_x0(self):
-        # columns fill the width starting at the left margin (no centring — the
-        # width is fully used, only the vertical size zooms).
-        return float(self.margin)
+        # centre the block of columns within the panel (the right label-overhang
+        # gap is balanced with an equal gap on the left).
+        content = len(self._files) * self.col_w + max(0, len(self._files) - 1) * self.gap
+        return max(self.margin, (self.width() - content) / 2.0)
 
     def _recompute_size(self):
         n = len(self._seq)
@@ -630,6 +649,9 @@ class ProteinsTab(QWidget):
         self.current_protein = None
         self._combined = False   # panel 1 "All" mode
         self._color_mode = "log"  # q-value colour scale: "log" or "lin"
+        self._sort_desc = True
+        self._len_cache = {}
+        self._cov_cache = {}
         self._panel1_spans = []  # identified spans currently shown in panel 1
         self.on_navigate_to_ms = None
         self.on_theme_toggle = None
@@ -654,7 +676,23 @@ class ProteinsTab(QWidget):
         self.file_combo.currentIndexChanged.connect(self._on_file_changed)
         left_layout.addWidget(self.file_combo)
 
-        left_layout.addWidget(QLabel("proteins"))
+        # Sort-by row: "Sort By" + metric dropdown + asc/desc toggle button.
+        sort_row = QHBoxLayout()
+        sort_row.setContentsMargins(0, 0, 0, 0)
+        sort_row.addWidget(QLabel("Sort By"))
+        self.sort_combo = QComboBox()
+        for label in SORT_OPTIONS:
+            self.sort_combo.addItem(label)
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        sort_row.addWidget(self.sort_combo, stretch=1)
+        self.sort_dir_btn = QPushButton("▼")
+        self.sort_dir_btn.setFixedWidth(30)
+        self.sort_dir_btn.setToolTip("Descending / ascending")
+        self._sort_desc = True
+        self.sort_dir_btn.clicked.connect(self._on_sort_dir_toggle)
+        sort_row.addWidget(self.sort_dir_btn)
+        left_layout.addLayout(sort_row)
+
         self.protein_list = QListWidget()
         self.protein_list.setStyleSheet(
             "QListWidget::item:selected,"
@@ -808,7 +846,8 @@ class ProteinsTab(QWidget):
         return max(0.0, self.fdr_edit.value()) / 100.0
 
     def _identified_proteins(self, filename):
-        """Proteins identified at/below the FDR in ``filename``, sorted by q."""
+        """Proteins identified at/below the FDR in ``filename``, ordered by the
+        currently-selected sort metric and direction."""
         thr = self._fdr_threshold()
         out = []
         for row in self.session.file_proteins(filename or ""):
@@ -818,11 +857,81 @@ class ProteinsTab(QWidget):
             q = _safe_float(row.get("protein_q"))
             if q is not None and q > thr:
                 continue
-            out.append((q if q is not None else 1.0, pid, row))
-        out.sort(key=lambda t: t[0])
-        return [(pid, row) for _q, pid, row in out]
+            out.append((pid, row))
+        return self._sort_proteins(out, filename)
+
+    # ---- sorting ---------------------------------------------------------
+
+    def _protein_len(self, pid):
+        if pid not in self._len_cache:
+            seq = self.session.protein_sequence(pid)
+            self._len_cache[pid] = len(seq) if seq else 0
+        return self._len_cache[pid]
+
+    def _protein_coverage(self, pid, filename):
+        key = (pid, filename)
+        if key not in self._cov_cache:
+            seq = self.session.protein_sequence(pid)
+            if not seq:
+                self._cov_cache[key] = 0.0
+            else:
+                _qs, hit = residue_q(seq, self.session.peptide_q_for_file(filename or ""))
+                self._cov_cache[key] = 100.0 * sum(hit) / len(seq)
+        return self._cov_cache[key]
+
+    def _best_peptide_q(self, row, filename):
+        qmap = self.session.peptide_q_for_file(filename or "")
+        best = None
+        for pep in str(row.get("peptides", "")).split(";"):
+            plain = _plain(pep)
+            q = qmap.get(plain)
+            if plain in qmap and q is not None and (best is None or q < best):
+                best = q
+        return best
+
+    def _metric_value(self, metric, pid, row, filename):
+        """A sortable value; larger = 'better' so descending puts the best first."""
+        if metric == "% Coverage":
+            return self._protein_coverage(pid, filename)
+        if metric == "Protein Length":
+            return self._protein_len(pid)
+        if metric == "Total Identified Peptides":
+            return _safe_int(row.get("n_peptides"))
+        if metric == "Protein Confidence":
+            q = _safe_float(row.get("protein_q"))
+            return -(q if q is not None else 1.0)     # most confident (low q) first
+        if metric == "Spectral Count (PSMs)":
+            return _safe_int(row.get("n_psms"))
+        if metric == "Best Peptide q-value":
+            q = self._best_peptide_q(row, filename)
+            return -(q if q is not None else 1.0)
+        if metric == "Accession (A–Z)":
+            return pid.lower()
+        return pid.lower()
+
+    def _sort_proteins(self, items, filename):
+        metric = self.sort_combo.currentText() if hasattr(self, "sort_combo") else SORT_OPTIONS[0]
+        keyed = [(self._metric_value(metric, pid, row, filename), pid, row)
+                 for pid, row in items]
+        # Accession sorts alphabetically (ascending A–Z by default); numeric
+        # metrics default to descending (best first). The button flips either.
+        is_text = metric.startswith("Accession")
+        reverse = self._sort_desc if not is_text else (not self._sort_desc)
+        try:
+            keyed.sort(key=lambda t: t[0], reverse=reverse)
+        except TypeError:
+            keyed.sort(key=lambda t: str(t[0]), reverse=reverse)
+        return [(pid, row) for _v, pid, row in keyed]
 
     # ---- events ----------------------------------------------------------
+
+    def _on_sort_changed(self):
+        self._refresh_protein_list()
+
+    def _on_sort_dir_toggle(self):
+        self._sort_desc = not self._sort_desc
+        self.sort_dir_btn.setText("▼" if self._sort_desc else "▲")
+        self._refresh_protein_list()
 
     def _on_file_changed(self):
         self.current_file = self.file_combo.currentData()
@@ -972,3 +1081,18 @@ def _safe_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(value):
+    f = _safe_float(value)
+    return int(f) if f is not None else 0
+
+
+def _plain(peptide):
+    """Bare uppercase residues (strip flanks + modifications) — for matching a
+    protein's listed peptides against the file's identified peptide_plain set."""
+    value = peptide or ""
+    if len(value) >= 5 and value[1] == "." and value[-2] == ".":
+        value = value[2:-2]
+    value = re.sub(r"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}", "", value)
+    return re.sub(r"[^A-Za-z]", "", value).upper()

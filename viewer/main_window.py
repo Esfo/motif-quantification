@@ -201,6 +201,13 @@ class MainWindow(QMainWindow):
                                   theme=self.theme)
         self.ms_tab.on_theme_toggle = self.toggle_theme   # panel-1 Light/Dark button
 
+        # Preserve whichever tab the user is on across open/reload (don't jump
+        # back to MS Data).
+        prev_index = 0
+        old_central = self.centralWidget()
+        if isinstance(old_central, QTabWidget):
+            prev_index = old_central.currentIndex()
+
         tabs = QTabWidget()
         self.tabs = tabs
         # 'loading' now shows as a badge on top of panels 1/2 and as a row within
@@ -219,6 +226,8 @@ class MainWindow(QMainWindow):
                     "Time series + DE at the motif level; proteins grouped by shared skeleton "
                     "motif, with include/exclude refinement saved back to a motif-sets folder. "
                     "— staged, see ARCHITECTURE.md"), "Motifs")
+        if 0 <= prev_index < tabs.count():
+            tabs.setCurrentIndex(prev_index)
         self.setCentralWidget(tabs)
         # Restore the dock arrangement after the tab is laid out (sizes depend on
         # the final widget geometry), so opening a file doesn't reset it.

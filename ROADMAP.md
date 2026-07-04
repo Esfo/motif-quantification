@@ -228,7 +228,8 @@ data the pipeline produces. The four founding goals:
 - ✅ Panel 2 **zooms** (Ctrl-wheel) all the way down to fit the whole protein — residues collapse to filled colour blocks (FDR colour preserved) while **file names stay full size**.
 - ✅ **Lin/Log colour** toggle (like MS Data's) rescales the FDR colour gradient; the colour bar's percentage ticks move with it.
 - ✅ **Light/dark** adaptive colours for the panels only (the left file list keeps the app palette); theme stays in sync across tabs.
-- ✅ Panel sizes are **remembered** (h/v splitters persisted by the main window, like the MS Data dock layout).
+- ✅ Panel sizes are **remembered** (h/v splitters persisted by the main window, like the MS Data dock layout); opening/reloading a folder keeps the current tab.
+- ✅ Protein list **sort** row ("Sort By" + metric dropdown + asc/desc toggle): % Coverage, Protein Length, Total Identified Peptides, Protein Confidence, Spectral Count (PSMs), Best Peptide q-value, Accession (A–Z).
 
 ---
 
