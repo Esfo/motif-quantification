@@ -386,6 +386,13 @@ def peptide_isotope_distribution(sequence, dividing_threshold=DEFAULT_DIVIDING_T
     and ``abundances`` are the summed group abundances (not normalized).
     """
     atomiccomposition = chem.peptide_atomic_composition(sequence)
+    return composition_isotope_distribution(atomiccomposition, dividing_threshold)
+
+
+def composition_isotope_distribution(atomiccomposition, dividing_threshold=DEFAULT_DIVIDING_THRESHOLD):
+    """Neutral isotope envelope for an explicit element->count composition (the
+    body of ``peptide_isotope_distribution`` without the sequence step), so a
+    mass-derived averagine composition can reuse the same grouping."""
     subformulas, massesandabundances = distribution_generation(dividing_threshold, atomiccomposition)
     subformulas = [i.decode() for i in subformulas]
 
@@ -458,4 +465,51 @@ def peptide_isotope_bars(sequence, charge, mode="raw",
     else:
         masses, abundances = peptide_isotope_raw(sequence, dividing_threshold)
     mzs = (masses + proton * charge) / charge
+    return mzs, abundances
+
+
+# Averagine: the average amino-acid residue composition + mass, used to estimate
+# a peptide's isotope envelope from its neutral mass alone (Senko et al. 1995),
+# i.e. for distributions with no sequence identification.
+AVERAGINE_RESIDUE = {"C": 4.9384, "H": 7.7583, "N": 1.3577, "O": 1.4773, "S": 0.0417}
+AVERAGINE_RESIDUE_MASS = 111.1254
+
+
+def averagine_composition(neutral_mass):
+    """Integer element->count composition approximating a peptide of the given
+    neutral mass (averagine units scaled to the mass, plus one water)."""
+    from collections import Counter
+
+    units = max(1.0, float(neutral_mass) / AVERAGINE_RESIDUE_MASS)
+    comp = Counter()
+    for element, per in AVERAGINE_RESIDUE.items():
+        count = int(round(per * units))
+        if count > 0:
+            comp[element] = count
+    comp["C"] = max(comp.get("C", 0), 1)
+    comp["H"] = comp.get("H", 0) + 2   # + water
+    comp["O"] = comp.get("O", 0) + 1
+    return comp
+
+
+def mass_isotope_bars(neutral_mass, charge, n=8,
+                      dividing_threshold=DEFAULT_DIVIDING_THRESHOLD):
+    """Theoretical MS1 bars (m/z, abundance) for an unidentified distribution.
+
+    The isotope-envelope SHAPE comes from the averagine composition for
+    ``neutral_mass``; the m/z POSITIONS are anchored to the exact ``neutral_mass``
+    (mono at ``neutral_mass/z + proton``, then +C13/z spacing) so the bars sit at
+    the distribution's presumed m/z rather than the rounded averagine mass.
+    Returns the first ``n`` isotope peaks.
+    """
+    charge = max(1, int(charge or 1))
+    comp = averagine_composition(neutral_mass)
+    masses, abundances = composition_isotope_distribution(comp, dividing_threshold)
+    if masses is None or len(masses) == 0:
+        return np.array([]), np.array([])
+    order = np.argsort(masses)
+    abundances = np.asarray(abundances, dtype=float)[order][:n]
+    step = chem.C13_DELTA if hasattr(chem, "C13_DELTA") else 1.0033548
+    mono_mz = float(neutral_mass) / charge + proton
+    mzs = mono_mz + np.arange(len(abundances)) * (step / charge)
     return mzs, abundances

@@ -1717,6 +1717,7 @@ class MSViewerTab(QMainWindow):
                 self._select_distribution_for_candidate(row, charge, scan)
             except Exception:
                 pass
+            self._selection_is_raw_dist = False
             self._ms1_theo = {"seq": seq, "charge": charge,
                               "mod_mass": peptide_mod_mass(row.get("peptide", ""))}
             self._redraw_panel1_view()
@@ -1794,6 +1795,9 @@ class MSViewerTab(QMainWindow):
         self._ms1_theo = ({"seq": plain, "charge": charge or 1,
                            "mod_mass": peptide_mod_mass(row.get("peptide", ""))}
                           if len(plain) >= 2 else None)
+        # This is an identified-peptide selection (not a raw distribution click),
+        # so charge stepping uses the sequence envelope.
+        self._selection_is_raw_dist = False
         self.render_table1(self.current)
         # Initialize the window from the ± controls and snap the views to it.
         rt_start = max(0.0, rt - self.rt_half) if rt is not None else 0.0
@@ -2487,8 +2491,12 @@ class MSViewerTab(QMainWindow):
         # (robust to scatter/scene signal ordering, and to panel-1 dot clicks
         # which route here too but fire no panel-2 scene click).
         self._dist_click_seq = getattr(self, "_dist_click_seq", 0) + 1
-        # A real distribution is now selected: any theoretical overlay from a
-        # prior peptide / charge-scroll hypothetical goes away.
+        # A raw distribution is now selected (may be unidentified): a later charge
+        # step should build its theoretical from the distribution's neutral mass,
+        # not the last peptide's sequence.
+        self._selection_is_raw_dist = True
+        # Any theoretical overlay from a prior peptide / charge-scroll hypothetical
+        # goes away until the user scrolls charge.
         self._ms1_theo = None
         self._draw_ms1_theo_overlay()
         # Select it: dotted border + charge-search anchor (no view move on click).
@@ -2870,6 +2878,7 @@ class MSViewerTab(QMainWindow):
         # WITHOUT flipping panel 3 back to its MS1 view (we stay on the MS2
         # spectrum). The band + border survive panel-2 redraws.
         self._select_distribution_for_candidate(r, charge, scan)
+        self._selection_is_raw_dist = False
         # Also overlay this peptide's theoretical MS1 distribution on panel 1.
         self._ms1_theo = {"seq": seq, "charge": charge,
                           "mod_mass": peptide_mod_mass(r.get("peptide", ""))}
@@ -3015,18 +3024,29 @@ class MSViewerTab(QMainWindow):
                 exp_max = 1.0
         if exp_max <= 0:
             exp_max = 1.0
+        theo = self._ms1_theo
         try:
-            mode = self.ms1theo_toggle.key()
-            mzs, abund = isotopes.peptide_isotope_bars(
-                self._ms1_theo["seq"], self._ms1_theo["charge"], mode=mode,
-                dividing_threshold=0.1)
+            if theo.get("seq"):
+                # Identified peptide: exact isotope pattern from the sequence.
+                mode = self.ms1theo_toggle.key()
+                mzs, abund = isotopes.peptide_isotope_bars(
+                    theo["seq"], theo["charge"], mode=mode, dividing_threshold=0.1)
+            elif theo.get("neutral_mass"):
+                # Unidentified distribution: averagine envelope from its neutral
+                # mass, anchored at the presumed m/z for this charge. Lets charge
+                # relationships be mapped on distributions with no peptide.
+                mzs, abund = isotopes.mass_isotope_bars(
+                    theo["neutral_mass"], theo["charge"], n=8, dividing_threshold=0.1)
+            else:
+                return
         except Exception as exc:
             # Don't silently drop the overlay: a computation failure (e.g. a
             # residue with no atomic composition) otherwise looks identical to
             # "no distribution here". Surface it so it's diagnosable.
             import sys
             print(f"[ms1-theo] no overlay for "
-                  f"{self._ms1_theo.get('seq')!r}: {exc}", file=sys.stderr)
+                  f"{theo.get('seq') or theo.get('neutral_mass')!r}: {exc}",
+                  file=sys.stderr)
             return
         if mzs is None or len(mzs) == 0:
             return
@@ -4247,18 +4267,33 @@ class MSViewerTab(QMainWindow):
         self._draw_ms1_theo_overlay()
 
     def _set_theo_for_charge(self, charge):
-        """Point the panel-1 theoretical MS1 overlay at the current peptide at
-        ``charge`` (used by charge stepping). Rebuilds _ms1_theo from the current
-        PSM if it was cleared, so scrolling into a charge with no distribution
-        still shows a theoretical distribution at that charge's presumed m/z."""
+        """Point the panel-1 theoretical MS1 overlay at the selected analyte at
+        ``charge`` (used by charge stepping), so scrolling into any charge -- even
+        one with no distribution -- shows a theoretical distribution at that
+        charge's presumed m/z.
+
+        An identified peptide uses its exact sequence envelope; a raw distribution
+        clicked in panel 2 (which may be unidentified, have no MS2, or no linked
+        charge state) uses the averagine envelope from its neutral mass. This is
+        what lets charge relationships be mapped on things that slipped through."""
+        # Follow the charge on an existing overlay of the same kind.
         if isinstance(self._ms1_theo, dict):
             self._ms1_theo = {**self._ms1_theo, "charge": charge}
             return
-        row = self.current.get("row", {}) if isinstance(self.current, dict) else {}
-        plain = plain_seq(row.get("peptide", ""))
-        if len(plain) >= 2:
-            self._ms1_theo = {"seq": plain, "charge": charge,
-                              "mod_mass": peptide_mod_mass(row.get("peptide", ""))}
+        # Identified peptide selection -> exact sequence envelope.
+        if not getattr(self, "_selection_is_raw_dist", False):
+            row = self.current.get("row", {}) if isinstance(self.current, dict) else {}
+            plain = plain_seq(row.get("peptide", ""))
+            if len(plain) >= 2:
+                self._ms1_theo = {"seq": plain, "charge": charge,
+                                  "mod_mass": peptide_mod_mass(row.get("peptide", ""))}
+                return
+        # Raw / unidentified distribution -> averagine envelope from its mass.
+        nm = self.current.get("neutral_mass") if isinstance(self.current, dict) else None
+        if nm:
+            self._ms1_theo = {"neutral_mass": float(nm), "charge": charge}
+        else:
+            self._ms1_theo = None
 
     def set_charge(self, z):
         if self.current is None:
