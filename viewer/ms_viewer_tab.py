@@ -2049,7 +2049,19 @@ class MSViewerTab(QMainWindow):
         self.draw_ms2_strip(result.get("ms2", []))
         # Keep the MS2 spectrum up if the user is in MS2 mode; otherwise (re)draw
         # the MS1 envelope / charge grid.
-        if self._panel3_mode == "ms2" and self._ms2_scan is not None:
+        if self._panel3_mode == "ms2" and getattr(self, "_pending_charge_refocus", False):
+            # A charge step moved the selection to a linked distribution: shift
+            # the MS2 view to that distribution's scan (now that _ms2_all is
+            # reloaded for the new m/z region), not the stale previous scan.
+            self._pending_charge_refocus = False
+            scan = self._default_ms2_scan()
+            if scan is not None:
+                self.render_ms2(scan)
+            else:
+                # No MS2 on the new distribution -> show its MS1 view instead.
+                self._panel3_mode = "ms1"
+                self.draw_panel3_ms1(cur, scan_mz, scan_int)
+        elif self._panel3_mode == "ms2" and self._ms2_scan is not None:
             self.render_ms2(self._ms2_scan)
         else:
             self.draw_panel3_ms1(cur, scan_mz, scan_int)
@@ -4125,6 +4137,15 @@ class MSViewerTab(QMainWindow):
         if grp and target in grp and grp[target].get("distribution"):
             did = grp[target]["distribution"]["distribution_id"]
             self._set_selected(did, keep_group=True)
+            # Follow the new charge state on panel 1's theoretical overlay too.
+            if isinstance(self._ms1_theo, dict):
+                self._ms1_theo = {**self._ms1_theo, "charge": target}
+            # Fitting reloads the region (async); if the MS2 view is up, tell
+            # on_evidence_done to shift panel 3 to THIS distribution's MS2
+            # instead of re-rendering the old scan. (The MS1 view already
+            # follows the new distribution id.)
+            if self._panel3_mode == "ms2":
+                self._pending_charge_refocus = True
             self._fit_to_selected()
             return
         # Otherwise no distribution exists at this charge: show a RED box where the
