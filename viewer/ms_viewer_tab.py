@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDockWidget,
+    QDoubleSpinBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -850,14 +851,17 @@ class MSViewerTab(QMainWindow):
         # self.tab_loading_label); nothing above panel 1 anymore.
         self.tab_loading_label = None
 
-        # Acceptance-criteria field for the MS2-strip green/red identification
-        # gate: "acceptance criteria [0.1] % FDR". Value is a percentage.
-        self.fdr_label = QLabel("Acceptance Criteria")
-        self.fdr_edit = QLineEdit("0.1")
-        self.fdr_edit.setFixedWidth(48)
+        # FDR acceptance-criteria spin box for the MS2-strip green/red gate:
+        # "[0.10] % FDR". Scroll the cursor over it to step the value. Percentage.
+        self.fdr_edit = QDoubleSpinBox()
+        self.fdr_edit.setDecimals(2)
+        self.fdr_edit.setRange(0.0, 100.0)
+        self.fdr_edit.setSingleStep(0.1)
+        self.fdr_edit.setValue(0.1)
+        self.fdr_edit.setFixedWidth(60)
         self.fdr_edit.setToolTip("MS2 lines are green when a PSM passes this FDR "
                                  "(percent), red otherwise")
-        self.fdr_edit.editingFinished.connect(self._on_fdr_changed)
+        self.fdr_edit.valueChanged.connect(self._on_fdr_changed)
         self.fdr_unit = QLabel("% FDR")
 
         # Navigation-history arrows: same design as the charge arrows, placed to
@@ -894,7 +898,6 @@ class MSViewerTab(QMainWindow):
         # acceptance-criteria field. Replaces the old 'loading' text slot.
         bar.addWidget(self.noise_toggle)
         bar.addStretch(1)
-        bar.addWidget(self.fdr_label)
         bar.addWidget(self.fdr_edit)
         bar.addWidget(self.fdr_unit)
         bar.addSpacing(12)
@@ -2174,14 +2177,8 @@ class MSViewerTab(QMainWindow):
             pass
 
     def _on_fdr_changed(self):
-        """Acceptance-criteria field edited: reparse the FDR % and recolor the
-        MS2 strip."""
-        try:
-            pct = float(self.fdr_edit.text())
-            self._fdr_threshold = max(0.0, pct) / 100.0
-        except ValueError:
-            self.fdr_edit.setText(f"{self._fdr_threshold * 100:g}")
-            return
+        """FDR spin box changed: update the threshold and recolor the MS2 strip."""
+        self._fdr_threshold = max(0.0, self.fdr_edit.value()) / 100.0
         self._ident_cache_key = None   # invalidate cache
         self._refresh_ms2_visible()
 
