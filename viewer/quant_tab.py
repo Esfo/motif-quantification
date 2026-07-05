@@ -292,11 +292,10 @@ class QuantTab(QWidget):
         self._layers = []  # list of {"cat": str, "mode": str} organizer rows
 
         # Table nesting layers — an ordered list of categories (layer 1 = outermost).
-        # INDEPENDENT of the panel-1 organizer and of the replicate designation.
-        # DEFAULT IS EMPTY: with no layers the table shows the full flat view (every
-        # category value as a column); adding layers PIVOTS that same data.
-        self._nest_layers = [c for c in self._saved.get("nest_layers", [])
-                             if c in self._categories]
+        # ALWAYS starts empty so the table opens FLAT (every category value as a
+        # column); the user pivots by adding layers. Deliberately not persisted, so
+        # startup is never pinned to a previously-chosen pivot.
+        self._nest_layers = []
 
         self._build_ui()
         if self._active:
@@ -330,7 +329,6 @@ class QuantTab(QWidget):
             "compare": self.compare_combo.currentText(),
             "a": self.a_combo.currentText(),
             "b": self.b_combo.currentText(),
-            "nest_layers": self._nest_layers,
         }
         self.settings.setValue("quant_state", json.dumps(state))
 
@@ -428,9 +426,11 @@ class QuantTab(QWidget):
         self.facet_title.setStyleSheet("font-weight: bold; font-size: 13px;")
         lay.addWidget(self.facet_title)
 
-        # Fold-change contrast summary — full-contrast, above the organizer
-        # dropdowns (recoloured in apply_theme).
+        # Fold-change contrast summary, above the organizer dropdowns. Black text:
+        # the tab chrome sits on the light Qt palette (only the plots are dark), so
+        # black is the readable choice here.
         self.fold_status = QLabel("")
+        self.fold_status.setStyleSheet("color: black; font-weight: bold;")
         lay.addWidget(self.fold_status)
 
         # organizer pseudo-table: growable list of layer rows
@@ -1126,10 +1126,6 @@ class QuantTab(QWidget):
             return
         if getattr(self, "theme_btn", None) is not None:
             self.theme_btn.setText("Light Mode" if theme != "light" else "Dark Mode")
-        if getattr(self, "fold_status", None) is not None:
-            # full-contrast (black on light, white on dark), not muted grey
-            fg = "#101216" if theme == "light" else "#ffffff"
-            self.fold_status.setStyleSheet(f"color: {fg}; font-weight: bold;")
         pal = palette(theme)
         if getattr(self, "fold_plot", None) is not None:
             style_plot(self.fold_plot, pal)
