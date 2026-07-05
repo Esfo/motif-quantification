@@ -21,11 +21,14 @@ Top half (horizontal split):
     y = mean log2 abundance. Click a point to select that feature.
 
 Bottom half:
-  * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a
-    long-form table whose columns are **the experimental-setup categories** (every
-    design column except the filename — each file is fully described by its
-    category values) plus the feature id, a unique flag, and the quantity — one row
-    per (feature, file), so you can see and sort every quantity across conditions.
+  * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a **pivot
+    table**: rows are features, and the columns are the sample groups themselves —
+    a nested, spanning header built from the category *values* (e.g. condition
+    spanning over replicate), with the quantities as the cell values. The column
+    nesting comes from the organizer's column/row-split categories (outer→inner)
+    plus the designated replicate column innermost; any category left out collapses,
+    so files that land in the same leaf are **averaged** (non-zero values only) and
+    the cell is shaded grey to mark it as an average.
 
 An optional **Normalize** mode (median-center) shifts each file so its median
 log2 quantity matches the grand median, correcting systematic per-run intensity
@@ -42,13 +45,14 @@ import json
 import math
 import statistics
 
-from PySide6.QtCore import Qt, QSettings, Signal
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtCore import Qt, QRect, QSettings, QSize, Signal
+from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QPushButton,
     QSizePolicy,
@@ -120,6 +124,83 @@ class RotatedAxisItem(pg.AxisItem):
             p.rotate(self._angle)
             p.drawText(0, 0, text)
             p.restore()
+
+
+class GroupedHeaderView(QHeaderView):
+    """Horizontal header that paints a **multi-level, spanning** column header:
+    each data column carries a path of category values (outer→inner) and the
+    header draws one row per level, merging adjacent columns that share a prefix.
+    So the pivot's columns read as e.g. condition (spanning) over replicate.
+    Column 0 (the feature column) is drawn full-height with a corner label."""
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self._paths = []      # per logical column: tuple(values) or None (col 0)
+        self._nlevels = 1
+        self._corner = ""
+        self._fg = QColor("#e6e6e6")
+        self._bg = QColor("#16181d")
+        self._line = QColor("#2a2d33")
+        self.setSectionsClickable(True)
+
+    def _level_h(self):
+        return self.fontMetrics().height() + 8
+
+    def set_structure(self, paths, nlevels, corner, fg, bg, line):
+        self._paths = paths
+        self._nlevels = max(1, nlevels)
+        self._corner = corner
+        self._fg, self._bg, self._line = QColor(fg), QColor(bg), QColor(line)
+        self.setFixedHeight(self._level_h() * self._nlevels)
+        self.updateGeometry()
+        self.viewport().update()
+
+    def sizeHint(self):
+        return QSize(super().sizeHint().width(), self._level_h() * self._nlevels)
+
+    def paintEvent(self, event):
+        p = QPainter(self.viewport())
+        lh = self._level_h()
+        total_h = lh * self._nlevels
+        n = self.count()
+        p.fillRect(self.viewport().rect(), self._bg)
+
+        # feature column (0): one full-height cell with the corner label
+        if n > 0:
+            x0 = self.sectionViewportPosition(0)
+            w0 = self.sectionSize(0)
+            rect = QRect(int(x0), 0, int(w0), int(total_h))
+            p.setPen(QPen(self._line))
+            p.drawRect(rect)
+            p.setPen(QPen(self._fg))
+            p.drawText(rect, Qt.AlignCenter, self._corner)
+
+        fm = self.fontMetrics()
+        for level in range(self._nlevels):
+            c = 1
+            while c < n:
+                path = self._paths[c] if c < len(self._paths) else None
+                if path is None:
+                    c += 1
+                    continue
+                key = path[:level + 1]
+                start = c
+                while (c < n and c < len(self._paths)
+                       and self._paths[c] is not None
+                       and self._paths[c][:level + 1] == key):
+                    c += 1
+                last = c - 1
+                x0 = self.sectionViewportPosition(start)
+                xend = self.sectionViewportPosition(last) + self.sectionSize(last)
+                rect = QRect(int(x0), int(level * lh), int(xend - x0), int(lh))
+                p.setPen(QPen(self._line))
+                p.drawRect(rect)
+                val = self._paths[start][level] if level < len(self._paths[start]) else ""
+                label = str(val) if val != "" else "(blank)"
+                p.setPen(QPen(self._fg))
+                p.drawText(rect, Qt.AlignCenter,
+                           fm.elidedText(label, Qt.ElideRight, rect.width() - 4))
+        p.end()
 
 
 def _sorted_values(values):
@@ -458,6 +539,8 @@ class QuantTab(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
+        self._header = GroupedHeaderView(self.table)
+        self.table.setHorizontalHeader(self._header)
         self.table.itemSelectionChanged.connect(self._on_table_selection)
         lay.addWidget(self.table, 1)
         return panel
@@ -474,6 +557,7 @@ class QuantTab(QWidget):
         if rebuild:
             self._rebuild_layer_rows()
             self._rebuild_facets()
+            self._refresh_table()
             self._save_state()
 
     def _remove_layer(self, index):
@@ -481,6 +565,7 @@ class QuantTab(QWidget):
             self._layers.pop(index)
             self._rebuild_layer_rows()
             self._rebuild_facets()
+            self._refresh_table()
             self._save_state()
 
     def _rebuild_layer_rows(self):
@@ -516,6 +601,7 @@ class QuantTab(QWidget):
         if 0 <= index < len(self._layers):
             self._layers[index][key] = value
             self._rebuild_facets()
+            self._refresh_table()
             self._save_state()
 
     # ---- reactive handlers ----------------------------------------------
@@ -534,6 +620,7 @@ class QuantTab(QWidget):
     def _on_replicate_changed(self, _):
         self._rebuild_facets()
         self._refresh_fold_change()
+        self._refresh_table()   # replicate is the innermost pivot column level
         self._save_state()
 
     def _on_compare_changed(self, column):
@@ -573,75 +660,120 @@ class QuantTab(QWidget):
 
     # ---- feature table (long form; columns = experimental-setup cols) ----
 
+    def _column_levels(self):
+        """Nesting levels for the pivot's columns: the organizer's column/row
+        split categories (outer→inner, in organizer order), then the designated
+        replicate column innermost. Any category left out of this list collapses,
+        so files sharing a leaf path are averaged (see _refresh_table)."""
+        levels = []
+        for layer in self._layers:
+            if layer["mode"] in (MODE_COLS, MODE_ROWS) and layer["cat"] not in levels:
+                levels.append(layer["cat"])
+        rep = self._replicate_column()
+        if rep and rep not in levels:
+            levels.append(rep)
+        # No organizer splits chosen → show the full per-sample breakdown (all
+        # categories) rather than collapsing everything into one averaged column.
+        if not levels:
+            levels = list(self._categories)
+        return levels
+
+    def _chrome(self):
+        if self.theme == "light":
+            return ("#202020", "#ffffff", "#c8ccd2")
+        return ("#e6e6e6", "#16181d", "#2a2d33")
+
     def _refresh_table(self):
         matrix = self._matrix()
         feats = self._visible_features()
-
+        levels = self._column_levels()
         feat_label = "peptide" if self.level == "peptide" else "protein"
-        # Columns are the experimental-setup categories only — NOT the filename
-        # (each file is already fully described by its category values).
-        cat_cols = [c for c in self.experimental.columns() if c != "filename"]
-        headers = [feat_label] + cat_cols + ["unique", "quantity"]
+
+        # Build the leaf columns: unique combinations of the level values across
+        # all design files. Files that map to the same leaf are a "collision" and
+        # get averaged (non-zero only) per feature.
+        leaf_files = {}
+        for f in self.model.filenames():
+            path = tuple(self._cat_value(f, c) for c in levels) if levels else ("(all)",)
+            leaf_files.setdefault(path, []).append(f)
+
+        def leaf_key(path):
+            out = []
+            for v in path:
+                try:
+                    out.append((0, float(v)))
+                except (TypeError, ValueError):
+                    out.append((1, str(v)))
+            return tuple(out)
+
+        leaves = sorted(leaf_files.keys(), key=leaf_key)
+        nlevels = len(levels) if levels else 1
+        grey = QColor(150, 150, 150, 235)  # opaque grey = averaged collision
+        center = Qt.AlignCenter
 
         self.table.setSortingEnabled(False)
-        self.table.setColumnCount(len(headers))
-        self.table.setHorizontalHeaderLabels(headers)
-        self.table.setRowCount(0)
+        self.table.setColumnCount(1 + len(leaves))
+        # plain logical labels (the custom header paints the grouped version)
+        self.table.setHorizontalHeaderLabels(
+            [feat_label] + [str(p[-1]) for p in leaves])
+        self.table.setRowCount(len(feats))
 
-        rows = []
-        for feat in feats:
-            uniq = ("yes" if (self.level == "protein"
-                              or self.model.peptide_is_unique(feat)) else "no")
-            for fname, q in matrix.get(feat, {}).items():
-                if not q or q <= 0:
-                    continue
-                rows.append((feat, fname, uniq, float(q)))
-
-        self.table.setRowCount(len(rows))
-        center = Qt.AlignCenter
-        for r, (feat, fname, uniq, q) in enumerate(rows):
-            design = self._row_for(fname)
-            items = [QTableWidgetItem(feat)]
-            for col in cat_cols:
-                items.append(QTableWidgetItem(design.get(col, "")))
-            items.append(QTableWidgetItem(uniq))
-            items.append(NumericItem(f"{q:.4g}", q))
-            for c, it in enumerate(items):
+        for r, feat in enumerate(feats):
+            fitem = QTableWidgetItem(feat)
+            fitem.setTextAlignment(center)
+            self.table.setItem(r, 0, fitem)
+            per = matrix.get(feat, {})
+            for ci, path in enumerate(leaves):
+                qs = [per.get(f) for f in leaf_files[path]]
+                qs = [q for q in qs if q and q > 0]   # never average in zeros
+                if not qs:
+                    it = NumericItem("", float("nan"))
+                else:
+                    val = sum(qs) / len(qs)
+                    it = NumericItem(f"{val:.4g}", val)
+                    if len(qs) > 1:                    # an actual average
+                        it.setBackground(grey)
+                        it.setForeground(QColor("#101216"))
                 it.setTextAlignment(center)
-                self.table.setItem(r, c, it)
+                self.table.setItem(r, ci + 1, it)
 
         self.table.setSortingEnabled(True)
-        self._layout_table(len(headers))
+
+        # header structure + column widths
+        paths = [None] + list(leaves)
+        fg, bg, line = self._chrome()
+        self._header.set_structure(paths, nlevels, feat_label, fg, bg, line)
+        self._layout_table(feats, leaves)
+
         label = "peptides" if self.level == "peptide" else "proteins"
-        self.count_label.setText(f"{len(feats)} {label} · {len(rows)} rows")
+        self.count_label.setText(f"{len(feats)} {label} × {len(leaves)} groups")
 
-    def _layout_table(self, ncols):
-        """Size every column to its content (sampled — the table can hold 100k+
-        rows, so a full ResizeToContents scan would stall) and, if the columns
-        don't fill the viewport, stretch them to fill so the table reads centred
-        across the screen rather than clumped on the left."""
-        for c in range(ncols):
-            hi = self.table.horizontalHeaderItem(c)
-            if hi is not None:
-                hi.setTextAlignment(Qt.AlignCenter)
-
+    def _layout_table(self, feats, leaves):
+        """Feature column sized to content (sampled); data columns to a uniform
+        width from their leaf labels + quantity text. Spare width is spread across
+        the columns so the table fills the viewport."""
         fm = QFontMetrics(self.table.font())
-        n = self.table.rowCount()
-        step = max(1, n // 400)  # sample ~400 rows for width estimation
-        widths = []
-        for c in range(ncols):
-            hi = self.table.horizontalHeaderItem(c)
-            w = fm.horizontalAdvance(hi.text() if hi else "") + 28
-            r = 0
-            while r < n:
-                it = self.table.item(r, c)
-                if it is not None:
-                    w = max(w, fm.horizontalAdvance(it.text()) + 24)
-                r += step
-            widths.append(w)
-
-        self._content_widths = widths
+        wfeat = fm.horizontalAdvance("peptide") + 28
+        for feat in feats[:400]:
+            wfeat = max(wfeat, fm.horizontalAdvance(feat) + 24)
+        wdata = 64
+        for p in leaves:
+            wdata = max(wdata, fm.horizontalAdvance(str(p[-1])) + 18)
+        self._content_widths = [wfeat] + [wdata] * len(leaves)
         self._apply_column_fill()
+
+    def _apply_column_fill(self):
+        """Spread any spare viewport width evenly across the content-sized columns
+        (on top of their content width, so nothing truncates) so the table fills
+        the width. Cheap — reuses cached widths, safe to call on every resize."""
+        widths = getattr(self, "_content_widths", None)
+        if not widths:
+            return
+        total = sum(widths)
+        avail = self.table.viewport().width()
+        extra = (avail - total) // len(widths) if (total and avail > total) else 0
+        for c, w in enumerate(widths):
+            self.table.setColumnWidth(c, w + max(0, extra))
 
     def _apply_column_fill(self):
         """Spread any spare viewport width evenly across the content-sized columns
@@ -933,3 +1065,5 @@ class QuantTab(QWidget):
             style_plot(self.fold_plot, pal)
         self._refresh_fold_change()
         self._rebuild_facets()
+        if getattr(self, "table", None) is not None:
+            self._refresh_table()   # recolours the grouped header + averaged cells
