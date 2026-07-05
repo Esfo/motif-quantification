@@ -22,10 +22,14 @@ Top half (horizontal split):
 
 Bottom half:
   * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a
-    long-form table whose columns are **the experimental-setup columns**
-    (filename + every design category) plus the feature id, a unique flag, and
-    the quantity — one row per (feature, file), so you can see and sort every
-    quantity across conditions and files.
+    long-form table whose columns are **the experimental-setup categories** (every
+    design column except the filename — each file is fully described by its
+    category values) plus the feature id, a unique flag, and the quantity — one row
+    per (feature, file), so you can see and sort every quantity across conditions.
+
+An optional **Normalize** mode (median-center) shifts each file so its median
+log2 quantity matches the grand median, correcting systematic per-run intensity
+differences before anything is compared.
 
 Filenames from the search tables (which may carry a ``.centroid.mzML`` suffix)
 are matched to the design's ``filename`` column by stripped stem, so the join is
@@ -36,6 +40,7 @@ Everything is reactive — no run button.
 
 import json
 import math
+import statistics
 
 from PySide6.QtCore import Qt, QSettings, Signal
 from PySide6.QtWidgets import (
@@ -134,6 +139,8 @@ class QuantTab(QWidget):
 
         self.level = self._saved.get("level", "peptide")
         self.unique_only = bool(self._saved.get("unique", False))
+        self.normalize = self._saved.get("normalize", "none")
+        self._matrix_cache = {}
         self.selected_feature = None
         self._active = not experimental.is_empty()
 
@@ -172,6 +179,7 @@ class QuantTab(QWidget):
         state = {
             "level": self.level,
             "unique": self.unique_only,
+            "normalize": self.normalize,
             "logy": self.logy_check.isChecked(),
             "replicate": self.replicate_combo.currentText(),
             "layers": self._layers,
@@ -197,8 +205,44 @@ class QuantTab(QWidget):
         """Model filenames whose design row has column == value."""
         return [f for f in self.model.filenames() if self._cat_value(f, column) == value]
 
+    def _matrix(self):
+        """Current-level quantity matrix, per-file normalized if requested.
+
+        ``median-center`` shifts every file so its median log2 quantity matches
+        the grand median across files — the standard label-free correction for
+        differing per-run loading/intensity (what makes a systematic GuHCl−NaCl
+        offset go away). Works in log2 space, then maps back to linear so the
+        rest of the tab is unchanged. Cached per (level, mode)."""
+        key = (self.level, self.normalize)
+        cached = self._matrix_cache.get(key)
+        if cached is not None:
+            return cached
+
+        raw = self.model.matrix(self.level)
+        if self.normalize != "median-center":
+            self._matrix_cache[key] = raw
+            return raw
+
+        file_logs = {}
+        for per_file in raw.values():
+            for f, q in per_file.items():
+                if q and q > 0:
+                    file_logs.setdefault(f, []).append(math.log2(q))
+        med = {f: statistics.median(v) for f, v in file_logs.items() if v}
+        grand = statistics.median(list(med.values())) if med else 0.0
+
+        out = {}
+        for feat, per_file in raw.items():
+            d = {}
+            for f, q in per_file.items():
+                if q and q > 0:
+                    d[f] = 2.0 ** (math.log2(q) - med.get(f, 0.0) + grand)
+            out[feat] = d
+        self._matrix_cache[key] = out
+        return out
+
     def _visible_features(self):
-        matrix = self.model.matrix(self.level)
+        matrix = self._matrix()
         feats = list(matrix.keys())
         if self.level == "peptide" and self.unique_only:
             feats = [f for f in feats if self.model.peptide_is_unique(f)]
@@ -249,6 +293,18 @@ class QuantTab(QWidget):
         org_header = QHBoxLayout()
         org_header.addWidget(QLabel("Organize by (top → bottom = outer → inner):"))
         org_header.addStretch(1)
+        org_header.addWidget(QLabel("Normalize:"))
+        self.normalize_combo = QComboBox()
+        self.normalize_combo.addItems(["none", "median-center"])
+        if self.normalize in ("none", "median-center"):
+            self.normalize_combo.setCurrentText(self.normalize)
+        self.normalize_combo.setToolTip(
+            "median-center: shift each file so its median log2 quantity matches "
+            "the grand median — corrects systematic per-run loading/intensity "
+            "differences before comparing across files.")
+        self.normalize_combo.currentTextChanged.connect(self._on_normalize_changed)
+        org_header.addWidget(self.normalize_combo)
+
         self.logy_check = QCheckBox("log2 Y")
         self.logy_check.setChecked(bool(self._saved.get("logy", True)))
         self.logy_check.stateChanged.connect(self._on_logy_changed)
@@ -441,6 +497,13 @@ class QuantTab(QWidget):
         self._rebuild_facets()
         self._save_state()
 
+    def _on_normalize_changed(self, mode):
+        self.normalize = mode
+        self._refresh_table()
+        self._refresh_fold_change()
+        self._rebuild_facets()
+        self._save_state()
+
     def _on_replicate_changed(self, _):
         self._rebuild_facets()
         self._refresh_fold_change()
@@ -484,7 +547,7 @@ class QuantTab(QWidget):
     # ---- feature table (long form; columns = experimental-setup cols) ----
 
     def _refresh_table(self):
-        matrix = self.model.matrix(self.level)
+        matrix = self._matrix()
         feats = self._visible_features()
 
         feat_label = "peptide" if self.level == "peptide" else "protein"
@@ -583,7 +646,7 @@ class QuantTab(QWidget):
 
         files_a = self._files_in(col, a_val)
         files_b = self._files_in(col, b_val)
-        matrix = self.model.matrix(self.level)
+        matrix = self._matrix()
 
         xs, ys, feats = [], [], []
         for feat in self._visible_features():
@@ -646,7 +709,7 @@ class QuantTab(QWidget):
         splits = [l for l in self._layers if l["mode"] in (MODE_COLS, MODE_ROWS)]
         xaxis = next((l["cat"] for l in self._layers if l["mode"] == MODE_XAXIS), None)
 
-        per_file = self.model.matrix(self.level).get(feat, {})
+        per_file = self._matrix().get(feat, {})
         files = [f for f in self.model.filenames() if per_file.get(f)]
         widget = self._facet_node(feat, per_file, files, splits, 0, xaxis)
         self.facet_area.addWidget(widget)

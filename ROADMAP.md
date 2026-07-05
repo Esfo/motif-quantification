@@ -239,9 +239,11 @@ data the pipeline produces. The four founding goals:
 - ✅ **Reactive — no run button.** Changing a category, the replicate column, the contrast, the level, or the unique filter recomputes immediately.
 - ✅ **All-features fold-change scatter** (top-right): x = **log2 fold change** (a plain log difference between two chosen category values, **no statistical test**), y = mean log2 abundance; every peptide/protein is a point; click one to select it.
 - ✅ **Faceted per-feature view** (top-left) driven by a **growable organizer pseudo-table** (no fixed number of levels): each row picks a category + a mode (**split → columns / split ↓ rows / x-axis**); add layers in any order to nest the panels by depth (split by condition → time-series x-axis inside each). Replicate runs at the same x get a mean line.
-- ✅ **Long-form table**: columns are **the experimental-setup columns** (filename + every category) plus the feature id, a **unique/non-unique** flag (filterable to uniques only), and the quantity — one row per (feature, file), so every quantity across conditions and files is visible and sortable.
+- ✅ **Long-form table**: columns are **the experimental-setup categories** (every design column **except the filename** — each file is described by its category values) plus the feature id, a **unique/non-unique** flag (filterable to uniques only), and the quantity — one row per (feature, file), sortable.
 - ✅ **Robust filename join**: search-table filenames (e.g. `…​.centroid.mzML`) are matched to the design's `filename` column by stripped stem, so grouping/fold-change work even when the extensions differ (this was silently collapsing every file into one empty group).
-- ✅ **Adaptive light/dark** (matches the other tabs): **white datapoints on dark**, dark-outlined on light; `(x0.0001)` SI axis prefixes disabled.
+- ✅ **Optional normalization**: a **median-center** mode shifts each file so its median log2 quantity matches the grand median (standard label-free correction for per-run loading/intensity), applied consistently to the table, facets, and fold-change; **none** by default.
+- ✅ **Persisted state** (like the panel layouts, via QSettings): the organizer layers, replicate/normalize/log-Y, compare A/B, level, and unique filter are restored on reopen. The organizer **never auto-fills** — it starts empty (or however the user left it).
+- ✅ **Adaptive light/dark** (matches the other tabs): **all marks white on dark** (incl. the replicate mean line), dark-outlined on light; `(x0.0001)` SI axis prefixes disabled.
 - ⬜ Worker-thread recompute for large peptide sets; **save named layouts / narrowed feature sets**; clustered-heatmap view; per-feature link into the MS Data tab.
 
 ---
