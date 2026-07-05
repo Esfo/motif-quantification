@@ -146,17 +146,20 @@ reuses the base-mass (`mz*z - proton*z`) nearest-match logic from the original.
   is a generic category. The only special designation is optional and user-made —
   marking one column as the **replicate** column (its runs are averaged; every
   other column is compared, never averaged). Reactive throughout (no run button).
-  Top-left: a **depth-faceted** view of the selected feature — pick which
-  categories nest the plot (Level 1 splits into side-by-side sub-panels, Level 2
-  splits each again…) and which category is the leaf x-axis, so you organize the
-  axes by depth (conditions → time series → …). Top-right: a scatter of **every**
-  feature by **log2 fold change** (a plain log difference between two chosen
-  category values, no statistical test) vs mean log2 abundance; click a point to
-  select. Bottom: a per-file quantity table (columns = the design's files with
-  their category metadata in tooltips) + a unique/non-unique column and a
-  unique-only filter. Theming adapts light/dark; points are white on dark, dark on
-  light. Staged next: worker-thread recompute for large peptide sets, saved
-  layouts, per-feature link into the MS Data tab.
+  Top-left: a **faceted** view of the selected feature driven by a growable
+  **organizer** pseudo-table (no fixed number of levels) — each row picks a
+  category and a mode (*split into columns*, *split into rows*, or *x-axis*); add
+  layers in any order to nest the panels by depth (split by condition → time-series
+  x-axis inside each). Top-right: a scatter of **every** feature by **log2 fold
+  change** (a plain log difference between two chosen category values, no
+  statistical test) vs mean log2 abundance; click a point to select. Bottom: a
+  **long-form** table whose columns are the **experimental-setup columns**
+  (filename + every category) plus the feature id, a unique flag, and the quantity
+  — one row per (feature, file). Search-table filenames (which may carry a
+  `.centroid.mzML` suffix) are matched to the design's `filename` by stripped stem,
+  so the join survives extension differences. Theming adapts light/dark; points are
+  white on dark, dark on light. Staged next: worker-thread recompute for large
+  peptide sets, saved layouts, per-feature link into the MS Data tab.
 - **Motifs** — DE at the motif level (proteins represented by shared skeleton
   motif); include/exclude refinement saved to a new sibling folder (e.g.
   `motif-sets/`) alongside `distributions/` and `searches/`.

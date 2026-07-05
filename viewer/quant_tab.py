@@ -4,29 +4,34 @@ Compare peptide / protein quantities across files, grouped **entirely** by the
 project ``experimental-setup`` file. Nothing about the design is hard-coded: the
 tab reads whatever columns the setup file has and treats every one of them as a
 generic category. The only special designation is optional and made *by the
-user*: marking one column as the **replicate** column (so its runs may be
-averaged; every other column is compared, never averaged).
+user*: marking one column as the **replicate** column (its runs may be averaged;
+every other column is compared, never averaged).
 
 Layout
 ------
 Top half (horizontal split):
-  * **left** — a *faceted* view of the selected feature's quantities. You choose,
-    by depth, which categories nest the plot (Level 1 splits the panel into
-    side-by-side sub-panels, Level 2 splits each of those again, …) and which
-    category forms the x-axis of the leaf plots. This is the "organize the axes
-    by depth" view: pick conditions first → the panel splits per condition, then
-    a time-series/replicate axis inside each, and so on.
+  * **left** — a *faceted* view of the selected feature's quantities. Above the
+    plot is an **organizer** (a small growable pseudo-table): each row picks a
+    category and how it organizes the view — *split into columns*, *split into
+    rows*, or *use as the x-axis*. Add as many layers as you like, in any order,
+    to nest the panels by depth (e.g. split by condition → then a time-series
+    x-axis inside each). There is no fixed number of levels.
   * **right** — a scatter of **every** feature: x = log2 fold change between two
     chosen category values (a plain log difference, no statistical test),
     y = mean log2 abundance. Click a point to select that feature.
 
 Bottom half:
-  * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a table
-    whose columns are the design's files (with their category metadata) showing
-    each feature's per-file quantity, plus a unique/non-unique column.
+  * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a
+    long-form table whose columns are **the experimental-setup columns**
+    (filename + every design category) plus the feature id, a unique flag, and
+    the quantity — one row per (feature, file), so you can see and sort every
+    quantity across conditions and files.
 
-Everything is reactive — changing a category, the replicate column, the contrast,
-or the level re-computes immediately; there is no run button.
+Filenames from the search tables (which may carry a ``.centroid.mzML`` suffix)
+are matched to the design's ``filename`` column by stripped stem, so the join is
+robust to extension differences.
+
+Everything is reactive — no run button.
 """
 
 import math
@@ -36,12 +41,9 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
-    QFormLayout,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTableWidget,
@@ -55,24 +57,30 @@ import pyqtgraph as pg
 try:
     from .quant_model import QuantModel
     from .theming import palette, style_plot
+    from .session import strip_ms_suffix
 except ImportError:
     from quant_model import QuantModel
     from theming import palette, style_plot
+    from session import strip_ms_suffix
 
 
-NONE_LABEL = "(none)"
 FILE_LABEL = "(file)"
-MAX_FACET_LEVELS = 3
+MODE_COLS = "Split → columns"
+MODE_ROWS = "Split ↓ rows"
+MODE_XAXIS = "X-axis"
+MODES = [MODE_COLS, MODE_ROWS, MODE_XAXIS]
 
-
-# Local widget-chrome palette (mirrors proteins_tab) so list/label backgrounds
-# and outlines adapt to the theme too, not just the pyqtgraph plots.
 THEMES = {
     "dark": {"fg": "#e6e6e6", "bg": "#101216", "muted": "#8a8f98",
              "panel": "#16181d", "line": "#2a2d33"},
     "light": {"fg": "#202020", "bg": "#fafafa", "muted": "#606060",
               "panel": "#ffffff", "line": "#c8ccd2"},
 }
+
+
+def _norm(name):
+    """Filename → comparable stem (drop mzML/centroid/raw suffixes, lowercase)."""
+    return strip_ms_suffix(name).lower()
 
 
 def _sorted_values(values):
@@ -126,6 +134,13 @@ class QuantTab(QWidget):
 
         self._categories = [c for c in (experimental.columns() if self._active else [])
                             if c != "filename"]
+        # robust filename join: model filename -> experimental row
+        self._exp_by_norm = {}
+        if self._active:
+            for row in experimental.rows:
+                self._exp_by_norm[_norm(row.get("filename", ""))] = row
+
+        self._layers = []  # list of {"cat": str, "mode": str} organizer rows
 
         self._build_ui()
         if self._active:
@@ -136,21 +151,21 @@ class QuantTab(QWidget):
 
     # ---- design helpers --------------------------------------------------
 
+    def _row_for(self, filename):
+        return self._exp_by_norm.get(_norm(filename), {})
+
+    def _cat_value(self, filename, column):
+        return self._row_for(filename).get(column, "")
+
     def _replicate_column(self):
         col = self.replicate_combo.currentText()
-        return col if col and col != NONE_LABEL else None
+        return col if col in self._categories else None
 
-    def _row_for(self, filename):
-        return self.experimental.by_filename.get(filename, {})
-
-    def _files_with(self, feature):
-        """Files where this feature has a positive quantity."""
-        per_file = self.model.matrix(self.level).get(feature, {})
-        return [f for f, q in per_file.items() if q and q > 0]
+    def _files_in(self, column, value):
+        """Model filenames whose design row has column == value."""
+        return [f for f in self.model.filenames() if self._cat_value(f, column) == value]
 
     def _visible_features(self):
-        """Feature keys currently in scope (respects the unique-only filter for
-        peptides; proteins are already unique-quantified)."""
         matrix = self.model.matrix(self.level)
         feats = list(matrix.keys())
         if self.level == "peptide" and self.unique_only:
@@ -198,52 +213,46 @@ class QuantTab(QWidget):
         self.facet_title.setStyleSheet("font-weight: bold; font-size: 13px;")
         lay.addWidget(self.facet_title)
 
-        # organize-by-depth controls
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Split by depth:"))
-        self.facet_combos = []
-        cat_options = [NONE_LABEL] + self._categories
-        for i in range(MAX_FACET_LEVELS):
-            combo = QComboBox()
-            combo.addItems(cat_options)
-            # sensible default: first level = first category, rest none
-            if i == 0 and self._categories:
-                combo.setCurrentText(self._categories[0])
-            combo.currentTextChanged.connect(self._rebuild_facets)
-            controls.addWidget(QLabel(f"L{i + 1}"))
-            controls.addWidget(combo)
-            self.facet_combos.append(combo)
-
-        controls.addSpacing(12)
-        controls.addWidget(QLabel("X axis:"))
-        self.xaxis_combo = QComboBox()
-        self.xaxis_combo.addItems([FILE_LABEL] + self._categories)
-        if len(self._categories) > 1:
-            self.xaxis_combo.setCurrentText(self._categories[-1])
-        self.xaxis_combo.currentTextChanged.connect(self._rebuild_facets)
-        controls.addWidget(self.xaxis_combo)
-
+        # organizer pseudo-table: growable list of layer rows
+        org_header = QHBoxLayout()
+        org_header.addWidget(QLabel("Organize by (top → bottom = outer → inner):"))
+        org_header.addStretch(1)
         self.logy_check = QCheckBox("log2 Y")
         self.logy_check.setChecked(True)
         self.logy_check.stateChanged.connect(self._rebuild_facets)
-        controls.addWidget(self.logy_check)
-        controls.addStretch(1)
-        lay.addLayout(controls)
-
-        # replicate designation (the only special role, user-chosen)
-        rep_row = QHBoxLayout()
-        rep_row.addWidget(QLabel("Replicate column (averaged; others compared):"))
+        org_header.addWidget(self.logy_check)
+        rep_lbl = QLabel("Replicate:")
+        org_header.addWidget(rep_lbl)
         self.replicate_combo = QComboBox()
-        self.replicate_combo.addItems([NONE_LABEL] + self._categories)
+        self.replicate_combo.addItems(["(none)"] + self._categories)
         self.replicate_combo.currentTextChanged.connect(self._on_replicate_changed)
-        rep_row.addWidget(self.replicate_combo)
-        rep_row.addStretch(1)
-        lay.addLayout(rep_row)
+        org_header.addWidget(self.replicate_combo)
+        lay.addLayout(org_header)
+
+        self.layer_area = QVBoxLayout()
+        self.layer_area.setSpacing(2)
+        layer_holder = QWidget()
+        layer_holder.setLayout(self.layer_area)
+        lay.addWidget(layer_holder)
+
+        add_row = QHBoxLayout()
+        self.add_layer_btn = QPushButton("+ Add layer")
+        self.add_layer_btn.clicked.connect(lambda: self._add_layer())
+        add_row.addWidget(self.add_layer_btn)
+        add_row.addStretch(1)
+        lay.addLayout(add_row)
 
         self.facet_area = QVBoxLayout()
         holder = QWidget()
         holder.setLayout(self.facet_area)
         lay.addWidget(holder, 1)
+
+        # default: split by the first category into columns, x-axis = the last
+        if self._categories:
+            self._add_layer(self._categories[0], MODE_COLS, rebuild=False)
+        if len(self._categories) > 1:
+            self._add_layer(self._categories[-1], MODE_XAXIS, rebuild=False)
+        self._rebuild_layer_rows()
         return panel
 
     def _build_fold_panel(self):
@@ -262,11 +271,11 @@ class QuantTab(QWidget):
         form.addWidget(self.compare_combo)
         form.addWidget(QLabel("A"))
         self.a_combo = QComboBox()
-        self.a_combo.currentTextChanged.connect(self._refresh_fold_change)
+        self.a_combo.currentTextChanged.connect(lambda _: self._refresh_fold_change())
         form.addWidget(self.a_combo)
         form.addWidget(QLabel("B"))
         self.b_combo = QComboBox()
-        self.b_combo.currentTextChanged.connect(self._refresh_fold_change)
+        self.b_combo.currentTextChanged.connect(lambda _: self._refresh_fold_change())
         form.addWidget(self.b_combo)
         form.addStretch(1)
         lay.addLayout(form)
@@ -281,7 +290,6 @@ class QuantTab(QWidget):
         self.fold_status.setStyleSheet("color: #8a8f98;")
         lay.addWidget(self.fold_status)
 
-        # populate A/B for the initial compare column
         if self._categories:
             self._on_compare_changed(self.compare_combo.currentText())
         return panel
@@ -322,6 +330,59 @@ class QuantTab(QWidget):
         lay.addWidget(self.table, 1)
         return panel
 
+    # ---- organizer (dynamic layers) -------------------------------------
+
+    def _add_layer(self, cat=None, mode=None, rebuild=True):
+        if not self._categories:
+            return
+        self._layers.append({
+            "cat": cat or self._categories[0],
+            "mode": mode or MODE_COLS,
+        })
+        if rebuild:
+            self._rebuild_layer_rows()
+            self._rebuild_facets()
+
+    def _remove_layer(self, index):
+        if 0 <= index < len(self._layers):
+            self._layers.pop(index)
+            self._rebuild_layer_rows()
+            self._rebuild_facets()
+
+    def _rebuild_layer_rows(self):
+        # clear existing widgets
+        while self.layer_area.count():
+            item = self.layer_area.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        for i, layer in enumerate(self._layers):
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.addWidget(QLabel(f"{i + 1}."))
+            cat = QComboBox()
+            cat.addItems(self._categories)
+            cat.setCurrentText(layer["cat"])
+            cat.currentTextChanged.connect(lambda v, idx=i: self._set_layer(idx, "cat", v))
+            rl.addWidget(cat, 1)
+            mode = QComboBox()
+            mode.addItems(MODES)
+            mode.setCurrentText(layer["mode"])
+            mode.currentTextChanged.connect(lambda v, idx=i: self._set_layer(idx, "mode", v))
+            rl.addWidget(mode)
+            rm = QPushButton("✕")
+            rm.setFixedWidth(26)
+            rm.clicked.connect(lambda _=False, idx=i: self._remove_layer(idx))
+            rl.addWidget(rm)
+            self.layer_area.addWidget(row)
+
+    def _set_layer(self, index, key, value):
+        if 0 <= index < len(self._layers):
+            self._layers[index][key] = value
+            self._rebuild_facets()
+
     # ---- reactive handlers ----------------------------------------------
 
     def _on_replicate_changed(self, _):
@@ -356,45 +417,46 @@ class QuantTab(QWidget):
         self._refresh_fold_change()
         self._auto_select_first()
 
-    # ---- feature table ---------------------------------------------------
+    # ---- feature table (long form; columns = experimental-setup cols) ----
 
     def _refresh_table(self):
         matrix = self.model.matrix(self.level)
-        files = [f for f in self.model.filenames()]
         feats = self._visible_features()
 
-        # columns: Feature | Unique | one per file
-        headers = ["Feature", "Unique"] + files
+        feat_label = "peptide" if self.level == "peptide" else "protein"
+        headers = [feat_label] + self.experimental.columns() + ["unique", "quantity"]
+        cat_cols = self.experimental.columns()  # includes 'filename'
+
         self.table.setSortingEnabled(False)
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
-        # annotate file headers with their category metadata as a tooltip
-        for ci, f in enumerate(files):
-            item = self.table.horizontalHeaderItem(ci + 2)
-            if item is not None:
-                row = self._row_for(f)
-                meta = ", ".join(f"{c}={row.get(c, '')}" for c in self._categories)
-                item.setToolTip(meta)
+        self.table.setRowCount(0)
 
-        self.table.setRowCount(len(feats))
-        for r, feat in enumerate(feats):
+        rows = []
+        for feat in feats:
+            uniq = ("yes" if (self.level == "protein"
+                              or self.model.peptide_is_unique(feat)) else "no")
+            for fname, q in matrix.get(feat, {}).items():
+                if not q or q <= 0:
+                    continue
+                rows.append((feat, fname, uniq, float(q)))
+
+        self.table.setRowCount(len(rows))
+        for r, (feat, fname, uniq, q) in enumerate(rows):
+            design = self._row_for(fname)
             self.table.setItem(r, 0, QTableWidgetItem(feat))
-            if self.level == "peptide":
-                uniq = "yes" if self.model.peptide_is_unique(feat) else "no"
-            else:
-                uniq = "yes"
-            self.table.setItem(r, 1, QTableWidgetItem(uniq))
-            per_file = matrix.get(feat, {})
-            for ci, f in enumerate(files):
-                q = per_file.get(f)
-                if q and q > 0:
-                    self.table.setItem(r, ci + 2, NumericItem(f"{q:.4g}", float(q)))
-                else:
-                    self.table.setItem(r, ci + 2, NumericItem("", float("nan")))
-        self.table.setSortingEnabled(True)
+            for ci, col in enumerate(cat_cols):
+                # design's own filename value if present, else the model filename
+                val = design.get(col, "") if design else ""
+                if col == "filename" and not val:
+                    val = fname
+                self.table.setItem(r, ci + 1, QTableWidgetItem(val))
+            self.table.setItem(r, 1 + len(cat_cols), QTableWidgetItem(uniq))
+            self.table.setItem(r, 2 + len(cat_cols), NumericItem(f"{q:.4g}", q))
 
+        self.table.setSortingEnabled(True)
         label = "peptides" if self.level == "peptide" else "proteins"
-        self.count_label.setText(f"{len(feats)} {label} × {len(files)} files")
+        self.count_label.setText(f"{len(feats)} {label} · {len(rows)} rows")
 
     def _auto_select_first(self):
         if self.table.rowCount() > 0:
@@ -422,11 +484,8 @@ class QuantTab(QWidget):
     # ---- fold-change scatter (plain log difference) ---------------------
 
     def _group_mean_log2(self, per_file, files):
-        """Mean log2 quantity over ``files`` for one feature.
-
-        When a replicate column is set, replicates (files differing only in the
-        replicate column) are first averaged in linear space, then logged — so
-        replicate runs count once, not N times. Otherwise every file counts."""
+        """Mean log2 quantity over ``files`` for one feature. With a replicate
+        column set, replicates are averaged in linear space first."""
         rep = self._replicate_column()
         vals = []
         if rep:
@@ -434,8 +493,8 @@ class QuantTab(QWidget):
             for f in files:
                 q = per_file.get(f)
                 if q and q > 0:
-                    row = self._row_for(f)
-                    key = tuple((c, row.get(c, "")) for c in self._categories if c != rep)
+                    key = tuple((c, self._cat_value(f, c))
+                                for c in self._categories if c != rep)
                     groups.setdefault(key, []).append(q)
             for qs in groups.values():
                 vals.append(math.log2(sum(qs) / len(qs)))
@@ -460,8 +519,8 @@ class QuantTab(QWidget):
             self.fold_status.setText("Pick a compare column with two distinct values.")
             return
 
-        files_a = set(self.experimental.filenames_for(**{col: a_val}))
-        files_b = set(self.experimental.filenames_for(**{col: b_val}))
+        files_a = self._files_in(col, a_val)
+        files_b = self._files_in(col, b_val)
         matrix = self.model.matrix(self.level)
 
         xs, ys, feats = [], [], []
@@ -477,19 +536,19 @@ class QuantTab(QWidget):
 
         if not xs:
             self.fold_status.setText(
-                f"No features quantified in both {a_val} and {b_val}.")
+                f"No features quantified in both {a_val} (n={len(files_a)}) and "
+                f"{b_val} (n={len(files_b)}).")
             return
 
-        point = pg.mkBrush(pal["points"][0], pal["points"][1], pal["points"][2], 180)
-        outline = pg.mkPen(pal["fg"], width=0.6)
-        scatter = pg.ScatterPlotItem(x=xs, y=ys, brush=point, pen=outline, size=6)
+        pts = pal["points"]
+        scatter = pg.ScatterPlotItem(
+            x=xs, y=ys, size=6,
+            brush=pg.mkBrush(pts[0], pts[1], pts[2], 180),
+            pen=pg.mkPen(pal["fg"], width=0.6))
         scatter.feats = feats
         scatter.sigClicked.connect(self._on_fold_click)
         self.fold_plot.addItem(scatter)
-        self._fold_scatter = scatter
-
-        guide = pg.mkPen(pal["fg"], width=1, style=Qt.DashLine)
-        self.fold_plot.addLine(x=0.0, pen=guide)
+        self.fold_plot.addLine(x=0.0, pen=pg.mkPen(pal["fg"], width=1, style=Qt.DashLine))
         self.fold_plot.setLabel("bottom", f"log2 fold change ({a_val} − {b_val})")
         self.fold_status.setText(
             f"{len(xs)} features · {a_val} (n={len(files_a)}) vs "
@@ -522,69 +581,63 @@ class QuantTab(QWidget):
             return
         self.facet_title.setText(feat)
 
-        levels = []
-        for combo in self.facet_combos:
-            c = combo.currentText()
-            if c != NONE_LABEL and c not in levels:
-                levels.append(c)
+        splits = [l for l in self._layers if l["mode"] in (MODE_COLS, MODE_ROWS)]
+        xaxis = next((l["cat"] for l in self._layers if l["mode"] == MODE_XAXIS), None)
 
-        matrix = self.model.matrix(self.level)
-        per_file = matrix.get(feat, {})
+        per_file = self.model.matrix(self.level).get(feat, {})
         files = [f for f in self.model.filenames() if per_file.get(f)]
-        widget = self._facet_node(feat, per_file, files, levels)
+        widget = self._facet_node(feat, per_file, files, splits, 0, xaxis)
         self.facet_area.addWidget(widget)
 
-    def _facet_node(self, feat, per_file, files, levels):
-        if not levels or not files:
-            return self._leaf_plot(feat, per_file, files)
-        col = levels[0]
-        values = _sorted_values({self._row_for(f).get(col, "") for f in files})
-        split = QSplitter(Qt.Horizontal)
+    def _facet_node(self, feat, per_file, files, splits, depth, xaxis):
+        if depth >= len(splits) or not files:
+            return self._leaf_plot(feat, per_file, files, xaxis)
+        layer = splits[depth]
+        col = layer["cat"]
+        orient = Qt.Horizontal if layer["mode"] == MODE_COLS else Qt.Vertical
+        values = _sorted_values({self._cat_value(f, col) for f in files})
         pal = THEMES["dark" if self.theme != "light" else "light"]
+        split = QSplitter(orient)
         for v in values:
-            sub = [f for f in files if self._row_for(f).get(col, "") == v]
+            sub = [f for f in files if self._cat_value(f, col) == v]
             wrap = QWidget()
             wlay = QVBoxLayout(wrap)
             wlay.setContentsMargins(2, 2, 2, 2)
-            head = QLabel(f"{col} = {v}")
+            head = QLabel(f"{col} = {v}" if v != "" else f"{col} = (blank)")
             head.setAlignment(Qt.AlignCenter)
             head.setStyleSheet(
                 f"color: {pal['fg']}; font-weight: bold; "
                 f"border-bottom: 1px solid {pal['line']};")
             wlay.addWidget(head)
-            wlay.addWidget(self._facet_node(feat, per_file, sub, levels[1:]), 1)
+            wlay.addWidget(self._facet_node(feat, per_file, sub, splits, depth + 1, xaxis), 1)
             split.addWidget(wrap)
         return split
 
-    def _leaf_plot(self, feat, per_file, files):
+    def _leaf_plot(self, feat, per_file, files, xaxis):
         plot = pg.PlotWidget()
         style_plot(plot, palette(self.theme))
         for name in ("left", "bottom"):
             plot.getAxis(name).enableAutoSIPrefix(False)
         logy = self.logy_check.isChecked()
         plot.setLabel("left", "log2 quantity" if logy else "quantity")
-        xcol = self.xaxis_combo.currentText()
         pal = palette(self.theme)
         rep = self._replicate_column()
+        xcol = xaxis if xaxis in self._categories else None
 
         def yval(q):
             return math.log2(q) if logy else q
 
-        if xcol == FILE_LABEL:
-            xcol = None
-
-        # bucket files by x value
         buckets = {}
         for f in files:
             q = per_file.get(f)
             if not q or q <= 0:
                 continue
-            xv = self._row_for(f).get(xcol, "") if xcol else f
+            xv = self._cat_value(f, xcol) if xcol else f
             buckets.setdefault(xv, []).append(q)
 
         xvals = _sorted_values(list(buckets.keys()))
         xindex = {v: i for i, v in enumerate(xvals)}
-        point = (pal["points"][0], pal["points"][1], pal["points"][2])
+        pts = pal["points"]
 
         sx, sy, mx, my = [], [], [], []
         for xv in xvals:
@@ -593,17 +646,19 @@ class QuantTab(QWidget):
             for q in qs:
                 sx.append(i)
                 sy.append(yval(q))
-            # mean marker (linear-mean then transform, so replicates average)
             mean_q = sum(qs) / len(qs)
             mx.append(i)
             my.append(yval(mean_q))
 
         plot.plot(sx, sy, pen=None, symbol="o", symbolSize=7,
-                  symbolBrush=pg.mkBrush(*point, 220),
+                  symbolBrush=pg.mkBrush(pts[0], pts[1], pts[2], 220),
                   symbolPen=pg.mkPen(pal["fg"], width=0.5))
         if rep and len(mx) > 1:
             plot.plot(mx, my, pen=pg.mkPen(pal["accent"], width=2))
-        plot.getAxis("bottom").setTicks([list(enumerate(xvals))])
+        # short tick labels (avoid long filenames overflowing)
+        ticks = [(i, (v if len(str(v)) <= 14 else str(v)[:12] + "…"))
+                 for i, v in enumerate(xvals)]
+        plot.getAxis("bottom").setTicks([ticks])
         plot.setLabel("bottom", xcol if xcol else "file")
         return plot
 
