@@ -21,16 +21,17 @@ Top half (horizontal split):
     y = mean log2 abundance. Click a point to select that feature.
 
 Bottom half:
-  * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a table
-    that is **flat by default and pivots on demand**. With **no Nested Layers**
-    (the default) it shows the full flat view: one column per distinct value of
-    every category, side by side, all visible immediately. Adding **Nested Layers**
-    (ordered dropdowns — layer 1 outermost, "+ Add layer" appends the next) *pivots*
-    that same data into nested combinations with a spanning multi-level header (e.g.
-    condition over replicate). Fixed ``feature`` + ``unique`` columns lead. Each cell
-    is the feature's quantity **averaged across every file in that column** (zeros/
-    missing never averaged in); a cell that averaged ≥2 files is shaded grey.
-    Independent of the panel-1 organizer and of the replicate designation.
+  * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a **cross-tab
+    pivot**. With **no Nested Layers** it is flat: one column per distinct value of
+    every category (A, B, 1, 2, 3…). Adding a layer promotes that category to a
+    nested **super-column** and organizes every *other* category's value-columns
+    underneath it — layer=LETTERS turns A,B,1,2,3 into A:(1,2,3), B:(1,2,3). More
+    layers nest further (outer→inner). Fixed ``feature`` + ``unique`` columns lead.
+    Each cell is the feature's quantity **averaged across the files matching that
+    super-path and sub-value** (zeros/missing never averaged in); a cell that
+    averaged ≥2 files is shaded grey. A column is committed via "+ Add layer" (a
+    pending "(choose column)" dropdown never auto-pivots). Independent of the
+    panel-1 organizer and of the replicate designation.
 
 An optional **Normalize** mode (median-center) shifts each file so its median
 log2 quantity matches the grand median, correcting systematic per-run intensity
@@ -764,18 +765,23 @@ class QuantTab(QWidget):
     # ---- feature table (nested pivot driven by the Nested Layers) --------
 
     def _columns_and_paths(self):
-        """Return ``(columns, paths, nlevels, tooltips)`` for the current table.
+        """Return ``(columns, paths, nlevels, tooltips)`` for the current table — a
+        proper cross-tab pivot.
 
-        No Nested Layers → the FLAT full view: one column per distinct value of
-        every category, side by side (paths are single-element, header stays flat).
-        With Nested Layers → PIVOT: leaf columns = unique combinations of the
-        layers' values, with a spanning multi-level header. Either way each column
-        carries the list of files that feed it (averaged, non-zero, in the cells)."""
+        The **layers** become nested **super-columns** (outer→inner) using their
+        values; **every other category's value-columns** sit underneath as the leaf
+        (sub) columns. So with no layers you get the flat view (one column per value
+        of every category); adding layer=condition turns condition's values into
+        super-columns and organizes the remaining value-columns under each — e.g.
+        columns A,B,1,2,3 with layer LETTERS → A:(1,2,3), B:(1,2,3). Each column's
+        cell averages the files matching that super-path **and** that sub-value."""
         files = self.model.filenames()
-        levels = []
+        levels, seen = [], set()
         for c in self._nest_layers:
-            if c in self._categories and c not in levels:
+            if c in self._categories and c not in seen:
+                seen.add(c)
                 levels.append(c)
+        others = [c for c in self._categories if c not in seen]
 
         def key(vals):
             out = []
@@ -786,23 +792,40 @@ class QuantTab(QWidget):
                     out.append((1, str(v)))
             return tuple(out)
 
-        if not levels:
-            columns, paths, tips = [], [], []
-            for cat in self._categories:
-                for v in _sorted_values({self._cat_value(f, cat) for f in files
-                                         if self._cat_value(f, cat) != ""}):
-                    columns.append([f for f in files if self._cat_value(f, cat) == v])
-                    paths.append((v,))
-                    tips.append(f"{cat} = {v}")
-            return columns, paths, 1, tips
+        # super-column combinations (those that actually occur in the data)
+        if levels:
+            super_map = {}
+            for f in files:
+                super_map.setdefault(tuple(self._cat_value(f, c) for c in levels), []).append(f)
+            supers = sorted(super_map, key=key)
+        else:
+            super_map, supers = {(): list(files)}, [()]
 
-        leaf_files = {}
-        for f in files:
-            leaf_files.setdefault(tuple(self._cat_value(f, c) for c in levels), []).append(f)
-        leaves = sorted(leaf_files.keys(), key=key)
-        columns = [leaf_files[p] for p in leaves]
-        tips = [" / ".join(f"{lvl} = {val}" for lvl, val in zip(levels, p)) for p in leaves]
-        return columns, list(leaves), len(levels), tips
+        # leaf (sub) columns = the flat value-columns of the non-layer categories
+        subs = []
+        for cat in others:
+            for v in _sorted_values({self._cat_value(f, cat) for f in files
+                                     if self._cat_value(f, cat) != ""}):
+                subs.append((cat, v))
+
+        columns, paths, tips = [], [], []
+        if subs:
+            nlevels = len(levels) + 1
+            for combo in supers:
+                sfiles = super_map[combo]
+                sup_tip = " / ".join(f"{c} = {v}" for c, v in zip(levels, combo))
+                for subcat, subval in subs:
+                    columns.append([f for f in sfiles if self._cat_value(f, subcat) == subval])
+                    paths.append(tuple(combo) + (subval,))
+                    tips.append((sup_tip + " / " if sup_tip else "") + f"{subcat} = {subval}")
+        else:
+            # every category is a layer → leaves are the super-combinations themselves
+            nlevels = max(1, len(levels))
+            for combo in supers:
+                columns.append(super_map[combo])
+                paths.append(tuple(combo) if combo else ("(all)",))
+                tips.append(" / ".join(f"{c} = {v}" for c, v in zip(levels, combo)))
+        return columns, paths, nlevels, tips
 
     def _refresh_table(self):
         matrix = self._matrix()
@@ -968,8 +991,7 @@ class QuantTab(QWidget):
         self.fold_plot.addLine(x=0.0, pen=pg.mkPen(pal["fg"], width=1, style=Qt.DashLine))
         self.fold_plot.setLabel("bottom", f"log2 fold change ({a_val} − {b_val})")
         self.fold_status.setText(
-            f"{len(xs)} features · {a_val} (n={len(files_a)}) vs "
-            f"{b_val} (n={len(files_b)})")
+            f"{a_val} (n={len(files_a)}) vs {b_val} (n={len(files_b)})")
 
     def _on_fold_click(self, scatter, points):
         if not points:
