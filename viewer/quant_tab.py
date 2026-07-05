@@ -80,6 +80,7 @@ except ImportError:
 
 FILE_LABEL = "(file)"
 CHOOSE_LABEL = "(choose column)"
+REMOVE_LABEL = "(remove column)"
 MODE_COLS = "Split → columns"
 MODE_ROWS = "Split ↓ rows"
 MODE_XAXIS = "X-axis"
@@ -297,6 +298,9 @@ class QuantTab(QWidget):
         # column); the user pivots by adding layers. Deliberately not persisted, so
         # startup is never pinned to a previously-chosen pivot.
         self._nest_layers = []
+        # Categories removed from the table entirely (their columns — and any layer
+        # — disappear); re-added from their ✕ button. Table-only; not persisted.
+        self._excluded = set()
 
         self._build_ui()
         if self._active:
@@ -584,8 +588,20 @@ class QuantTab(QWidget):
         self.add_nest_btn.clicked.connect(self._add_nest)
         nest_row.addWidget(self.add_nest_btn)
         nest_row.addStretch(1)
+
+        # Right-aligned: remove whole categories from the table. Each removed one
+        # becomes a "<column> ✕" button to bring it back.
+        self.excluded_area = QHBoxLayout()
+        nest_row.addLayout(self.excluded_area)
+        nest_row.addWidget(QLabel("Remove column:"))
+        self.remove_combo = QComboBox()
+        self.remove_combo.setMinimumWidth(130)
+        self.remove_combo.currentTextChanged.connect(self._on_remove_selected)
+        nest_row.addWidget(self.remove_combo)
+
         lay.addLayout(nest_row)
         self._rebuild_nest_rows()
+        self._rebuild_excluded()
 
         self.table = QTableWidget()
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -709,6 +725,51 @@ class QuantTab(QWidget):
             self._refresh_table()
             self._save_state()
 
+    # ---- removed columns -------------------------------------------------
+
+    def _available_categories(self):
+        return [c for c in self._categories if c not in self._excluded]
+
+    def _rebuild_excluded(self):
+        while self.excluded_area.count():
+            item = self.excluded_area.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for cat in [c for c in self._categories if c in self._excluded]:
+            btn = QPushButton(f"{cat}  ✕")
+            btn.setToolTip(f"Bring '{cat}' back into the table")
+            btn.clicked.connect(lambda _=False, c=cat: self._include_column(c))
+            self.excluded_area.addWidget(btn)
+
+        avail = self._available_categories()
+        # repopulate the Remove dropdown (blocked so it doesn't fire on rebuild)
+        self.remove_combo.blockSignals(True)
+        self.remove_combo.clear()
+        self.remove_combo.addItems([REMOVE_LABEL] + avail)
+        self.remove_combo.blockSignals(False)
+        # keep the pending layer dropdown in sync with what's still available
+        if getattr(self, "pending_combo", None) is not None:
+            cur = self.pending_combo.currentText()
+            self.pending_combo.blockSignals(True)
+            self.pending_combo.clear()
+            self.pending_combo.addItems([CHOOSE_LABEL] + avail)
+            self.pending_combo.setCurrentText(cur if cur in avail else CHOOSE_LABEL)
+            self.pending_combo.blockSignals(False)
+
+    def _on_remove_selected(self, cat):
+        if cat in self._categories and cat not in self._excluded:
+            self._excluded.add(cat)
+            self._nest_layers = [c for c in self._nest_layers if c != cat]
+            self._rebuild_nest_rows()
+            self._rebuild_excluded()   # also resets the dropdown to its placeholder
+            self._refresh_table()
+
+    def _include_column(self, cat):
+        self._excluded.discard(cat)
+        self._rebuild_excluded()
+        self._refresh_table()
+
     # ---- reactive handlers ----------------------------------------------
 
     def _on_logy_changed(self, _):
@@ -778,10 +839,11 @@ class QuantTab(QWidget):
         files = self.model.filenames()
         levels, seen = [], set()
         for c in self._nest_layers:
-            if c in self._categories and c not in seen:
+            if c in self._categories and c not in self._excluded and c not in seen:
                 seen.add(c)
                 levels.append(c)
-        others = [c for c in self._categories if c not in seen]
+        others = [c for c in self._categories
+                  if c not in seen and c not in self._excluded]
 
         def key(vals):
             out = []
@@ -956,7 +1018,6 @@ class QuantTab(QWidget):
         a_val = self.a_combo.currentText()
         b_val = self.b_combo.currentText()
         if not col or not a_val or not b_val or a_val == b_val:
-            self.fold_status.setText("Pick a compare column with two distinct values.")
             return
 
         files_a = self._files_in(col, a_val)
@@ -975,9 +1036,6 @@ class QuantTab(QWidget):
             feats.append(feat)
 
         if not xs:
-            self.fold_status.setText(
-                f"No features quantified in both {a_val} (n={len(files_a)}) and "
-                f"{b_val} (n={len(files_b)}).")
             return
 
         pts = pal["points"]
@@ -990,8 +1048,6 @@ class QuantTab(QWidget):
         self.fold_plot.addItem(scatter)
         self.fold_plot.addLine(x=0.0, pen=pg.mkPen(pal["fg"], width=1, style=Qt.DashLine))
         self.fold_plot.setLabel("bottom", f"log2 fold change ({a_val} − {b_val})")
-        self.fold_status.setText(
-            f"{a_val} (n={len(files_a)}) vs {b_val} (n={len(files_b)})")
 
     def _on_fold_click(self, scatter, points):
         if not points:
@@ -1017,6 +1073,8 @@ class QuantTab(QWidget):
         feat = self.selected_feature
         if not feat:
             self.facet_title.setText("Select a feature below")
+            if getattr(self, "fold_status", None) is not None:
+                self.fold_status.setText("")
             return
         self.facet_title.setText(feat)
 
@@ -1044,6 +1102,30 @@ class QuantTab(QWidget):
         self.facet_area.addWidget(widget)
 
         self._link_facet_axes()
+        self._update_facet_status(feat, files)
+
+    def _update_facet_status(self, feat, files):
+        """Describe the categories currently organizing panel 1 (the split and
+        x-axis columns), each value with its sample size, adapting as the organizer
+        changes — e.g. "condition: keloid (n=14), … · fraction: NaCl (n=17), …"."""
+        if getattr(self, "fold_status", None) is None:
+            return
+        cats = []
+        for l in self._layers:
+            if (l["mode"] in (MODE_COLS, MODE_ROWS, MODE_XAXIS)
+                    and l["cat"] in self._categories and l["cat"] not in cats):
+                cats.append(l["cat"])
+        if not cats:
+            self.fold_status.setText("")
+            return
+        parts = []
+        for cat in cats:
+            vals = _sorted_values({self._cat_value(f, cat) for f in files
+                                   if self._cat_value(f, cat) != ""})
+            vp = [f"{v} (n={sum(1 for f in files if self._cat_value(f, cat) == v)})"
+                  for v in vals]
+            parts.append(f"{cat}: " + ", ".join(vp))
+        self.fold_status.setText("     ·     ".join(parts))
 
     def _link_facet_axes(self):
         """Share X and Y across every leaf plot in the grid: link their views and
