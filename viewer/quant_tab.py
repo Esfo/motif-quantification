@@ -432,9 +432,9 @@ class QuantTab(QWidget):
         org_header = QHBoxLayout()
         org_header.addWidget(QLabel("Organize by (top → bottom = outer → inner):"))
         org_header.addStretch(1)
-        self.theme_btn = QPushButton("Light / Dark")
-        self.theme_btn.setToolTip("Toggle light/dark theme")
-        self.theme_btn.clicked.connect(self._toggle_theme_clicked)
+        self.theme_btn = QPushButton("Light Mode" if self.theme != "light" else "Dark Mode")
+        self.theme_btn.setFixedWidth(90)
+        self.theme_btn.clicked.connect(lambda: self.on_theme_toggle and self.on_theme_toggle())
         org_header.addWidget(self.theme_btn)
         org_header.addWidget(QLabel("Normalize:"))
         self.normalize_combo = QComboBox()
@@ -652,6 +652,10 @@ class QuantTab(QWidget):
     # ---- table nested layers --------------------------------------------
 
     def _rebuild_nest_rows(self):
+        # Always keep at least one layer dropdown visible; an unset "(choose
+        # column)" layer means the table stays flat until the user picks.
+        if not self._nest_layers:
+            self._nest_layers = [CHOOSE_LABEL]
         while self.nest_area.count():
             item = self.nest_area.takeAt(0)
             w = item.widget()
@@ -1119,14 +1123,12 @@ class QuantTab(QWidget):
 
     # ---- theming ---------------------------------------------------------
 
-    def _toggle_theme_clicked(self):
-        if callable(self.on_theme_toggle):
-            self.on_theme_toggle()
-
     def apply_theme(self, theme):
         self.theme = theme
         if not self._active:
             return
+        if getattr(self, "theme_btn", None) is not None:
+            self.theme_btn.setText("Light Mode" if theme != "light" else "Dark Mode")
         pal = palette(theme)
         if getattr(self, "fold_plot", None) is not None:
             style_plot(self.fold_plot, pal)
