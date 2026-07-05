@@ -288,13 +288,7 @@ class QuantTab(QWidget):
         outer.setContentsMargins(4, 4, 4, 4)
 
         if not self._active:
-            warn = QLabel(
-                "No experimental-setup file found for this project.\n\n"
-                "Quantitative Comparisons groups runs entirely from the project's "
-                "experimental-setup csv (its first column is the mzML filename; "
-                "every other column is a category you can compare or facet by). "
-                "Add one beside distributions/ and searches/, then reload.")
-            warn.setWordWrap(True)
+            warn = QLabel("Double-click to open a folder")
             warn.setAlignment(Qt.AlignCenter)
             outer.addWidget(warn)
             return
