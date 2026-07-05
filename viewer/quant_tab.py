@@ -77,13 +77,6 @@ MODE_ROWS = "Split ↓ rows"
 MODE_XAXIS = "X-axis"
 MODES = [MODE_COLS, MODE_ROWS, MODE_XAXIS]
 
-THEMES = {
-    "dark": {"fg": "#e6e6e6", "bg": "#101216", "muted": "#8a8f98",
-             "panel": "#16181d", "line": "#2a2d33"},
-    "light": {"fg": "#202020", "bg": "#fafafa", "muted": "#606060",
-              "panel": "#ffffff", "line": "#c8ccd2"},
-}
-
 
 def _norm(name):
     """Filename → comparable stem (drop mzML/centroid/raw suffixes, lowercase)."""
@@ -802,34 +795,25 @@ class QuantTab(QWidget):
 
         per_file = self._matrix().get(feat, {})
         files = [f for f in self.model.filenames() if per_file.get(f)]
-        widget = self._facet_node(feat, per_file, files, splits, 0, xaxis)
+        widget = self._facet_node(feat, per_file, files, splits, 0, xaxis, [])
         self.facet_area.addWidget(widget)
 
-    def _facet_node(self, feat, per_file, files, splits, depth, xaxis):
+    def _facet_node(self, feat, per_file, files, splits, depth, xaxis, path):
         if depth >= len(splits) or not files:
-            return self._leaf_plot(feat, per_file, files, xaxis)
+            return self._leaf_plot(feat, per_file, files, xaxis, path)
         layer = splits[depth]
         col = layer["cat"]
         orient = Qt.Horizontal if layer["mode"] == MODE_COLS else Qt.Vertical
         values = _sorted_values({self._cat_value(f, col) for f in files})
-        pal = THEMES["dark" if self.theme != "light" else "light"]
         split = QSplitter(orient)
         for v in values:
             sub = [f for f in files if self._cat_value(f, col) == v]
-            wrap = QWidget()
-            wlay = QVBoxLayout(wrap)
-            wlay.setContentsMargins(2, 2, 2, 2)
-            head = QLabel(f"{col} = {v}" if v != "" else f"{col} = (blank)")
-            head.setAlignment(Qt.AlignCenter)
-            head.setStyleSheet(
-                f"color: {pal['fg']}; font-weight: bold; "
-                f"border-bottom: 1px solid {pal['line']};")
-            wlay.addWidget(head)
-            wlay.addWidget(self._facet_node(feat, per_file, sub, splits, depth + 1, xaxis), 1)
-            split.addWidget(wrap)
+            child = self._facet_node(feat, per_file, sub, splits, depth + 1,
+                                     xaxis, path + [(col, v)])
+            split.addWidget(child)
         return split
 
-    def _leaf_plot(self, feat, per_file, files, xaxis):
+    def _leaf_plot(self, feat, per_file, files, xaxis, path):
         logy = self.logy_check.isChecked()
         pal = palette(self.theme)
         rep = self._replicate_column()
@@ -862,6 +846,12 @@ class QuantTab(QWidget):
         for name in ("left", "bottom"):
             plot.getAxis(name).enableAutoSIPrefix(False)
         plot.setLabel("left", "log2 quantity" if logy else "quantity")
+        # Title names the split slice this sub-plot represents (the full path of
+        # column=value choices that led here), so every panel is self-describing.
+        if path:
+            title = " / ".join(f"{c} = {v if v != '' else '(blank)'}"
+                               for c, v in path)
+            plot.setTitle(title, color=pal["fg"], size="10pt")
 
         xindex = {v: i for i, v in enumerate(xvals)}
         pts = pal["points"]
