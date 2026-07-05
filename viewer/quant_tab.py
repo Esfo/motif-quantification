@@ -21,15 +21,16 @@ Top half (horizontal split):
     y = mean log2 abundance. Click a point to select that feature.
 
 Bottom half:
-  * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a **pivot
-    table** whose columns are driven by **Nested Layers** — an ordered set of
-    dropdowns (layer 1 = outermost, layer 2 nested inside it, …; "+ Add layer"
-    appends the next). Fixed ``feature`` + ``unique`` columns lead; then the sample
-    groups as a spanning header of the chosen layers' *values* (e.g. condition over
-    replicate). Each cell is the feature's quantity **averaged across every file in
-    that leaf** (zeros/missing never averaged in); a cell that averaged ≥2 files is
-    shaded grey. Defaults to one layer so columns show immediately. Independent of
-    the panel-1 organizer and of the replicate designation.
+  * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a table
+    that is **flat by default and pivots on demand**. With **no Nested Layers**
+    (the default) it shows the full flat view: one column per distinct value of
+    every category, side by side, all visible immediately. Adding **Nested Layers**
+    (ordered dropdowns — layer 1 outermost, "+ Add layer" appends the next) *pivots*
+    that same data into nested combinations with a spanning multi-level header (e.g.
+    condition over replicate). Fixed ``feature`` + ``unique`` columns lead. Each cell
+    is the feature's quantity **averaged across every file in that column** (zeros/
+    missing never averaged in); a cell that averaged ≥2 files is shaded grey.
+    Independent of the panel-1 organizer and of the replicate designation.
 
 An optional **Normalize** mode (median-center) shifts each file so its median
 log2 quantity matches the grand median, correcting systematic per-run intensity
@@ -176,6 +177,26 @@ class GroupedHeaderView(QHeaderView):
             p.drawText(rect, Qt.AlignCenter, self._corners[c])
 
         fm = self.fontMetrics()
+
+        # Flat view (single level): draw each data column with its own value, no
+        # merging (values from different categories must not span together).
+        if self._nlevels == 1:
+            for c in range(nfixed, n):
+                path = self._paths[c] if c < len(self._paths) else None
+                if path is None:
+                    continue
+                x0 = self.sectionViewportPosition(c)
+                rect = QRect(int(x0), 0, int(self.sectionSize(c)), int(lh))
+                p.setPen(QPen(self._line))
+                p.drawRect(rect)
+                val = path[0] if path else ""
+                label = str(val) if val != "" else "(blank)"
+                p.setPen(QPen(self._fg))
+                p.drawText(rect, Qt.AlignCenter,
+                           fm.elidedText(label, Qt.ElideRight, rect.width() - 4))
+            p.end()
+            return
+
         for level in range(self._nlevels):
             c = nfixed
             while c < n:
@@ -270,12 +291,10 @@ class QuantTab(QWidget):
 
         # Table nesting layers — an ordered list of categories (layer 1 = outermost).
         # INDEPENDENT of the panel-1 organizer and of the replicate designation.
-        # Defaults to the first category so columns are visible immediately.
-        saved_layers = [c for c in self._saved.get("nest_layers", []) if c in self._categories]
-        if saved_layers:
-            self._nest_layers = saved_layers
-        else:
-            self._nest_layers = [self._categories[0]] if self._categories else []
+        # DEFAULT IS EMPTY: with no layers the table shows the full flat view (every
+        # category value as a column); adding layers PIVOTS that same data.
+        self._nest_layers = [c for c in self._saved.get("nest_layers", [])
+                             if c in self._categories]
 
         self._build_ui()
         if self._active:
@@ -724,35 +743,52 @@ class QuantTab(QWidget):
 
     # ---- feature table (nested pivot driven by the Nested Layers) --------
 
-    def _refresh_table(self):
-        matrix = self._matrix()
-        feats = self._visible_features()
-        feat_label = "peptide" if self.level == "peptide" else "protein"
+    def _columns_and_paths(self):
+        """Return ``(columns, paths, nlevels, tooltips)`` for the current table.
 
-        # Nesting levels (dedup, in order). Each leaf column = a unique combination
-        # of the levels' values; files sharing a leaf are averaged (non-zero only).
+        No Nested Layers → the FLAT full view: one column per distinct value of
+        every category, side by side (paths are single-element, header stays flat).
+        With Nested Layers → PIVOT: leaf columns = unique combinations of the
+        layers' values, with a spanning multi-level header. Either way each column
+        carries the list of files that feed it (averaged, non-zero, in the cells)."""
+        files = self.model.filenames()
         levels = []
         for c in self._nest_layers:
             if c in self._categories and c not in levels:
                 levels.append(c)
 
-        files = self.model.filenames()
-        leaf_files = {}
-        for f in files:
-            path = tuple(self._cat_value(f, c) for c in levels)
-            leaf_files.setdefault(path, []).append(f)
-
-        def leaf_key(path):
+        def key(vals):
             out = []
-            for v in path:
+            for v in vals:
                 try:
                     out.append((0, float(v)))
                 except (TypeError, ValueError):
                     out.append((1, str(v)))
             return tuple(out)
 
-        leaves = sorted(leaf_files.keys(), key=leaf_key) if levels else []
-        nlevels = max(1, len(levels))
+        if not levels:
+            columns, paths, tips = [], [], []
+            for cat in self._categories:
+                for v in _sorted_values({self._cat_value(f, cat) for f in files
+                                         if self._cat_value(f, cat) != ""}):
+                    columns.append([f for f in files if self._cat_value(f, cat) == v])
+                    paths.append((v,))
+                    tips.append(f"{cat} = {v}")
+            return columns, paths, 1, tips
+
+        leaf_files = {}
+        for f in files:
+            leaf_files.setdefault(tuple(self._cat_value(f, c) for c in levels), []).append(f)
+        leaves = sorted(leaf_files.keys(), key=key)
+        columns = [leaf_files[p] for p in leaves]
+        tips = [" / ".join(f"{lvl} = {val}" for lvl, val in zip(levels, p)) for p in leaves]
+        return columns, list(leaves), len(levels), tips
+
+    def _refresh_table(self):
+        matrix = self._matrix()
+        feats = self._visible_features()
+        feat_label = "peptide" if self.level == "peptide" else "protein"
+        columns, paths, nlevels, tips = self._columns_and_paths()
 
         grey = QColor(150, 150, 150, 235)   # opaque grey = an average of ≥2 files
         dark = QColor("#101216")
@@ -761,9 +797,12 @@ class QuantTab(QWidget):
         nfixed = len(fixed)
 
         self.table.setSortingEnabled(False)
-        self.table.setColumnCount(nfixed + len(leaves))
-        self.table.setHorizontalHeaderLabels(
-            fixed + [str(p[-1]) for p in leaves])   # header painting is grouped
+        self.table.setColumnCount(nfixed + len(columns))
+        self.table.setHorizontalHeaderLabels(fixed + [str(p[-1]) for p in paths])
+        for ci, tip in enumerate(tips):
+            hi = self.table.horizontalHeaderItem(nfixed + ci)
+            if hi is not None:
+                hi.setToolTip(tip)
         self.table.setRowCount(len(feats))
 
         for r, feat in enumerate(feats):
@@ -776,8 +815,8 @@ class QuantTab(QWidget):
             uitem.setTextAlignment(center)
             self.table.setItem(r, 1, uitem)
             per = matrix.get(feat, {})
-            for ci, path in enumerate(leaves):
-                qs = [per.get(f) for f in leaf_files[path]]
+            for ci, colfiles in enumerate(columns):
+                qs = [per.get(f) for f in colfiles]
                 qs = [q for q in qs if q and q > 0]   # never average in zeros
                 if not qs:
                     it = NumericItem("", float("nan"))
@@ -792,12 +831,13 @@ class QuantTab(QWidget):
         self.table.setSortingEnabled(True)
 
         fg, bg, line = self._chrome()
-        self._header.set_structure([None] * nfixed + list(leaves), nlevels,
+        self._header.set_structure([None] * nfixed + list(paths), nlevels,
                                    fixed, fg, bg, line)
-        self._size_columns(feats, leaves)
+        self._size_columns(feats, paths)
 
         label = "peptides" if self.level == "peptide" else "proteins"
-        self.count_label.setText(f"{len(feats)} {label} · {len(leaves)} groups")
+        kind = "value columns" if nlevels == 1 else "groups"
+        self.count_label.setText(f"{len(feats)} {label} · {len(columns)} {kind}")
 
     def _chrome(self):
         if self.theme == "light":
