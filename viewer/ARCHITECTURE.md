@@ -25,6 +25,8 @@ sqlite and the experimental-setup file.
 | `main_window.py` | window chrome, 4-tab shell, folder open/reload, theme, dock-layout persistence, distributions/experimental auto-detect |
 | `ms_viewer_tab.py` | **Tab 1** dock workspace (lists, panels 1–3, table 1) |
 | `proteins_tab.py` | **Tab 2** protein sequence viewer: file selector + FDR + protein list, panel 1 (horizontal sequence, peptide rectangles coloured by q-value, All button) over panel 2 (same protein verticalized per-file, click a column to load it in panel 1) |
+| `quant_tab.py` | **Tab 3** Quantitative Comparisons: depth-faceted per-feature view + all-features fold-change scatter over the top half; per-file quantity table with a Peptides⇄Proteins switch + unique filter across the bottom. Fully generic over the experimental-setup columns (no hard-coded column names); reactive (no run button) |
+| `quant_model.py` | builds/caches the feature×file quantity matrix — peptide level (charge/mod variants summed, unique flag per peptide) or protein level (**unique quantification**: unique peptides only) |
 | `session.py` | reads the `reorganized/` tables (files, PSMs, peptides, proteins, quant) + the project FASTA (protein sequences) and in-silico tryptic digestion (Tab 2) |
 | `mzml_store.py` | indexed mzML reader: metadata (no array decode), random-access scans, `extract_xics`, `extract_region` |
 | `region_view.py` | standalone bounded 2D heatmap + 3D region (`RegionWorker` thread is reused by Tab 1) |
@@ -138,8 +140,26 @@ reuses the base-mass (`mz*z - proton*z`) nearest-match logic from the original.
 - **Proteins** — whole sequences with peptide coverage coloured by q-value on the
   shared q-value colour scale; single-file or verticalized side-by-side; block
   chunks proportional to peptide length when zoomed out.
-- **File comparison** — quantitative peptide/protein comparison across files;
-  time series + DE; reads `experimental-setup` for grouping/contrasts.
+- **Quantitative Comparisons** (wired) — quantitative peptide/protein comparison
+  across files, grouped **entirely** by the `experimental-setup` columns with **no
+  hard-coded column names**: the first column is the filename, every other column
+  is a generic category. The only special designation is optional and user-made —
+  marking one column as the **replicate** column (its runs are averaged; every
+  other column is compared, never averaged). Reactive throughout (no run button).
+  Top-left: a **faceted** view of the selected feature driven by a growable
+  **organizer** pseudo-table (no fixed number of levels) — each row picks a
+  category and a mode (*split into columns*, *split into rows*, or *x-axis*); add
+  layers in any order to nest the panels by depth (split by condition → time-series
+  x-axis inside each). Top-right: a scatter of **every** feature by **log2 fold
+  change** (a plain log difference between two chosen category values, no
+  statistical test) vs mean log2 abundance; click a point to select. Bottom: a
+  **long-form** table whose columns are the **experimental-setup columns**
+  (filename + every category) plus the feature id, a unique flag, and the quantity
+  — one row per (feature, file). Search-table filenames (which may carry a
+  `.centroid.mzML` suffix) are matched to the design's `filename` by stripped stem,
+  so the join survives extension differences. Theming adapts light/dark; points are
+  white on dark, dark on light. Staged next: worker-thread recompute for large
+  peptide sets, saved layouts, per-feature link into the MS Data tab.
 - **Motifs** — DE at the motif level (proteins represented by shared skeleton
   motif); include/exclude refinement saved to a new sibling folder (e.g.
   `motif-sets/`) alongside `distributions/` and `searches/`.

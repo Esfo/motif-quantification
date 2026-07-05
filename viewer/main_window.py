@@ -19,6 +19,7 @@ try:
     from .theming import palette, style_plot
     from .ms_viewer_tab import MSViewerTab
     from .proteins_tab import ProteinsTab
+    from .quant_tab import QuantTab
     from .distributions_db import DistributionsDB
     from .experimental import ExperimentalSetup
 except ImportError:
@@ -26,6 +27,7 @@ except ImportError:
     from theming import palette, style_plot
     from ms_viewer_tab import MSViewerTab
     from proteins_tab import ProteinsTab
+    from quant_tab import QuantTab
     from distributions_db import DistributionsDB
     from experimental import ExperimentalSetup
 
@@ -132,6 +134,8 @@ class MainWindow(QMainWindow):
             self.ms_tab.apply_theme(theme)
         if getattr(self, "proteins_tab", None) is not None:
             self.proteins_tab.apply_theme(theme)
+        if getattr(self, "quant_tab", None) is not None:
+            self.quant_tab.apply_theme(theme)
         self.theme_action.setText("Switch to &light mode" if theme == "dark" else "Switch to &dark mode")
 
     # ---- opening folders -------------------------------------------------
@@ -217,11 +221,9 @@ class MainWindow(QMainWindow):
         self.proteins_tab.on_navigate_to_ms = self._navigate_to_ms
         self.proteins_tab.on_theme_toggle = self.toggle_theme
         tabs.addTab(self.proteins_tab, "Proteins")
-        tabs.addTab(self._placeholder("File-by-file comparison",
-                    f"Quantitative comparison across files: time series + differential "
-                    f"expression. Reads experimental-setup "
-                    f"({'loaded: ' + str(len(self.experimental.rows)) + ' rows' if not self.experimental.is_empty() else 'not found'}). "
-                    "— staged, see ARCHITECTURE.md"), "Quantitative Comparisons")
+        self.quant_tab = QuantTab(self.session, self.experimental, theme=self.theme)
+        self.quant_tab.on_theme_toggle = self.toggle_theme
+        tabs.addTab(self.quant_tab, "Quantitative Comparisons")
         tabs.addTab(self._placeholder("Motif quantification",
                     "Time series + DE at the motif level; proteins grouped by shared skeleton "
                     "motif, with include/exclude refinement saved back to a motif-sets folder. "

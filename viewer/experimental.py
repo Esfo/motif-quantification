@@ -44,6 +44,22 @@ class ExperimentalSetup:
     def is_empty(self):
         return not self.rows
 
+    def columns(self):
+        """Column names actually present, in file order, ``filename`` first.
+
+        The design file is not restricted to the canonical five columns — any
+        extra column (a batch, a timepoint, a dose…) is exposed here so the
+        Quantitative Comparisons tab can assign it a role."""
+        seen = []
+        for row in self.rows:
+            for key in row.keys():
+                if key and key not in seen:
+                    seen.append(key)
+        # keep filename first if present, otherwise preserve discovery order
+        if "filename" in seen:
+            seen = ["filename"] + [c for c in seen if c != "filename"]
+        return seen
+
     def values(self, column):
         seen = []
         for row in self.rows:
