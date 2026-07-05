@@ -244,6 +244,8 @@ data the pipeline produces. The four founding goals:
 - ✅ **Optional normalization**: a **median-center** mode shifts each file so its median log2 quantity matches the grand median (standard label-free correction for per-run loading/intensity), applied consistently to the table, facets, and fold-change; **none** by default.
 - ✅ **Persisted state** (like the panel layouts, via QSettings): the organizer layers, replicate/normalize/log-Y, compare A/B, level, and unique filter are restored on reopen. The organizer **never auto-fills** — it starts empty (or however the user left it).
 - ✅ **Adaptive light/dark** (matches the other tabs): **all marks white on dark** (incl. the replicate mean line), dark-outlined on light; `(x0.0001)` SI axis prefixes disabled.
+- ✅ **Slanted x labels**: panel-1 leaf plots draw their category/filename x labels at 45° (`RotatedAxisItem`) when they'd otherwise overlap (heuristic on label count/width), so long filenames stay legible; horizontal when few/short.
+- ✅ **Table default layout**: columns auto-expand to their content (sampled, so 100k+ rows don't stall), cells + headers centred, and spare viewport width is spread across columns (re-applied on resize) so the table fills the width instead of clumping left.
 - ⬜ Worker-thread recompute for large peptide sets; **save named layouts / narrowed feature sets**; clustered-heatmap view; per-feature link into the MS Data tab.
 
 ---

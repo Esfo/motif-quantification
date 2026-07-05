@@ -43,6 +43,7 @@ import math
 import statistics
 
 from PySide6.QtCore import Qt, QSettings, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -87,6 +88,45 @@ THEMES = {
 def _norm(name):
     """Filename → comparable stem (drop mzML/centroid/raw suffixes, lowercase)."""
     return strip_ms_suffix(name).lower()
+
+
+class RotatedAxisItem(pg.AxisItem):
+    """Bottom axis that draws its tick labels slanted by ``angle`` degrees, so
+    long or numerous category labels stay legible instead of overlapping (or
+    being silently dropped, as pyqtgraph does when horizontal labels collide).
+    ``angle=0`` falls back to the normal horizontal rendering."""
+
+    def __init__(self, *args, angle=45, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._angle = angle
+
+    def set_angle(self, angle):
+        self._angle = angle
+        self.picture = None
+        self.update()
+
+    def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
+        if not self._angle:
+            return super().drawPicture(p, axisSpec, tickSpecs, textSpecs)
+        p.setRenderHint(p.RenderHint.TextAntialiasing, True)
+        pen, p1, p2 = axisSpec
+        p.setPen(pen)
+        p.drawLine(p1, p2)
+        for tpen, tp1, tp2 in tickSpecs:
+            p.setPen(tpen)
+            p.drawLine(tp1, tp2)
+        if self.style["tickFont"] is not None:
+            p.setFont(self.style["tickFont"])
+        p.setPen(self.textPen())
+        for rect, flags, text in textSpecs:
+            # Anchor at the top-centre of each label slot (just under its tick)
+            # and rotate; point-based drawText doesn't clip, so long labels show
+            # in full running down-right.
+            p.save()
+            p.translate(rect.center().x(), rect.top())
+            p.rotate(self._angle)
+            p.drawText(0, 0, text)
+            p.restore()
 
 
 def _sorted_values(values):
@@ -571,17 +611,68 @@ class QuantTab(QWidget):
                 rows.append((feat, fname, uniq, float(q)))
 
         self.table.setRowCount(len(rows))
+        center = Qt.AlignCenter
         for r, (feat, fname, uniq, q) in enumerate(rows):
             design = self._row_for(fname)
-            self.table.setItem(r, 0, QTableWidgetItem(feat))
-            for ci, col in enumerate(cat_cols):
-                self.table.setItem(r, ci + 1, QTableWidgetItem(design.get(col, "")))
-            self.table.setItem(r, 1 + len(cat_cols), QTableWidgetItem(uniq))
-            self.table.setItem(r, 2 + len(cat_cols), NumericItem(f"{q:.4g}", q))
+            items = [QTableWidgetItem(feat)]
+            for col in cat_cols:
+                items.append(QTableWidgetItem(design.get(col, "")))
+            items.append(QTableWidgetItem(uniq))
+            items.append(NumericItem(f"{q:.4g}", q))
+            for c, it in enumerate(items):
+                it.setTextAlignment(center)
+                self.table.setItem(r, c, it)
 
         self.table.setSortingEnabled(True)
+        self._layout_table(len(headers))
         label = "peptides" if self.level == "peptide" else "proteins"
         self.count_label.setText(f"{len(feats)} {label} · {len(rows)} rows")
+
+    def _layout_table(self, ncols):
+        """Size every column to its content (sampled — the table can hold 100k+
+        rows, so a full ResizeToContents scan would stall) and, if the columns
+        don't fill the viewport, stretch them to fill so the table reads centred
+        across the screen rather than clumped on the left."""
+        for c in range(ncols):
+            hi = self.table.horizontalHeaderItem(c)
+            if hi is not None:
+                hi.setTextAlignment(Qt.AlignCenter)
+
+        fm = QFontMetrics(self.table.font())
+        n = self.table.rowCount()
+        step = max(1, n // 400)  # sample ~400 rows for width estimation
+        widths = []
+        for c in range(ncols):
+            hi = self.table.horizontalHeaderItem(c)
+            w = fm.horizontalAdvance(hi.text() if hi else "") + 28
+            r = 0
+            while r < n:
+                it = self.table.item(r, c)
+                if it is not None:
+                    w = max(w, fm.horizontalAdvance(it.text()) + 24)
+                r += step
+            widths.append(w)
+
+        self._content_widths = widths
+        self._apply_column_fill()
+
+    def _apply_column_fill(self):
+        """Spread any spare viewport width evenly across the content-sized columns
+        (on top of their content width, so nothing truncates) so the table fills
+        the width and reads centred rather than clumped on the left. Cheap — reuses
+        the cached content widths, so it's safe to call on every resize."""
+        widths = getattr(self, "_content_widths", None)
+        if not widths:
+            return
+        total = sum(widths)
+        avail = self.table.viewport().width()
+        extra = (avail - total) // len(widths) if (total and avail > total) else 0
+        for c, w in enumerate(widths):
+            self.table.setColumnWidth(c, w + max(0, extra))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_column_fill()
 
     def _auto_select_first(self):
         if self.table.rowCount() > 0:
@@ -739,12 +830,7 @@ class QuantTab(QWidget):
         return split
 
     def _leaf_plot(self, feat, per_file, files, xaxis):
-        plot = pg.PlotWidget()
-        style_plot(plot, palette(self.theme))
-        for name in ("left", "bottom"):
-            plot.getAxis(name).enableAutoSIPrefix(False)
         logy = self.logy_check.isChecked()
-        plot.setLabel("left", "log2 quantity" if logy else "quantity")
         pal = palette(self.theme)
         rep = self._replicate_column()
         xcol = xaxis if xaxis in self._categories else None
@@ -761,9 +847,24 @@ class QuantTab(QWidget):
             buckets.setdefault(xv, []).append(q)
 
         xvals = _sorted_values(list(buckets.keys()))
+        labels = [str(v) for v in xvals]
+
+        # Decide whether the x labels need slanting: many ticks, or any long
+        # label, would overlap horizontally. Estimate real widths and compare to
+        # a rough per-tick budget so this adapts to the actual labels.
+        fm = QFontMetrics(self.font())
+        widest = max((fm.horizontalAdvance(s) for s in labels), default=0)
+        angle = 45 if (len(labels) > 5 or widest > 60) else 0
+
+        axis = RotatedAxisItem(orientation="bottom", angle=angle)
+        plot = pg.PlotWidget(axisItems={"bottom": axis})
+        style_plot(plot, pal)
+        for name in ("left", "bottom"):
+            plot.getAxis(name).enableAutoSIPrefix(False)
+        plot.setLabel("left", "log2 quantity" if logy else "quantity")
+
         xindex = {v: i for i, v in enumerate(xvals)}
         pts = pal["points"]
-
         sx, sy, mx, my = [], [], [], []
         for xv in xvals:
             qs = buckets[xv]
@@ -781,10 +882,11 @@ class QuantTab(QWidget):
         if rep and len(mx) > 1:
             # mean-across-replicates line, drawn in the theme fg (white on dark)
             plot.plot(mx, my, pen=pg.mkPen(pal["fg"], width=2))
-        # short tick labels (avoid long filenames overflowing)
-        ticks = [(i, (v if len(str(v)) <= 14 else str(v)[:12] + "…"))
-                 for i, v in enumerate(xvals)]
-        plot.getAxis("bottom").setTicks([ticks])
+
+        axis.setTicks([list(enumerate(labels))])
+        if angle:
+            # reserve vertical room for the slanted labels so they aren't clipped
+            axis.setHeight(int(widest * 0.72) + 26)
         plot.setLabel("bottom", xcol if xcol else "file")
         return plot
 
