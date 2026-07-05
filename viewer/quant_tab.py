@@ -428,6 +428,11 @@ class QuantTab(QWidget):
         self.facet_title.setStyleSheet("font-weight: bold; font-size: 13px;")
         lay.addWidget(self.facet_title)
 
+        # Fold-change contrast summary — full-contrast, above the organizer
+        # dropdowns (recoloured in apply_theme).
+        self.fold_status = QLabel("")
+        lay.addWidget(self.fold_status)
+
         # organizer pseudo-table: growable list of layer rows
         org_header = QHBoxLayout()
         org_header.addWidget(QLabel("Organize by (top → bottom = outer → inner):"))
@@ -499,10 +504,6 @@ class QuantTab(QWidget):
         title.setStyleSheet("font-weight: bold; font-size: 13px;")
         lay.addWidget(title)
 
-        # Contrast summary — above the dropdowns, full-contrast (not muted grey).
-        self.fold_status = QLabel("")
-        lay.addWidget(self.fold_status)
-
         form = QHBoxLayout()
         form.addWidget(QLabel("Compare"))
         self.compare_combo = QComboBox()
@@ -567,7 +568,8 @@ class QuantTab(QWidget):
         lay.addLayout(bar)
 
         # Nested Layers: ordered dropdowns (layer 1 = outermost). Choosing a column
-        # does NOT change the table — the table only re-pivots when Pivot is pressed.
+        # does NOT change the table — the table re-pivots only when "+ Add layer" is
+        # pressed (which applies the current layers and opens the next one).
         nest_row = QHBoxLayout()
         nest_row.addWidget(QLabel("Nested Layers:"))
         self.nest_area = QHBoxLayout()
@@ -575,9 +577,6 @@ class QuantTab(QWidget):
         self.add_nest_btn = QPushButton("+ Add layer")
         self.add_nest_btn.clicked.connect(self._add_nest)
         nest_row.addWidget(self.add_nest_btn)
-        self.pivot_btn = QPushButton("Pivot")
-        self.pivot_btn.clicked.connect(lambda: self._refresh_table())
-        nest_row.addWidget(self.pivot_btn)
         nest_row.addStretch(1)
         lay.addLayout(nest_row)
         self._rebuild_nest_rows()
@@ -680,19 +679,22 @@ class QuantTab(QWidget):
             cl.addWidget(rm)
             self.nest_area.addWidget(chip)
 
-    # Editing the layers only updates the pending config — the table re-pivots
-    # solely when the user presses the Pivot button (_refresh_table).
+    # Choosing a column only updates the pending config; the table re-pivots when
+    # "+ Add layer" (or removing a layer) is pressed — never on a mere selection.
 
     def _add_nest(self):
-        if self._categories:
-            self._nest_layers.append(CHOOSE_LABEL)   # unset until chosen
-            self._rebuild_nest_rows()
-            self._save_state()
+        if not self._categories:
+            return
+        self._refresh_table()                    # apply the current layers now
+        self._nest_layers.append(CHOOSE_LABEL)   # then open the next (unset) layer
+        self._rebuild_nest_rows()
+        self._save_state()
 
     def _remove_nest(self, index):
         if 0 <= index < len(self._nest_layers):
             self._nest_layers.pop(index)
             self._rebuild_nest_rows()
+            self._refresh_table()
             self._save_state()
 
     def _set_nest(self, index, cat):
