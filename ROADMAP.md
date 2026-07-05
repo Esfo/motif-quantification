@@ -234,11 +234,14 @@ data the pipeline produces. The four founding goals:
 ---
 
 # TAB 3 — QUANTITATIVE COMPARISONS 🟡
-- ✅ Quantitative data **comparing peptides and proteins across files** — the **quant work**. `quant_model.py` builds a feature×file quantity matrix at the **peptide** level (charge/mod variants summed on `peptide_plain`) or **protein** level (roll-up: sum / median / unique-peptides). A **Peptides⇄Proteins** switch across the bottom-half table re-analyzes everything above.
-- ✅ **Differential expression**: Welch's (default) or **paired** t-test on **log2** quantities + **Benjamini-Hochberg FDR**, all pure-Python (`de_stats.py`, Student-t p via incomplete beta — no scipy). **Volcano** plot (log2FC vs -log10 FDR) on the top-right; click a point to select the feature. DE results fill the sortable feature table (mean A, mean B, log2FC, p, FDR).
-- ✅ Reads `experimental-setup` and lets **any** column take a **role** — Group / Series-axis / Replicate / Pair / Ignore — so the contrast is user-defined, not hard-coded. **Restrict-to** filters on the other Group columns give the **hierarchical** grouping; the contrast picks any Group column's value A vs value B (**any treatment vs any other**).
-- ✅ **Titration / time-series**: assign a column the **Series-axis** role and the visualization plots quantity **along** it (x = ordered series values, one line per group, replicate dots) — e.g. "fraction is the Group, replicate is the Series-axis" groups by fraction then orders along replicate. No Series-axis → per-group strip+mean plot.
-- ⬜ Run DE on a **worker thread** for large peptide sets (currently synchronous); **save named contrasts / narrowed feature sets**; add MA-plot / clustered-heatmap views; per-feature link into the MS Data tab.
+- ✅ Quantitative data **comparing peptides and proteins across files** — the **quant work**. `quant_model.py` builds a feature×file quantity matrix at the **peptide** level (charge/mod variants summed on `peptide_plain`, unique flag per peptide) or **protein** level (**unique quantification** — unique peptides only). A **Peptides⇄Proteins** switch + **unique-only** filter over the bottom table.
+- ✅ **Fully generic over the design — NO hard-coded column names.** The first `experimental-setup` column is the filename; **every** other column is a generic category. The only special designation is optional and **user-made**: mark one column as the **replicate** column (its runs are averaged; every other column is **compared, never averaged**). Works for any setup file regardless of which columns exist.
+- ✅ **Reactive — no run button.** Changing a category, the replicate column, the contrast, the level, or the unique filter recomputes immediately.
+- ✅ **All-features fold-change scatter** (top-right): x = **log2 fold change** (a plain log difference between two chosen category values, **no statistical test**), y = mean log2 abundance; every peptide/protein is a point; click one to select it.
+- ✅ **Depth-faceted per-feature view** (top-left): choose which categories nest the plot by depth (Level 1 splits the panel into side-by-side sub-panels, Level 2 splits each again…) and which category is the leaf **x-axis** — so the axes are organized by depth (conditions → time series → …). Replicate runs at the same x get a mean line.
+- ✅ **Per-file quantity table**: columns are the design's **files** (category metadata in header tooltips) showing each feature's quantity across files (not averaged), plus a **unique/non-unique** column filterable to uniques only.
+- ✅ **Adaptive light/dark** (matches the other tabs): **white datapoints on dark**, dark-outlined on light; `(x0.0001)` SI axis prefixes disabled.
+- ⬜ Worker-thread recompute for large peptide sets; **save named layouts / narrowed feature sets**; clustered-heatmap view; per-feature link into the MS Data tab.
 
 ---
 

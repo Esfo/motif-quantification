@@ -25,9 +25,8 @@ sqlite and the experimental-setup file.
 | `main_window.py` | window chrome, 4-tab shell, folder open/reload, theme, dock-layout persistence, distributions/experimental auto-detect |
 | `ms_viewer_tab.py` | **Tab 1** dock workspace (lists, panels 1–3, table 1) |
 | `proteins_tab.py` | **Tab 2** protein sequence viewer: file selector + FDR + protein list, panel 1 (horizontal sequence, peptide rectangles coloured by q-value, All button) over panel 2 (same protein verticalized per-file, click a column to load it in panel 1) |
-| `quant_tab.py` | **Tab 3** Quantitative Comparisons: role-assignment design panel + group/titration visualization + DE volcano over the top half; sortable feature table with a Peptides⇄Proteins switch across the bottom |
-| `quant_model.py` | builds/caches the feature×file quantity matrix (peptide or protein level; protein roll-up sum/median/unique) from the reorganized quant tables |
-| `de_stats.py` | pure-Python differential-expression stats: log2, Welch's & paired t-tests (Student-t p via incomplete beta, no scipy), Benjamini-Hochberg FDR |
+| `quant_tab.py` | **Tab 3** Quantitative Comparisons: depth-faceted per-feature view + all-features fold-change scatter over the top half; per-file quantity table with a Peptides⇄Proteins switch + unique filter across the bottom. Fully generic over the experimental-setup columns (no hard-coded column names); reactive (no run button) |
+| `quant_model.py` | builds/caches the feature×file quantity matrix — peptide level (charge/mod variants summed, unique flag per peptide) or protein level (**unique quantification**: unique peptides only) |
 | `session.py` | reads the `reorganized/` tables (files, PSMs, peptides, proteins, quant) + the project FASTA (protein sequences) and in-silico tryptic digestion (Tab 2) |
 | `mzml_store.py` | indexed mzML reader: metadata (no array decode), random-access scans, `extract_xics`, `extract_region` |
 | `region_view.py` | standalone bounded 2D heatmap + 3D region (`RegionWorker` thread is reused by Tab 1) |
@@ -142,16 +141,22 @@ reuses the base-mass (`mz*z - proton*z`) nearest-match logic from the original.
   shared q-value colour scale; single-file or verticalized side-by-side; block
   chunks proportional to peptide length when zoomed out.
 - **Quantitative Comparisons** (wired) — quantitative peptide/protein comparison
-  across files with differential expression. Reads `experimental-setup` and lets
-  **any** column take a *role* (Group / Series-axis / Replicate / Pair / Ignore),
-  so the contrast and the titration/time ordering are user-defined rather than
-  hard-coded to condition/fraction/replicate. Top half: design/role panel (left),
-  per-group or along-series visualization of the selected feature (center), DE
-  volcano (right, log2FC vs -log10 FDR, click a point to select). Bottom half: a
-  sortable feature table with a Peptides⇄Proteins switch (protein roll-up
-  sum/median/unique) that re-analyzes everything above. Stats: Welch's or paired
-  t-test on log2 quantities + BH-FDR (`de_stats.py`, `quant_model.py`). Staged
-  next: worker-thread DE for large peptide sets, saved contrasts, MA/heatmap views.
+  across files, grouped **entirely** by the `experimental-setup` columns with **no
+  hard-coded column names**: the first column is the filename, every other column
+  is a generic category. The only special designation is optional and user-made —
+  marking one column as the **replicate** column (its runs are averaged; every
+  other column is compared, never averaged). Reactive throughout (no run button).
+  Top-left: a **depth-faceted** view of the selected feature — pick which
+  categories nest the plot (Level 1 splits into side-by-side sub-panels, Level 2
+  splits each again…) and which category is the leaf x-axis, so you organize the
+  axes by depth (conditions → time series → …). Top-right: a scatter of **every**
+  feature by **log2 fold change** (a plain log difference between two chosen
+  category values, no statistical test) vs mean log2 abundance; click a point to
+  select. Bottom: a per-file quantity table (columns = the design's files with
+  their category metadata in tooltips) + a unique/non-unique column and a
+  unique-only filter. Theming adapts light/dark; points are white on dark, dark on
+  light. Staged next: worker-thread recompute for large peptide sets, saved
+  layouts, per-feature link into the MS Data tab.
 - **Motifs** — DE at the motif level (proteins represented by shared skeleton
   motif); include/exclude refinement saved to a new sibling folder (e.g.
   `motif-sets/`) alongside `distributions/` and `searches/`.
