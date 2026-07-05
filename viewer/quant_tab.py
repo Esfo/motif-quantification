@@ -22,13 +22,14 @@ Top half (horizontal split):
 
 Bottom half:
   * a **Peptides ⇄ Proteins** switch and a **unique-only** filter, over a **pivot
-    table**: rows are features, and the columns are the sample groups themselves —
-    a nested, spanning header built from the category *values* (e.g. condition
-    spanning over replicate), with the quantities as the cell values. The column
-    nesting comes from the organizer's column/row-split categories (outer→inner)
-    plus the designated replicate column innermost; any category left out collapses,
-    so files that land in the same leaf are **averaged** (non-zero values only) and
-    the cell is shaded grey to mark it as an average.
+    table**: fixed ``feature`` + ``unique`` columns, then the sample groups
+    themselves as a nested, spanning header built from the category *values* (e.g.
+    condition spanning over replicate), with the quantities as the cell values. The
+    column nesting is **entirely user-arranged** by the table's own column chips —
+    every category is included by default and can be reordered (◀ ▶ = outer↔inner)
+    or toggled off. A category toggled off collapses, so files that land in the
+    same leaf are **averaged** (non-zero values only) and the cell is shaded grey to
+    mark it as an average. This arrangement is independent of the panel-1 organizer.
 
 An optional **Normalize** mode (median-center) shifts each file so its median
 log2 quantity matches the grand median, correcting systematic per-run intensity
@@ -135,9 +136,9 @@ class GroupedHeaderView(QHeaderView):
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
-        self._paths = []      # per logical column: tuple(values) or None (col 0)
+        self._paths = []      # per logical column: tuple(values) or None (fixed)
         self._nlevels = 1
-        self._corner = ""
+        self._corners = []    # labels for the leading fixed columns
         self._fg = QColor("#e6e6e6")
         self._bg = QColor("#16181d")
         self._line = QColor("#2a2d33")
@@ -146,10 +147,10 @@ class GroupedHeaderView(QHeaderView):
     def _level_h(self):
         return self.fontMetrics().height() + 8
 
-    def set_structure(self, paths, nlevels, corner, fg, bg, line):
+    def set_structure(self, paths, nlevels, corners, fg, bg, line):
         self._paths = paths
         self._nlevels = max(1, nlevels)
-        self._corner = corner
+        self._corners = list(corners)
         self._fg, self._bg, self._line = QColor(fg), QColor(bg), QColor(line)
         self.setFixedHeight(self._level_h() * self._nlevels)
         self.updateGeometry()
@@ -163,21 +164,22 @@ class GroupedHeaderView(QHeaderView):
         lh = self._level_h()
         total_h = lh * self._nlevels
         n = self.count()
+        nfixed = len(self._corners)
         p.fillRect(self.viewport().rect(), self._bg)
 
-        # feature column (0): one full-height cell with the corner label
-        if n > 0:
-            x0 = self.sectionViewportPosition(0)
-            w0 = self.sectionSize(0)
+        # leading fixed columns (feature, unique, …): one full-height cell each
+        for c in range(min(nfixed, n)):
+            x0 = self.sectionViewportPosition(c)
+            w0 = self.sectionSize(c)
             rect = QRect(int(x0), 0, int(w0), int(total_h))
             p.setPen(QPen(self._line))
             p.drawRect(rect)
             p.setPen(QPen(self._fg))
-            p.drawText(rect, Qt.AlignCenter, self._corner)
+            p.drawText(rect, Qt.AlignCenter, self._corners[c])
 
         fm = self.fontMetrics()
         for level in range(self._nlevels):
-            c = 1
+            c = nfixed
             while c < n:
                 path = self._paths[c] if c < len(self._paths) else None
                 if path is None:
@@ -268,6 +270,17 @@ class QuantTab(QWidget):
 
         self._layers = []  # list of {"cat": str, "mode": str} organizer rows
 
+        # Table column arrangement — INDEPENDENT of the panel-1 organizer. Order
+        # (outer→inner nesting) and which categories are included are the user's
+        # to arrange; default is every category, in file order, all included.
+        saved_order = [c for c in self._saved.get("table_order", []) if c in self._categories]
+        self._table_order = saved_order + [c for c in self._categories if c not in saved_order]
+        saved_inc = self._saved.get("table_included")
+        if saved_inc is None:
+            self._table_included = set(self._categories)
+        else:
+            self._table_included = set(c for c in saved_inc if c in self._categories)
+
         self._build_ui()
         if self._active:
             self._refresh_table()
@@ -300,6 +313,8 @@ class QuantTab(QWidget):
             "compare": self.compare_combo.currentText(),
             "a": self.a_combo.currentText(),
             "b": self.b_combo.currentText(),
+            "table_order": self._table_order,
+            "table_included": sorted(self._table_included),
         }
         self.settings.setValue("quant_state", json.dumps(state))
 
@@ -533,6 +548,16 @@ class QuantTab(QWidget):
         bar.addWidget(self.count_label)
         lay.addLayout(bar)
 
+        # Column arrangement: reorder (◀ ▶ = outer↔inner) and toggle each category
+        # as a column-nesting level. Fully user-controlled, all included by default.
+        col_row = QHBoxLayout()
+        col_row.addWidget(QLabel("Columns (outer ◀ ▶ inner):"))
+        self.col_chip_area = QHBoxLayout()
+        col_row.addLayout(self.col_chip_area)
+        col_row.addStretch(1)
+        lay.addLayout(col_row)
+        self._rebuild_col_chips()
+
         self.table = QTableWidget()
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -557,7 +582,6 @@ class QuantTab(QWidget):
         if rebuild:
             self._rebuild_layer_rows()
             self._rebuild_facets()
-            self._refresh_table()
             self._save_state()
 
     def _remove_layer(self, index):
@@ -565,7 +589,6 @@ class QuantTab(QWidget):
             self._layers.pop(index)
             self._rebuild_layer_rows()
             self._rebuild_facets()
-            self._refresh_table()
             self._save_state()
 
     def _rebuild_layer_rows(self):
@@ -601,8 +624,54 @@ class QuantTab(QWidget):
         if 0 <= index < len(self._layers):
             self._layers[index][key] = value
             self._rebuild_facets()
+            self._save_state()
+
+    # ---- table column arrangement ---------------------------------------
+
+    def _rebuild_col_chips(self):
+        while self.col_chip_area.count():
+            item = self.col_chip_area.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        n = len(self._table_order)
+        for i, cat in enumerate(self._table_order):
+            chip = QWidget()
+            cl = QHBoxLayout(chip)
+            cl.setContentsMargins(2, 0, 2, 0)
+            cl.setSpacing(1)
+            box = QCheckBox(cat)
+            box.setChecked(cat in self._table_included)
+            box.stateChanged.connect(lambda _s, c=cat: self._toggle_col(c))
+            cl.addWidget(box)
+            left = QPushButton("◀")
+            left.setFixedWidth(22)
+            left.setEnabled(i > 0)
+            left.clicked.connect(lambda _=False, idx=i: self._move_col(idx, -1))
+            cl.addWidget(left)
+            right = QPushButton("▶")
+            right.setFixedWidth(22)
+            right.setEnabled(i < n - 1)
+            right.clicked.connect(lambda _=False, idx=i: self._move_col(idx, +1))
+            cl.addWidget(right)
+            self.col_chip_area.addWidget(chip)
+
+    def _move_col(self, index, delta):
+        j = index + delta
+        if 0 <= index < len(self._table_order) and 0 <= j < len(self._table_order):
+            order = self._table_order
+            order[index], order[j] = order[j], order[index]
+            self._rebuild_col_chips()
             self._refresh_table()
             self._save_state()
+
+    def _toggle_col(self, cat):
+        if cat in self._table_included:
+            self._table_included.discard(cat)
+        else:
+            self._table_included.add(cat)
+        self._refresh_table()
+        self._save_state()
 
     # ---- reactive handlers ----------------------------------------------
 
@@ -620,7 +689,6 @@ class QuantTab(QWidget):
     def _on_replicate_changed(self, _):
         self._rebuild_facets()
         self._refresh_fold_change()
-        self._refresh_table()   # replicate is the innermost pivot column level
         self._save_state()
 
     def _on_compare_changed(self, column):
@@ -661,22 +729,11 @@ class QuantTab(QWidget):
     # ---- feature table (long form; columns = experimental-setup cols) ----
 
     def _column_levels(self):
-        """Nesting levels for the pivot's columns: the organizer's column/row
-        split categories (outer→inner, in organizer order), then the designated
-        replicate column innermost. Any category left out of this list collapses,
-        so files sharing a leaf path are averaged (see _refresh_table)."""
-        levels = []
-        for layer in self._layers:
-            if layer["mode"] in (MODE_COLS, MODE_ROWS) and layer["cat"] not in levels:
-                levels.append(layer["cat"])
-        rep = self._replicate_column()
-        if rep and rep not in levels:
-            levels.append(rep)
-        # No organizer splits chosen → show the full per-sample breakdown (all
-        # categories) rather than collapsing everything into one averaged column.
-        if not levels:
-            levels = list(self._categories)
-        return levels
+        """Nesting levels for the pivot's columns — entirely user-arranged via the
+        table's own column chips (``_table_order`` filtered by ``_table_included``,
+        outer→inner). Every category is included by default. A category left out
+        collapses, so files sharing a leaf path are averaged (see _refresh_table)."""
+        return [c for c in self._table_order if c in self._table_included]
 
     def _chrome(self):
         if self.theme == "light":
@@ -711,17 +768,25 @@ class QuantTab(QWidget):
         grey = QColor(150, 150, 150, 235)  # opaque grey = averaged collision
         center = Qt.AlignCenter
 
+        # Two fixed leading columns: the feature id and its unique flag.
+        fixed = [feat_label, "unique"]
+        nfixed = len(fixed)
+
         self.table.setSortingEnabled(False)
-        self.table.setColumnCount(1 + len(leaves))
+        self.table.setColumnCount(nfixed + len(leaves))
         # plain logical labels (the custom header paints the grouped version)
-        self.table.setHorizontalHeaderLabels(
-            [feat_label] + [str(p[-1]) for p in leaves])
+        self.table.setHorizontalHeaderLabels(fixed + [str(p[-1]) for p in leaves])
         self.table.setRowCount(len(feats))
 
         for r, feat in enumerate(feats):
             fitem = QTableWidgetItem(feat)
             fitem.setTextAlignment(center)
             self.table.setItem(r, 0, fitem)
+            uniq = ("yes" if (self.level == "protein"
+                              or self.model.peptide_is_unique(feat)) else "no")
+            uitem = QTableWidgetItem(uniq)
+            uitem.setTextAlignment(center)
+            self.table.setItem(r, 1, uitem)
             per = matrix.get(feat, {})
             for ci, path in enumerate(leaves):
                 qs = [per.get(f) for f in leaf_files[path]]
@@ -735,45 +800,33 @@ class QuantTab(QWidget):
                         it.setBackground(grey)
                         it.setForeground(QColor("#101216"))
                 it.setTextAlignment(center)
-                self.table.setItem(r, ci + 1, it)
+                self.table.setItem(r, nfixed + ci, it)
 
         self.table.setSortingEnabled(True)
 
         # header structure + column widths
-        paths = [None] + list(leaves)
+        paths = [None] * nfixed + list(leaves)
         fg, bg, line = self._chrome()
-        self._header.set_structure(paths, nlevels, feat_label, fg, bg, line)
-        self._layout_table(feats, leaves)
+        self._header.set_structure(paths, nlevels, fixed, fg, bg, line)
+        self._layout_table(feats, leaves, fixed)
 
         label = "peptides" if self.level == "peptide" else "proteins"
         self.count_label.setText(f"{len(feats)} {label} × {len(leaves)} groups")
 
-    def _layout_table(self, feats, leaves):
-        """Feature column sized to content (sampled); data columns to a uniform
-        width from their leaf labels + quantity text. Spare width is spread across
-        the columns so the table fills the viewport."""
+    def _layout_table(self, feats, leaves, fixed):
+        """Feature column sized to content (sampled); the unique + data columns to a
+        uniform width from their labels. Spare width is spread across the columns so
+        the table fills the viewport."""
         fm = QFontMetrics(self.table.font())
         wfeat = fm.horizontalAdvance("peptide") + 28
         for feat in feats[:400]:
             wfeat = max(wfeat, fm.horizontalAdvance(feat) + 24)
+        wuniq = fm.horizontalAdvance("unique") + 24
         wdata = 64
         for p in leaves:
             wdata = max(wdata, fm.horizontalAdvance(str(p[-1])) + 18)
-        self._content_widths = [wfeat] + [wdata] * len(leaves)
+        self._content_widths = [wfeat, wuniq] + [wdata] * len(leaves)
         self._apply_column_fill()
-
-    def _apply_column_fill(self):
-        """Spread any spare viewport width evenly across the content-sized columns
-        (on top of their content width, so nothing truncates) so the table fills
-        the width. Cheap — reuses cached widths, safe to call on every resize."""
-        widths = getattr(self, "_content_widths", None)
-        if not widths:
-            return
-        total = sum(widths)
-        avail = self.table.viewport().width()
-        extra = (avail - total) // len(widths) if (total and avail > total) else 0
-        for c, w in enumerate(widths):
-            self.table.setColumnWidth(c, w + max(0, extra))
 
     def _apply_column_fill(self):
         """Spread any spare viewport width evenly across the content-sized columns
