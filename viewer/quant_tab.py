@@ -34,9 +34,10 @@ robust to extension differences.
 Everything is reactive — no run button.
 """
 
+import json
 import math
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QSettings, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -127,8 +128,12 @@ class QuantTab(QWidget):
         self.theme = theme
 
         self.model = QuantModel(session)
-        self.level = "peptide"
-        self.unique_only = False
+        self.settings = QSettings("motif-quantification", "viewer")
+        self._saved = self._load_state()
+        self._restoring = True
+
+        self.level = self._saved.get("level", "peptide")
+        self.unique_only = bool(self._saved.get("unique", False))
         self.selected_feature = None
         self._active = not experimental.is_empty()
 
@@ -147,7 +152,34 @@ class QuantTab(QWidget):
             self._refresh_table()
             self._refresh_fold_change()
             self._auto_select_first()
+        self._restoring = False
         self.apply_theme(theme)
+
+    # ---- persisted state (organizer + contrast, like the panel layouts) --
+
+    def _load_state(self):
+        raw = self.settings.value("quant_state")
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+
+    def _save_state(self):
+        if getattr(self, "_restoring", False) or not self._active:
+            return
+        state = {
+            "level": self.level,
+            "unique": self.unique_only,
+            "logy": self.logy_check.isChecked(),
+            "replicate": self.replicate_combo.currentText(),
+            "layers": self._layers,
+            "compare": self.compare_combo.currentText(),
+            "a": self.a_combo.currentText(),
+            "b": self.b_combo.currentText(),
+        }
+        self.settings.setValue("quant_state", json.dumps(state))
 
     # ---- design helpers --------------------------------------------------
 
@@ -218,13 +250,16 @@ class QuantTab(QWidget):
         org_header.addWidget(QLabel("Organize by (top → bottom = outer → inner):"))
         org_header.addStretch(1)
         self.logy_check = QCheckBox("log2 Y")
-        self.logy_check.setChecked(True)
-        self.logy_check.stateChanged.connect(self._rebuild_facets)
+        self.logy_check.setChecked(bool(self._saved.get("logy", True)))
+        self.logy_check.stateChanged.connect(self._on_logy_changed)
         org_header.addWidget(self.logy_check)
         rep_lbl = QLabel("Replicate:")
         org_header.addWidget(rep_lbl)
         self.replicate_combo = QComboBox()
         self.replicate_combo.addItems(["(none)"] + self._categories)
+        saved_rep = self._saved.get("replicate")
+        if saved_rep and saved_rep in self._categories:
+            self.replicate_combo.setCurrentText(saved_rep)
         self.replicate_combo.currentTextChanged.connect(self._on_replicate_changed)
         org_header.addWidget(self.replicate_combo)
         lay.addLayout(org_header)
@@ -247,11 +282,13 @@ class QuantTab(QWidget):
         holder.setLayout(self.facet_area)
         lay.addWidget(holder, 1)
 
-        # default: split by the first category into columns, x-axis = the last
-        if self._categories:
-            self._add_layer(self._categories[0], MODE_COLS, rebuild=False)
-        if len(self._categories) > 1:
-            self._add_layer(self._categories[-1], MODE_XAXIS, rebuild=False)
+        # No auto-fill — the organizer starts however the user last left it
+        # (persisted), otherwise empty. It is the user's choice what to add.
+        for layer in self._saved.get("layers", []):
+            cat = layer.get("cat")
+            mode = layer.get("mode")
+            if cat in self._categories and mode in MODES:
+                self._layers.append({"cat": cat, "mode": mode})
         self._rebuild_layer_rows()
         return panel
 
@@ -267,15 +304,18 @@ class QuantTab(QWidget):
         form.addWidget(QLabel("Compare"))
         self.compare_combo = QComboBox()
         self.compare_combo.addItems(self._categories)
+        saved_compare = self._saved.get("compare")
+        if saved_compare and saved_compare in self._categories:
+            self.compare_combo.setCurrentText(saved_compare)
         self.compare_combo.currentTextChanged.connect(self._on_compare_changed)
         form.addWidget(self.compare_combo)
         form.addWidget(QLabel("A"))
         self.a_combo = QComboBox()
-        self.a_combo.currentTextChanged.connect(lambda _: self._refresh_fold_change())
+        self.a_combo.currentTextChanged.connect(lambda _: self._on_ab_changed())
         form.addWidget(self.a_combo)
         form.addWidget(QLabel("B"))
         self.b_combo = QComboBox()
-        self.b_combo.currentTextChanged.connect(lambda _: self._refresh_fold_change())
+        self.b_combo.currentTextChanged.connect(lambda _: self._on_ab_changed())
         form.addWidget(self.b_combo)
         form.addStretch(1)
         lay.addLayout(form)
@@ -292,6 +332,12 @@ class QuantTab(QWidget):
 
         if self._categories:
             self._on_compare_changed(self.compare_combo.currentText())
+            # restore the saved A/B values now that the combos are populated
+            sa, sb = self._saved.get("a"), self._saved.get("b")
+            if sa and self.a_combo.findText(sa) >= 0:
+                self.a_combo.setCurrentText(sa)
+            if sb and self.b_combo.findText(sb) >= 0:
+                self.b_combo.setCurrentText(sb)
         return panel
 
     def _build_table_panel(self):
@@ -305,13 +351,16 @@ class QuantTab(QWidget):
         for b in (self.pep_button, self.prot_button):
             b.setCheckable(True)
             b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.pep_button.setChecked(True)
+        self.pep_button.setChecked(self.level == "peptide")
+        self.prot_button.setChecked(self.level == "protein")
         self.pep_button.clicked.connect(lambda: self._set_level("peptide"))
         self.prot_button.clicked.connect(lambda: self._set_level("protein"))
         bar.addWidget(self.pep_button)
         bar.addWidget(self.prot_button)
         bar.addSpacing(16)
         self.unique_check = QCheckBox("Unique peptides only")
+        self.unique_check.setChecked(self.unique_only)
+        self.unique_check.setEnabled(self.level == "peptide")
         self.unique_check.stateChanged.connect(self._on_unique_toggled)
         bar.addWidget(self.unique_check)
         bar.addStretch(1)
@@ -342,12 +391,14 @@ class QuantTab(QWidget):
         if rebuild:
             self._rebuild_layer_rows()
             self._rebuild_facets()
+            self._save_state()
 
     def _remove_layer(self, index):
         if 0 <= index < len(self._layers):
             self._layers.pop(index)
             self._rebuild_layer_rows()
             self._rebuild_facets()
+            self._save_state()
 
     def _rebuild_layer_rows(self):
         # clear existing widgets
@@ -382,12 +433,18 @@ class QuantTab(QWidget):
         if 0 <= index < len(self._layers):
             self._layers[index][key] = value
             self._rebuild_facets()
+            self._save_state()
 
     # ---- reactive handlers ----------------------------------------------
+
+    def _on_logy_changed(self, _):
+        self._rebuild_facets()
+        self._save_state()
 
     def _on_replicate_changed(self, _):
         self._rebuild_facets()
         self._refresh_fold_change()
+        self._save_state()
 
     def _on_compare_changed(self, column):
         vals = _sorted_values(self.experimental.values(column)) if column else []
@@ -399,11 +456,17 @@ class QuantTab(QWidget):
                 combo.setCurrentIndex(idx)
             combo.blockSignals(False)
         self._refresh_fold_change()
+        self._save_state()
+
+    def _on_ab_changed(self):
+        self._refresh_fold_change()
+        self._save_state()
 
     def _on_unique_toggled(self, _):
         self.unique_only = self.unique_check.isChecked()
         self._refresh_table()
         self._refresh_fold_change()
+        self._save_state()
 
     def _set_level(self, level):
         self.pep_button.setChecked(level == "peptide")
@@ -416,6 +479,7 @@ class QuantTab(QWidget):
         self._refresh_table()
         self._refresh_fold_change()
         self._auto_select_first()
+        self._save_state()
 
     # ---- feature table (long form; columns = experimental-setup cols) ----
 
@@ -424,8 +488,10 @@ class QuantTab(QWidget):
         feats = self._visible_features()
 
         feat_label = "peptide" if self.level == "peptide" else "protein"
-        headers = [feat_label] + self.experimental.columns() + ["unique", "quantity"]
-        cat_cols = self.experimental.columns()  # includes 'filename'
+        # Columns are the experimental-setup categories only — NOT the filename
+        # (each file is already fully described by its category values).
+        cat_cols = [c for c in self.experimental.columns() if c != "filename"]
+        headers = [feat_label] + cat_cols + ["unique", "quantity"]
 
         self.table.setSortingEnabled(False)
         self.table.setColumnCount(len(headers))
@@ -446,11 +512,7 @@ class QuantTab(QWidget):
             design = self._row_for(fname)
             self.table.setItem(r, 0, QTableWidgetItem(feat))
             for ci, col in enumerate(cat_cols):
-                # design's own filename value if present, else the model filename
-                val = design.get(col, "") if design else ""
-                if col == "filename" and not val:
-                    val = fname
-                self.table.setItem(r, ci + 1, QTableWidgetItem(val))
+                self.table.setItem(r, ci + 1, QTableWidgetItem(design.get(col, "")))
             self.table.setItem(r, 1 + len(cat_cols), QTableWidgetItem(uniq))
             self.table.setItem(r, 2 + len(cat_cols), NumericItem(f"{q:.4g}", q))
 
@@ -654,7 +716,8 @@ class QuantTab(QWidget):
                   symbolBrush=pg.mkBrush(pts[0], pts[1], pts[2], 220),
                   symbolPen=pg.mkPen(pal["fg"], width=0.5))
         if rep and len(mx) > 1:
-            plot.plot(mx, my, pen=pg.mkPen(pal["accent"], width=2))
+            # mean-across-replicates line, drawn in the theme fg (white on dark)
+            plot.plot(mx, my, pen=pg.mkPen(pal["fg"], width=2))
         # short tick labels (avoid long filenames overflowing)
         ticks = [(i, (v if len(str(v)) <= 14 else str(v)[:12] + "…"))
                  for i, v in enumerate(xvals)]
