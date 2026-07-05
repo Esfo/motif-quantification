@@ -245,6 +245,7 @@ data the pipeline produces. The four founding goals:
 - ✅ **Persisted state** (like the panel layouts, via QSettings): the organizer layers, replicate/normalize/log-Y, compare A/B, level, and unique filter are restored on reopen. The organizer **never auto-fills** — it starts empty (or however the user left it).
 - ✅ **Adaptive light/dark** (matches the other tabs): **all marks white on dark** (incl. the replicate mean line), dark-outlined on light; `(x0.0001)` SI axis prefixes disabled.
 - ✅ **Slanted x labels**: panel-1 leaf plots draw their category/filename x labels at 45° (`RotatedAxisItem`) when they'd otherwise overlap (heuristic on label count/width), so long filenames stay legible; horizontal when few/short.
+- ✅ **Split sub-plots are self-describing + share axes**: each faceted leaf is titled with its full split path (`condition = keloid / fraction = NaCl`), all leaves use one **global x ordering** (same category at the same position), and their **X and Y views are linked to a common range** so heights/positions are directly comparable across the whole grid.
 - ✅ **Table default layout**: columns auto-expand to their content (sampled, so 100k+ rows don't stall), cells + headers centred, and spare viewport width is spread across columns (re-applied on resize) so the table fills the width instead of clumping left.
 - ⬜ Worker-thread recompute for large peptide sets; **save named layouts / narrowed feature sets**; clustered-heatmap view; per-feature link into the MS Data tab.
 

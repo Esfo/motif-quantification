@@ -793,10 +793,45 @@ class QuantTab(QWidget):
         splits = [l for l in self._layers if l["mode"] in (MODE_COLS, MODE_ROWS)]
         xaxis = next((l["cat"] for l in self._layers if l["mode"] == MODE_XAXIS), None)
 
+        # Track leaf plots + global data extents so axes can be shared across the
+        # whole facet grid (comparable heights/positions everywhere).
+        self._leaf_plots = []
+        self._y_lo, self._y_hi, self._x_max = math.inf, -math.inf, 0
+
         per_file = self._matrix().get(feat, {})
         files = [f for f in self.model.filenames() if per_file.get(f)]
+
+        # One global x ordering shared by every leaf, so a given x position means
+        # the same category everywhere (required for a shared x-axis to be valid).
+        xcol = xaxis if xaxis in self._categories else None
+        if xcol:
+            self._facet_xvals = _sorted_values({self._cat_value(f, xcol) for f in files})
+        else:
+            self._facet_xvals = _sorted_values(files)
+        self._facet_xcol = xcol
+
         widget = self._facet_node(feat, per_file, files, splits, 0, xaxis, [])
         self.facet_area.addWidget(widget)
+
+        self._link_facet_axes()
+
+    def _link_facet_axes(self):
+        """Share X and Y across every leaf plot in the grid: link their views and
+        set one common range spanning all panels' data, so a split on the x-axis
+        shares x and a split on the y-axis shares y (and quantities stay directly
+        comparable across the whole grid)."""
+        plots = self._leaf_plots
+        if len(plots) < 1:
+            return
+        base = plots[0]
+        for p in plots[1:]:
+            p.setXLink(base)
+            p.setYLink(base)
+        if math.isfinite(self._y_lo) and math.isfinite(self._y_hi):
+            span = self._y_hi - self._y_lo or 1.0
+            base.setYRange(self._y_lo - 0.05 * span, self._y_hi + 0.05 * span,
+                           padding=0)
+        base.setXRange(-0.5, self._x_max + 0.5, padding=0)
 
     def _facet_node(self, feat, per_file, files, splits, depth, xaxis, path):
         if depth >= len(splits) or not files:
@@ -817,7 +852,12 @@ class QuantTab(QWidget):
         logy = self.logy_check.isChecked()
         pal = palette(self.theme)
         rep = self._replicate_column()
-        xcol = xaxis if xaxis in self._categories else None
+        # Global (shared) x ordering — same category at the same position in every
+        # leaf, so the linked x-axis is meaningful across the grid.
+        xcol = self._facet_xcol
+        xvals = self._facet_xvals
+        xindex = {v: i for i, v in enumerate(xvals)}
+        labels = [str(v) for v in xvals]
 
         def yval(q):
             return math.log2(q) if logy else q
@@ -829,9 +869,6 @@ class QuantTab(QWidget):
                 continue
             xv = self._cat_value(f, xcol) if xcol else f
             buckets.setdefault(xv, []).append(q)
-
-        xvals = _sorted_values(list(buckets.keys()))
-        labels = [str(v) for v in xvals]
 
         # Decide whether the x labels need slanting: many ticks, or any long
         # label, would overlap horizontally. Estimate real widths and compare to
@@ -853,18 +890,23 @@ class QuantTab(QWidget):
                                for c, v in path)
             plot.setTitle(title, color=pal["fg"], size="10pt")
 
-        xindex = {v: i for i, v in enumerate(xvals)}
         pts = pal["points"]
         sx, sy, mx, my = [], [], [], []
-        for xv in xvals:
-            qs = buckets[xv]
-            i = xindex[xv]
+        for xv, qs in buckets.items():
+            i = xindex.get(xv)
+            if i is None:
+                continue
             for q in qs:
                 sx.append(i)
                 sy.append(yval(q))
             mean_q = sum(qs) / len(qs)
             mx.append(i)
             my.append(yval(mean_q))
+        # keep the mean line drawn left-to-right along x
+        if mx:
+            order = sorted(range(len(mx)), key=lambda k: mx[k])
+            mx = [mx[k] for k in order]
+            my = [my[k] for k in order]
 
         plot.plot(sx, sy, pen=None, symbol="o", symbolSize=7,
                   symbolBrush=pg.mkBrush(pts[0], pts[1], pts[2], 220),
@@ -872,6 +914,13 @@ class QuantTab(QWidget):
         if rep and len(mx) > 1:
             # mean-across-replicates line, drawn in the theme fg (white on dark)
             plot.plot(mx, my, pen=pg.mkPen(pal["fg"], width=2))
+
+        # feed the shared-axis extents (see _link_facet_axes)
+        if sy:
+            self._y_lo = min(self._y_lo, min(sy))
+            self._y_hi = max(self._y_hi, max(sy))
+        self._x_max = max(self._x_max, len(labels) - 1)
+        self._leaf_plots.append(plot)
 
         axis.setTicks([list(enumerate(labels))])
         if angle:
