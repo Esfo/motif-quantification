@@ -499,6 +499,10 @@ class QuantTab(QWidget):
         title.setStyleSheet("font-weight: bold; font-size: 13px;")
         lay.addWidget(title)
 
+        # Contrast summary — above the dropdowns, full-contrast (not muted grey).
+        self.fold_status = QLabel("")
+        lay.addWidget(self.fold_status)
+
         form = QHBoxLayout()
         form.addWidget(QLabel("Compare"))
         self.compare_combo = QComboBox()
@@ -525,9 +529,6 @@ class QuantTab(QWidget):
         for name in ("left", "bottom"):
             self.fold_plot.getAxis(name).enableAutoSIPrefix(False)
         lay.addWidget(self.fold_plot, 1)
-        self.fold_status = QLabel("")
-        self.fold_status.setStyleSheet("color: #8a8f98;")
-        lay.addWidget(self.fold_status)
 
         if self._categories:
             self._on_compare_changed(self.compare_combo.currentText())
@@ -563,13 +564,10 @@ class QuantTab(QWidget):
         self.unique_check.stateChanged.connect(self._on_unique_toggled)
         bar.addWidget(self.unique_check)
         bar.addStretch(1)
-        self.count_label = QLabel("")
-        self.count_label.setStyleSheet("color: #8a8f98;")
-        bar.addWidget(self.count_label)
         lay.addLayout(bar)
 
-        # Nested Layers: ordered dropdowns (layer 1 = outermost) that pivot the
-        # table. Each dropdown picks a category; "+ Add layer" appends the next.
+        # Nested Layers: ordered dropdowns (layer 1 = outermost). Choosing a column
+        # does NOT change the table — the table only re-pivots when Pivot is pressed.
         nest_row = QHBoxLayout()
         nest_row.addWidget(QLabel("Nested Layers:"))
         self.nest_area = QHBoxLayout()
@@ -577,6 +575,9 @@ class QuantTab(QWidget):
         self.add_nest_btn = QPushButton("+ Add layer")
         self.add_nest_btn.clicked.connect(self._add_nest)
         nest_row.addWidget(self.add_nest_btn)
+        self.pivot_btn = QPushButton("Pivot")
+        self.pivot_btn.clicked.connect(lambda: self._refresh_table())
+        nest_row.addWidget(self.pivot_btn)
         nest_row.addStretch(1)
         lay.addLayout(nest_row)
         self._rebuild_nest_rows()
@@ -679,26 +680,24 @@ class QuantTab(QWidget):
             cl.addWidget(rm)
             self.nest_area.addWidget(chip)
 
+    # Editing the layers only updates the pending config — the table re-pivots
+    # solely when the user presses the Pivot button (_refresh_table).
+
     def _add_nest(self):
         if self._categories:
-            # start unset so the user explicitly chooses the column (the table only
-            # pivots once a real category is picked)
-            self._nest_layers.append(CHOOSE_LABEL)
+            self._nest_layers.append(CHOOSE_LABEL)   # unset until chosen
             self._rebuild_nest_rows()
-            self._refresh_table()
             self._save_state()
 
     def _remove_nest(self, index):
         if 0 <= index < len(self._nest_layers):
             self._nest_layers.pop(index)
             self._rebuild_nest_rows()
-            self._refresh_table()
             self._save_state()
 
     def _set_nest(self, index, cat):
         if 0 <= index < len(self._nest_layers):
             self._nest_layers[index] = cat
-            self._refresh_table()
             self._save_state()
 
     # ---- reactive handlers ----------------------------------------------
@@ -847,10 +846,6 @@ class QuantTab(QWidget):
         self._header.set_structure([None] * nfixed + list(paths), nlevels,
                                    fixed, fg, bg, line)
         self._size_columns(feats, paths)
-
-        label = "peptides" if self.level == "peptide" else "proteins"
-        kind = "value columns" if nlevels == 1 else "groups"
-        self.count_label.setText(f"{len(feats)} {label} · {len(columns)} {kind}")
 
     def _chrome(self):
         if self.theme == "light":
@@ -1129,6 +1124,10 @@ class QuantTab(QWidget):
             return
         if getattr(self, "theme_btn", None) is not None:
             self.theme_btn.setText("Light Mode" if theme != "light" else "Dark Mode")
+        if getattr(self, "fold_status", None) is not None:
+            # full-contrast (black on light, white on dark), not muted grey
+            fg = "#101216" if theme == "light" else "#ffffff"
+            self.fold_status.setStyleSheet(f"color: {fg}; font-weight: bold;")
         pal = palette(theme)
         if getattr(self, "fold_plot", None) is not None:
             style_plot(self.fold_plot, pal)
