@@ -567,13 +567,18 @@ class QuantTab(QWidget):
         bar.addStretch(1)
         lay.addLayout(bar)
 
-        # Nested Layers: ordered dropdowns (layer 1 = outermost). Choosing a column
-        # does NOT change the table — the table re-pivots only when "+ Add layer" is
-        # pressed (which applies the current layers and opens the next one).
+        # Nested Layers: the committed layers (each with an ✕) sit to the left; a
+        # separate "pending" dropdown (no ✕) is where you choose the next column —
+        # it only becomes a layer, and the table only re-pivots, when "+ Add layer"
+        # is pressed. Choosing in the pending dropdown alone changes nothing.
         nest_row = QHBoxLayout()
         nest_row.addWidget(QLabel("Nested Layers:"))
         self.nest_area = QHBoxLayout()
         nest_row.addLayout(self.nest_area)
+        self.pending_combo = QComboBox()
+        self.pending_combo.addItems([CHOOSE_LABEL] + self._categories)
+        self.pending_combo.setMinimumWidth(130)
+        nest_row.addWidget(self.pending_combo)
         self.add_nest_btn = QPushButton("+ Add layer")
         self.add_nest_btn.clicked.connect(self._add_nest)
         nest_row.addWidget(self.add_nest_btn)
@@ -652,10 +657,8 @@ class QuantTab(QWidget):
     # ---- table nested layers --------------------------------------------
 
     def _rebuild_nest_rows(self):
-        # Always keep at least one layer dropdown visible; an unset "(choose
-        # column)" layer means the table stays flat until the user picks.
-        if not self._nest_layers:
-            self._nest_layers = [CHOOSE_LABEL]
+        # Only COMMITTED layers get a row (each with an ✕). The pending/unset
+        # dropdown lives outside this area and never carries an ✕.
         while self.nest_area.count():
             item = self.nest_area.takeAt(0)
             w = item.widget()
@@ -666,10 +669,10 @@ class QuantTab(QWidget):
             cl = QHBoxLayout(chip)
             cl.setContentsMargins(2, 0, 2, 0)
             cl.setSpacing(2)
-            cl.addWidget(QLabel(f"{i + 1}."))     # hard-coded layer number, += 1
+            cl.addWidget(QLabel(f"{i + 1}."))     # layer number, += 1 per layer
             combo = QComboBox()
-            combo.addItems([CHOOSE_LABEL] + self._categories)
-            combo.setCurrentText(cat if cat in self._categories else CHOOSE_LABEL)
+            combo.addItems(self._categories)
+            combo.setCurrentText(cat)
             combo.setMinimumWidth(130)
             combo.currentTextChanged.connect(lambda v, idx=i: self._set_nest(idx, v))
             cl.addWidget(combo)
@@ -679,15 +682,16 @@ class QuantTab(QWidget):
             cl.addWidget(rm)
             self.nest_area.addWidget(chip)
 
-    # Choosing a column only updates the pending config; the table re-pivots when
-    # "+ Add layer" (or removing a layer) is pressed — never on a mere selection.
-
     def _add_nest(self):
-        if not self._categories:
+        # Commit the pending dropdown as a new layer — only if a real column is
+        # chosen. "(choose column)" adds nothing. Re-pivots on commit.
+        cat = self.pending_combo.currentText()
+        if cat not in self._categories:
             return
-        self._refresh_table()                    # apply the current layers now
-        self._nest_layers.append(CHOOSE_LABEL)   # then open the next (unset) layer
+        self._nest_layers.append(cat)
+        self.pending_combo.setCurrentText(CHOOSE_LABEL)
         self._rebuild_nest_rows()
+        self._refresh_table()
         self._save_state()
 
     def _remove_nest(self, index):
@@ -698,8 +702,10 @@ class QuantTab(QWidget):
             self._save_state()
 
     def _set_nest(self, index, cat):
+        # changing an already-committed layer re-pivots to reflect it
         if 0 <= index < len(self._nest_layers):
             self._nest_layers[index] = cat
+            self._refresh_table()
             self._save_state()
 
     # ---- reactive handlers ----------------------------------------------
