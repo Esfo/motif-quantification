@@ -222,6 +222,7 @@ class MainWindow(QMainWindow):
         self.proteins_tab.on_theme_toggle = self.toggle_theme
         tabs.addTab(self.proteins_tab, "Proteins")
         self.quant_tab = QuantTab(self.session, self.experimental, theme=self.theme)
+        self.quant_tab.on_theme_toggle = self.toggle_theme
         tabs.addTab(self.quant_tab, "Quantitative Comparisons")
         tabs.addTab(self._placeholder("Motif quantification",
                     "Time series + DE at the motif level; proteins grouped by shared skeleton "

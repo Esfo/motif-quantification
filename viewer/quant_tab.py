@@ -78,6 +78,7 @@ except ImportError:
 
 
 FILE_LABEL = "(file)"
+CHOOSE_LABEL = "(choose column)"
 MODE_COLS = "Split → columns"
 MODE_ROWS = "Split ↓ rows"
 MODE_XAXIS = "X-axis"
@@ -268,6 +269,7 @@ class QuantTab(QWidget):
         self.theme = theme
 
         self.model = QuantModel(session)
+        self.on_theme_toggle = None   # set by MainWindow; wired to the theme button
         self.settings = QSettings("motif-quantification", "viewer")
         self._saved = self._load_state()
         self._restoring = True
@@ -430,6 +432,10 @@ class QuantTab(QWidget):
         org_header = QHBoxLayout()
         org_header.addWidget(QLabel("Organize by (top → bottom = outer → inner):"))
         org_header.addStretch(1)
+        self.theme_btn = QPushButton("Light / Dark")
+        self.theme_btn.setToolTip("Toggle light/dark theme")
+        self.theme_btn.clicked.connect(self._toggle_theme_clicked)
+        org_header.addWidget(self.theme_btn)
         org_header.addWidget(QLabel("Normalize:"))
         self.normalize_combo = QComboBox()
         self.normalize_combo.addItems(["none", "median-center"])
@@ -658,8 +664,9 @@ class QuantTab(QWidget):
             cl.setSpacing(2)
             cl.addWidget(QLabel(f"{i + 1}."))     # hard-coded layer number, += 1
             combo = QComboBox()
-            combo.addItems(self._categories)
-            combo.setCurrentText(cat)
+            combo.addItems([CHOOSE_LABEL] + self._categories)
+            combo.setCurrentText(cat if cat in self._categories else CHOOSE_LABEL)
+            combo.setMinimumWidth(130)
             combo.currentTextChanged.connect(lambda v, idx=i: self._set_nest(idx, v))
             cl.addWidget(combo)
             rm = QPushButton("✕")
@@ -670,7 +677,9 @@ class QuantTab(QWidget):
 
     def _add_nest(self):
         if self._categories:
-            self._nest_layers.append(self._categories[0])
+            # start unset so the user explicitly chooses the column (the table only
+            # pivots once a real category is picked)
+            self._nest_layers.append(CHOOSE_LABEL)
             self._rebuild_nest_rows()
             self._refresh_table()
             self._save_state()
@@ -1109,6 +1118,10 @@ class QuantTab(QWidget):
         return plot
 
     # ---- theming ---------------------------------------------------------
+
+    def _toggle_theme_clicked(self):
+        if callable(self.on_theme_toggle):
+            self.on_theme_toggle()
 
     def apply_theme(self, theme):
         self.theme = theme
