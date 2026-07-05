@@ -886,8 +886,7 @@ class QuantTab(QWidget):
         # Title names the split slice this sub-plot represents (the full path of
         # column=value choices that led here), so every panel is self-describing.
         if path:
-            title = " / ".join(f"{c} = {v if v != '' else '(blank)'}"
-                               for c, v in path)
+            title = " / ".join((v if v != "" else "(blank)") for _, v in path)
             plot.setTitle(title, color=pal["fg"], size="10pt")
 
         pts = pal["points"]
