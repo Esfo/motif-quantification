@@ -290,6 +290,20 @@ class ViewerSession:
             return None
         return self.reorganized.parent.parent / "distributions"
 
+    @property
+    def quant_dir(self):
+        # <project>/quant, written by quantify.py (AUC peptide/protein quant).
+        if self.reorganized is None:
+            return None
+        return self.reorganized.parent.parent / "quant"
+
+    @property
+    def motif_sets_dir(self):
+        # <project>/motif-sets, written by quantify.py (motif grouping + quant).
+        if self.reorganized is None:
+            return None
+        return self.reorganized.parent.parent / "motif-sets"
+
     def distributions_db_for(self, filename):
         """Path to the distributions sqlite produced for THIS file, or None.
 

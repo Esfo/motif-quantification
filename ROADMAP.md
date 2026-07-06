@@ -253,15 +253,17 @@ data the pipeline produces. The four founding goals:
 
 ---
 
-# TAB 4 — MOTIF QUANTIFICATION ⬜
-- Motif index location is **auto-detected, not hard-coded**; expected structure is a
+# TAB 4 — MOTIF QUANTIFICATION 🟡
+- Motif index location is passed to `quantify.py` (`--motif-index`); expected structure is a
   `human-proteome-skeletons/{build_info.tsv, motifs.tsv, postings.bin, proteins.tsv}` dir under a
   motifs folder (e.g. `~/data/proteomics/motifs/`). Reader exists: `viewer/motifs.py`.
-- ⬜ Quantify the **motifs** found via `index-motifs.py`. **Time series + DE at the MOTIF level**, where proteins with specific motifs are **represented by that motif**.
-- ⬜ Look for **changes in expression of groups of proteins that all share a specific motif**.
+- ✅ Quantify the **motifs** found via `index-motifs.py`. **DE at the MOTIF level**, where proteins with specific motifs are **represented by that motif** — `viewer/motif_tab.py` (`MotifTab` subclasses `QuantTab`), fed by `viewer/motif_quant_model.py`.
+- ✅ Look for **changes in expression of groups of proteins that all share a specific motif** — a motif's quantity is the SUM of its observed proteins' AUC quantities; the fold-change scatter + faceting are inherited from Tab 3.
+- ✅ The **protein→motif join** and motif quantities are precomputed off-GUI by `quantify.py` (the `run_quantify` stage in `execution.xsh`), which also switches protein/peptide quant to the **charge-distribution AUC** (most abundant unique peptide) matched against the per-file distributions sqlite.
+- ✅ Only motifs that **show up more than once** (>1 observed protein) are kept; a **min observed proteins** control tunes this live.
 - ⬜ A functional database links proteins to **skeleton motifs**; **organize the different peptides within these skeletons**.
-- ⬜ **Include/exclude specific sequences** to narrow the protein lists; **save that narrowed motif set** within the database — a **new folder at the same level as `/distributions` and `/searches`** (e.g. `motif-sets/`).
-- ⬜ Tabs 3 & 4 both **read `experimental-setup`** for grouping/contrasts.
+- ⬜ **Include/exclude specific sequences** to narrow the protein lists; **save that narrowed motif set** back into `motif-sets/`.
+- ✅ Tabs 3 & 4 both **read `experimental-setup`** for grouping/contrasts (Tab 4 inherits it from Tab 3).
 
 ---
 

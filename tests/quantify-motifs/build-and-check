@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Synthetic end-to-end check for quantify.py (AUC quant + motif grouping).
+
+Builds a tiny fake project -- a reorganized search (2 files, a handful of PSMs),
+one distributions sqlite per file, and a motif skeleton index -- then runs the
+pipeline and asserts the protein quantities (most-abundant unique peptide AUC)
+and the summed motif quantities come out exactly as designed.
+
+Run:  python tests/quantify-motifs/build-and-check
+"""
+
+from __future__ import annotations
+
+import csv
+import importlib.util
+import sqlite3
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+
+# Import quantify.py (hyphen-free module load from the repo root).
+spec = importlib.util.spec_from_file_location("quantify", REPO / "quantify.py")
+quantify = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(quantify)
+
+PROTON = quantify.PROTON
+
+# ---- design: (peptide, protein(s), neutral_mass, z, rt, {file: area}) --------
+# Two files A and B; unique peptides for P1/P2/P3 plus one shared peptide.
+PSMS = [
+    ("PEPTIDEAONE", "P1", 1000.0, 2, 10.0, {"A": 500.0, "B": 600.0}),
+    ("PEPTIDEATWO", "P1", 1200.0, 2, 20.0, {"A": 200.0, "B": 250.0}),
+    ("PEPTIDEBONE", "P2", 1400.0, 2, 30.0, {"A": 300.0, "B": 350.0}),
+    ("PEPTIDECONE", "P3", 1600.0, 2, 40.0, {"A": 100.0, "B": 150.0}),
+    ("PEPTIDESHARED", "P1;P2", 1800.0, 2, 50.0, {"A": 999.0, "B": 999.0}),
+]
+
+# Motifs: accession groups + expected keep/drop.
+#   M1 {P1,P2,P3} kept   M2 {P1} dropped (1 observed)   M3 {P1,P2} kept
+MOTIFS = [
+    (0, "A...E", [0, 1, 2]),   # P1 P2 P3
+    (1, "K...R", [0]),         # P1 only
+    (2, "L...G", [0, 1]),      # P1 P2
+]
+ACCESSIONS = {0: "P1", 1: "P2", 2: "P3"}
+
+
+def write_tsv(path, rows, fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, delimiter="\t")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def build_reorganized(root: Path):
+    reorganized = root / "searches" / "reorganized"
+    files = [
+        {"filename": "sampleA.centroid.mzML", "run_dir": "sampleA"},
+        {"filename": "sampleB.centroid.mzML", "run_dir": "sampleB"},
+    ]
+    write_tsv(reorganized / "files.tsv", files, ["filename", "run_dir"])
+
+    for file_key, run_dir in (("A", "sampleA"), ("B", "sampleB")):
+        rows = []
+        for pep, prots, neutral, z, rt, _areas in PSMS:
+            rows.append({
+                "peptide_plain": pep,
+                "proteins": prots,
+                "calc_mass": repr(neutral),
+                "charge": str(z),
+                "rt": repr(rt),
+                "label": "1",
+                "percolator_q": "0.0",
+            })
+        write_tsv(reorganized / "by_file" / run_dir / "psms.tsv", rows,
+                  ["peptide_plain", "proteins", "calc_mass", "charge", "rt",
+                   "label", "percolator_q"])
+    return reorganized
+
+
+def build_distributions(root: Path):
+    dist_dir = root / "distributions"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    for file_key, stem in (("A", "sampleA"), ("B", "sampleB")):
+        path = dist_dir / f"{stem}.distributions.sqlite"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE distributions (distribution_id INTEGER PRIMARY KEY,
+                charge INTEGER, mono_mz REAL, rt_start REAL, rt_apex REAL,
+                rt_end REAL, quality REAL);
+            CREATE TABLE distribution_members (distribution_id INTEGER,
+                feature_id INTEGER, isotope_index INTEGER);
+            CREATE TABLE features (feature_id INTEGER PRIMARY KEY, area REAL);
+            CREATE TABLE analytes (analyte_id INTEGER PRIMARY KEY);
+            CREATE TABLE analyte_members (analyte_id INTEGER,
+                distribution_id INTEGER, charge INTEGER);
+            """
+        )
+        did = 0
+        for pep, prots, neutral, z, rt, areas in PSMS:
+            area = areas[file_key]
+            mono_mz = neutral / z + PROTON
+            did += 1
+            fid = did
+            conn.execute(
+                "INSERT INTO distributions VALUES (?,?,?,?,?,?,?)",
+                (did, z, mono_mz, rt - 0.2, rt, rt + 0.2, 1.0))
+            conn.execute("INSERT INTO features VALUES (?,?)", (fid, area))
+            conn.execute(
+                "INSERT INTO distribution_members VALUES (?,?,?)", (did, fid, 0))
+            # One analyte per distribution: analyte AUC == this feature area.
+            conn.execute("INSERT INTO analytes VALUES (?)", (did,))
+            conn.execute(
+                "INSERT INTO analyte_members VALUES (?,?,?)", (did, did, z))
+        conn.commit()
+        conn.close()
+    return dist_dir
+
+
+def build_motif_index(root: Path):
+    motif_dir = root / "motifs" / "test-skeletons"
+    motif_dir.mkdir(parents=True, exist_ok=True)
+    write_tsv(motif_dir / "proteins.tsv",
+              [{"protein_id": pid, "accession": acc}
+               for pid, acc in ACCESSIONS.items()],
+              ["protein_id", "accession"])
+
+    def encode_varint(n):
+        out = bytearray()
+        while True:
+            byte = n & 0x7F
+            n >>= 7
+            if n:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                return bytes(out)
+
+    motif_rows = []
+    with (motif_dir / "postings.bin").open("wb") as f:
+        for motif_id, text, pids in MOTIFS:
+            offset = f.tell()
+            buf = bytearray(encode_varint(len(pids)))
+            prev = 0
+            for i, pid in enumerate(sorted(pids)):
+                buf += encode_varint(pid if i == 0 else pid - prev)
+                prev = pid
+            f.write(buf)
+            motif_rows.append({
+                "motif_id": motif_id, "motif_text": text,
+                "protein_count": len(pids),
+                "posting_offset": offset, "posting_bytes": len(buf),
+            })
+    write_tsv(motif_dir / "motifs.tsv", motif_rows,
+              ["motif_id", "motif_text", "protein_count",
+               "posting_offset", "posting_bytes"])
+    return motif_dir
+
+
+def read_tsv(path):
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f, delimiter="\t"))
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        reorganized = build_reorganized(root)
+        dist_dir = build_distributions(root)
+        motif_dir = build_motif_index(root)
+        out_dir = root / "quant"
+        motif_out = root / "motif-sets"
+
+        quantify.run(reorganized=reorganized, distributions_dir=dist_dir,
+                     out_dir=out_dir, motif_dir=motif_dir, motif_out=motif_out,
+                     min_observed=2)
+
+        failures = []
+
+        def check(name, got, want):
+            if abs(got - want) > 1e-6:
+                failures.append(f"{name}: got {got}, want {want}")
+
+        # ---- protein quantities: most abundant unique peptide's AUC ----
+        prot = {(r["protein"], r["filename"].split(".")[0]): float(r["quantity"])
+                for r in read_tsv(out_dir / "protein_quant.tsv")}
+        check("P1 sampleA", prot[("P1", "sampleA")], 500.0)   # PEPTIDEAONE
+        check("P1 sampleB", prot[("P1", "sampleB")], 600.0)
+        check("P2 sampleA", prot[("P2", "sampleA")], 300.0)
+        check("P3 sampleB", prot[("P3", "sampleB")], 150.0)
+        best = {r["protein"]: r["best_peptide"]
+                for r in read_tsv(out_dir / "protein_quant.tsv")}
+        if best.get("P1") != "PEPTIDEAONE":
+            failures.append(f"P1 best peptide: {best.get('P1')}")
+
+        # ---- motif keep/drop ----
+        motif_rows = read_tsv(motif_out / "motifs.tsv")
+        kept = {int(r["motif_id"]) for r in motif_rows}
+        if kept != {0, 2}:
+            failures.append(f"kept motifs: {sorted(kept)} (want [0, 2])")
+
+        # ---- motif quantities: SUM over observed member proteins ----
+        mq = {(int(r["motif_id"]), r["filename"].split(".")[0]): float(r["quantity"])
+              for r in read_tsv(motif_out / "motif_quant.tsv")}
+        check("M0 sampleA", mq[(0, "sampleA")], 900.0)    # 500+300+100
+        check("M0 sampleB", mq[(0, "sampleB")], 1100.0)   # 600+350+150
+        check("M2 sampleA", mq[(2, "sampleA")], 800.0)    # 500+300
+        check("M2 sampleB", mq[(2, "sampleB")], 950.0)    # 600+350
+
+        # ---- viewer QuantModel should read the produced quant/ folder ----
+        sys.path.insert(0, str(REPO / "viewer"))
+        from quant_model import QuantModel  # noqa: E402
+
+        class _Session:
+            quant_dir = out_dir
+
+            def files(self):
+                return [{"filename": "sampleA.centroid.mzML"},
+                        {"filename": "sampleB.centroid.mzML"}]
+
+            def all_quant_rows(self):
+                raise AssertionError("QuantModel must use quant/, not Sage LFQ")
+
+        qm = QuantModel(_Session())
+        pm = qm.protein_matrix()
+        if abs(pm.get("P1", {}).get("sampleA.centroid.mzML", 0) - 500.0) > 1e-6:
+            failures.append(f"QuantModel P1 sampleA: {pm.get('P1')}")
+
+        if failures:
+            print("FAIL:")
+            for f in failures:
+                print("  -", f)
+            return 1
+        print("OK: protein AUC roll-up + motif grouping/sum + QuantModel wiring correct")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

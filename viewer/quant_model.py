@@ -5,6 +5,13 @@ quantity}}`` matrices, at the **peptide** or **protein** level. Nothing here
 knows anything about the experimental design — it only maps features to their
 per-file quantities; the tab layers the (fully user-defined) grouping on top.
 
+**Quantity source.** When the off-GUI ``quantify.py`` stage has written a
+``quant/`` folder next to ``searches/``, the AUC-based tables there are used:
+``protein_quant.tsv`` (a protein = the charge-distribution AUC of its single most
+abundant unique peptide, the same number the MS Data tab shows) and
+``peptide_auc.tsv`` (per-peptide AUC). Otherwise it falls back to the Sage-LFQ
+``quantity`` column of the reorganized ``peptide_quant.tsv``.
+
 Peptide level keys on ``peptide_plain`` (charge/mod variants summed). Each
 peptide also carries a ``unique`` flag (maps to exactly one protein).
 
@@ -15,6 +22,7 @@ shared peptides never double-count across proteins.
 Matrices are cached so switching Peptides⇄Proteins is instant.
 """
 
+import csv
 import re
 
 
@@ -44,11 +52,31 @@ class QuantModel:
     def filenames(self):
         return [r.get("filename", "") for r in (self.session.files() or [])]
 
+    # ---- AUC tables (quantify.py) ----------------------------------------
+
+    def _quant_dir(self):
+        return getattr(self.session, "quant_dir", None)
+
+    def _read_quant_tsv(self, name):
+        d = self._quant_dir()
+        if d is None:
+            return None
+        path = d / name
+        if not path.exists():
+            return None
+        with path.open(newline="", errors="replace") as f:
+            return list(csv.DictReader(f, delimiter="\t"))
+
     # ---- peptide-level ---------------------------------------------------
 
     def _ensure_peptide(self):
         if self._peptide is not None:
             return
+        auc_rows = self._read_quant_tsv("peptide_auc.tsv")
+        if auc_rows is not None:
+            self._build_peptide_from_auc(auc_rows)
+            return
+
         matrix = {}
         pep_proteins = {}
         for row in self.session.all_quant_rows():
@@ -61,6 +89,25 @@ class QuantModel:
             fname = row.get("filename", "")
             per_file = matrix.setdefault(pep, {})
             per_file[fname] = per_file.get(fname, 0.0) + q
+            if pep not in pep_proteins:
+                pep_proteins[pep] = _split_proteins(row.get("proteins", ""))
+        self._peptide = matrix
+        self._pep_proteins = pep_proteins
+        self._pep_unique = {p: (len(prots) == 1) for p, prots in pep_proteins.items()}
+
+    def _build_peptide_from_auc(self, rows):
+        """Peptide matrix from ``quant/peptide_auc.tsv`` (AUC per peptide/file)."""
+        matrix = {}
+        pep_proteins = {}
+        for row in rows:
+            pep = row.get("peptide_plain", "")
+            if not pep:
+                continue
+            q = _to_float(row.get("auc"))
+            if q is None:
+                continue
+            fname = row.get("filename", "")
+            matrix.setdefault(pep, {})[fname] = q
             if pep not in pep_proteins:
                 pep_proteins[pep] = _split_proteins(row.get("proteins", ""))
         self._peptide = matrix
@@ -84,6 +131,18 @@ class QuantModel:
     def _ensure_protein(self):
         if self._protein is not None:
             return
+        prot_rows = self._read_quant_tsv("protein_quant.tsv")
+        if prot_rows is not None:
+            matrix = {}
+            for row in prot_rows:
+                prot = row.get("protein", "")
+                q = _to_float(row.get("quantity"))
+                if not prot or q is None:
+                    continue
+                matrix.setdefault(prot, {})[row.get("filename", "")] = q
+            self._protein = matrix
+            return
+
         self._ensure_peptide()
         matrix = {}
         for pep, per_file in self._peptide.items():

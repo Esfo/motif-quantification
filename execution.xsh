@@ -18,15 +18,25 @@ proteome_fasta = Path("/home/sfo/data/proteomics/fastas/human_uniprot_reviewed_p
 
 reorganize_py = Path("/home/sfo/motif-quantification/reorganize-results.py")
 distributions_py = Path("/home/sfo/motif-quantification/index-distributions.py")
+quantify_py = Path("/home/sfo/motif-quantification/quantify.py")
+
+# Motif skeleton index to group proteins by (from index-motifs.py). Leave as None
+# to compute AUC protein/peptide quant only, without the motif grouping.
+motif_index_dir = Path("/home/sfo/data/proteomics/motifs/human-proteome-skeletons")
 
 decoy_tag = "decoy_"
 batch_size = 4
+
+# Minimum number of quantified (observed) proteins a motif must group for it to
+# be kept -- 2 means "the motif shows up more than once".
+motif_min_observed = 2
 
 run_sage = True
 patch_pins = True
 run_percolator = True
 run_reorganize = True
 run_distributions = True
+run_quantify = True
 
 
 # ----------------------------
@@ -538,3 +548,33 @@ if run_distributions:
     python @(str(distributions_py)) \
         --mzml-dir @(str(mzml_dir)) \
         --out-dir @(str(distributions_dir))
+
+
+# ----------------------------
+# AUC quantification + motif grouping
+#   -> project/quant/{peptide_auc,protein_quant}.tsv
+#   -> project/motif-sets/{motifs,motif_quant}.tsv
+# ----------------------------
+#
+# Protein quantity = the charge-distribution AUC (summed isotope-line areas over
+# a peptide's whole analyte, the same number the MS Data tab shows) of the
+# protein's single most abundant unique peptide, matched per file against that
+# file's distributions sqlite. Motif quantity = the SUM of that quantity over the
+# proteins each skeleton motif groups. This is what the viewer's Quantitative
+# Comparisons and Motifs tabs read.
+
+quant_dir = project_dir / "quant"
+motif_sets_dir = project_dir / "motif-sets"
+
+if run_quantify:
+    quant_cmd = [
+        str(quantify_py),
+        "--reorganized", str(reorganized_dir),
+        "--distributions", str(distributions_dir),
+        "--out-dir", str(quant_dir),
+        "--min-observed", str(motif_min_observed),
+    ]
+    if motif_index_dir is not None:
+        quant_cmd += ["--motif-index", str(motif_index_dir),
+                      "--motif-out", str(motif_sets_dir)]
+    python @(quant_cmd)

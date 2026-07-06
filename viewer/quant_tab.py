@@ -264,19 +264,27 @@ class NumericItem(QTableWidgetItem):
 class QuantTab(QWidget):
     feature_selected = Signal(str)
 
+    # Overridable seams so the Motifs tab can reuse this whole tab with a
+    # different model / feature vocabulary (see motif_tab.MotifTab).
+    SETTINGS_KEY = "quant_state"
+    _default_level = "peptide"
+
+    def _make_model(self):
+        return QuantModel(self.session)
+
     def __init__(self, session, experimental, theme="dark", parent=None):
         super().__init__(parent)
         self.session = session
         self.experimental = experimental
         self.theme = theme
 
-        self.model = QuantModel(session)
+        self.model = self._make_model()
         self.on_theme_toggle = None   # set by MainWindow; wired to the theme button
         self.settings = QSettings("motif-quantification", "viewer")
         self._saved = self._load_state()
         self._restoring = True
 
-        self.level = self._saved.get("level", "peptide")
+        self.level = self._saved.get("level", self._default_level)
         self.unique_only = bool(self._saved.get("unique", False))
         self.normalize = self._saved.get("normalize", "none")
         self._matrix_cache = {}
@@ -313,7 +321,7 @@ class QuantTab(QWidget):
     # ---- persisted state (organizer + contrast, like the panel layouts) --
 
     def _load_state(self):
-        raw = self.settings.value("quant_state")
+        raw = self.settings.value(self.SETTINGS_KEY)
         if not raw:
             return {}
         try:
@@ -335,7 +343,7 @@ class QuantTab(QWidget):
             "a": self.a_combo.currentText(),
             "b": self.b_combo.currentText(),
         }
-        self.settings.setValue("quant_state", json.dumps(state))
+        self.settings.setValue(self.SETTINGS_KEY, json.dumps(state))
 
     # ---- design helpers --------------------------------------------------
 
@@ -395,6 +403,43 @@ class QuantTab(QWidget):
         if self.level == "peptide" and self.unique_only:
             feats = [f for f in feats if self.model.peptide_is_unique(f)]
         return sorted(feats)
+
+    # ---- feature-vocabulary seams (overridden by MotifTab) ---------------
+
+    def _feature_column_label(self):
+        """Header for the table's leading feature column."""
+        return "peptide" if self.level == "peptide" else "protein"
+
+    def _second_column_label(self):
+        """Header for the second fixed column."""
+        return "unique"
+
+    def _second_column_value(self, feat):
+        """Value of the second fixed column for a feature."""
+        if self.level == "protein" or self.model.peptide_is_unique(feat):
+            return "yes"
+        return "no"
+
+    def _build_level_controls(self, bar):
+        """Populate the table toolbar's left side (level switch + filter). The
+        Motifs tab overrides this to swap in a min-observed control."""
+        self.pep_button = QPushButton("Peptides")
+        self.prot_button = QPushButton("Proteins")
+        for b in (self.pep_button, self.prot_button):
+            b.setCheckable(True)
+            b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.pep_button.setChecked(self.level == "peptide")
+        self.prot_button.setChecked(self.level == "protein")
+        self.pep_button.clicked.connect(lambda: self._set_level("peptide"))
+        self.prot_button.clicked.connect(lambda: self._set_level("protein"))
+        bar.addWidget(self.pep_button)
+        bar.addWidget(self.prot_button)
+        bar.addSpacing(16)
+        self.unique_check = QCheckBox("Unique peptides only")
+        self.unique_check.setChecked(self.unique_only)
+        self.unique_check.setEnabled(self.level == "peptide")
+        self.unique_check.stateChanged.connect(self._on_unique_toggled)
+        bar.addWidget(self.unique_check)
 
     # ---- UI construction -------------------------------------------------
 
@@ -552,23 +597,7 @@ class QuantTab(QWidget):
         lay.setContentsMargins(6, 6, 6, 6)
 
         bar = QHBoxLayout()
-        self.pep_button = QPushButton("Peptides")
-        self.prot_button = QPushButton("Proteins")
-        for b in (self.pep_button, self.prot_button):
-            b.setCheckable(True)
-            b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.pep_button.setChecked(self.level == "peptide")
-        self.prot_button.setChecked(self.level == "protein")
-        self.pep_button.clicked.connect(lambda: self._set_level("peptide"))
-        self.prot_button.clicked.connect(lambda: self._set_level("protein"))
-        bar.addWidget(self.pep_button)
-        bar.addWidget(self.prot_button)
-        bar.addSpacing(16)
-        self.unique_check = QCheckBox("Unique peptides only")
-        self.unique_check.setChecked(self.unique_only)
-        self.unique_check.setEnabled(self.level == "peptide")
-        self.unique_check.stateChanged.connect(self._on_unique_toggled)
-        bar.addWidget(self.unique_check)
+        self._build_level_controls(bar)
         bar.addStretch(1)
         lay.addLayout(bar)
 
@@ -892,13 +921,13 @@ class QuantTab(QWidget):
     def _refresh_table(self):
         matrix = self._matrix()
         feats = self._visible_features()
-        feat_label = "peptide" if self.level == "peptide" else "protein"
+        feat_label = self._feature_column_label()
         columns, paths, nlevels, tips = self._columns_and_paths()
 
         grey = QColor(150, 150, 150, 235)   # opaque grey = an average of ≥2 files
         dark = QColor("#101216")
         center = Qt.AlignCenter
-        fixed = [feat_label, "unique"]
+        fixed = [feat_label, self._second_column_label()]
         nfixed = len(fixed)
 
         self.table.setSortingEnabled(False)
@@ -914,9 +943,7 @@ class QuantTab(QWidget):
             fitem = QTableWidgetItem(feat)
             fitem.setTextAlignment(center)
             self.table.setItem(r, 0, fitem)
-            uniq = ("yes" if (self.level == "protein"
-                              or self.model.peptide_is_unique(feat)) else "no")
-            uitem = QTableWidgetItem(uniq)
+            uitem = QTableWidgetItem(self._second_column_value(feat))
             uitem.setTextAlignment(center)
             self.table.setItem(r, 1, uitem)
             per = matrix.get(feat, {})
@@ -950,11 +977,11 @@ class QuantTab(QWidget):
         sequence, the rest to their leaf-label / quantity text. No stretch-to-fill,
         so columns stay tight and re-tighten whenever layers change."""
         fm = QFontMetrics(self.table.font())
-        wfeat = fm.horizontalAdvance("peptide") + 24
+        wfeat = fm.horizontalAdvance(self._feature_column_label()) + 24
         for feat in feats[:400]:
             wfeat = max(wfeat, fm.horizontalAdvance(feat) + 20)
         self.table.setColumnWidth(0, wfeat)
-        self.table.setColumnWidth(1, fm.horizontalAdvance("unique") + 20)
+        self.table.setColumnWidth(1, fm.horizontalAdvance(self._second_column_label()) + 20)
         qwidth = fm.horizontalAdvance("0.000e+00") + 16
         for ci, path in enumerate(leaves):
             self.table.setColumnWidth(

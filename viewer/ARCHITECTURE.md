@@ -26,7 +26,9 @@ sqlite and the experimental-setup file.
 | `ms_viewer_tab.py` | **Tab 1** dock workspace (lists, panels 1–3, table 1) |
 | `proteins_tab.py` | **Tab 2** protein sequence viewer: file selector + FDR + protein list, panel 1 (horizontal sequence, peptide rectangles coloured by q-value, All button) over panel 2 (same protein verticalized per-file, click a column to load it in panel 1) |
 | `quant_tab.py` | **Tab 3** Quantitative Comparisons: depth-faceted per-feature view + all-features fold-change scatter over the top half; per-file quantity table with a Peptides⇄Proteins switch + unique filter across the bottom. Fully generic over the experimental-setup columns (no hard-coded column names); reactive (no run button) |
-| `quant_model.py` | builds/caches the feature×file quantity matrix — peptide level (charge/mod variants summed, unique flag per peptide) or protein level (**unique quantification**: unique peptides only) |
+| `quant_tab.py` (`MotifTab`) | **Tab 4** Motifs: `motif_tab.MotifTab` subclasses `QuantTab`, swapping in the motif model, a *motif*/*observed* column pair, and a **min observed proteins** control in place of the Peptides/Proteins switch; all faceting/fold-change/pivot inherited |
+| `quant_model.py` | builds/caches the feature×file quantity matrix — peptide level (charge/mod variants summed, unique flag per peptide) or protein level (**unique quantification**: unique peptides only). Prefers the AUC tables in `quant/` (from `quantify.py`) when present, else the Sage-LFQ `quantity` column |
+| `motif_quant_model.py` | reads `motif-sets/` (motifs.tsv + motif_quant.tsv) into the same `{feature: {filename: quantity}}` shape as `quant_model`, keyed by skeleton motif; a motif's quantity is the SUM of its observed proteins' AUC quantities |
 | `session.py` | reads the `reorganized/` tables (files, PSMs, peptides, proteins, quant) + the project FASTA (protein sequences) and in-silico tryptic digestion (Tab 2) |
 | `mzml_store.py` | indexed mzML reader: metadata (no array decode), random-access scans, `extract_xics`, `extract_region` |
 | `region_view.py` | standalone bounded 2D heatmap + 3D region (`RegionWorker` thread is reused by Tab 1) |
@@ -160,9 +162,26 @@ reuses the base-mass (`mz*z - proton*z`) nearest-match logic from the original.
   so the join survives extension differences. Theming adapts light/dark; points are
   white on dark, dark on light. Staged next: worker-thread recompute for large
   peptide sets, saved layouts, per-feature link into the MS Data tab.
-- **Motifs** — DE at the motif level (proteins represented by shared skeleton
-  motif); include/exclude refinement saved to a new sibling folder (e.g.
-  `motif-sets/`) alongside `distributions/` and `searches/`.
+- **Motifs** (wired) — DE at the motif level, the Quantitative-Comparisons tab
+  with a motif vocabulary (`motif_tab.MotifTab` subclasses `QuantTab`). Proteins
+  are grouped by shared skeleton motif and each group is quantified as the SUM of
+  its member proteins' AUC quantities. The grouping + quantities are precomputed
+  off-GUI by `quantify.py` (the `run_quantify` stage in `execution.xsh`) and read
+  from `motif-sets/{motifs,motif_quant}.tsv`; a **min observed proteins** control
+  (default 2 — "shows up more than once") filters the groups. Staged next:
+  include/exclude refinement saved back into `motif-sets/`.
+
+### AUC quantities & the `quantify.py` stage
+
+`quantify.py` is the off-GUI counterpart of the quant tabs. Per file it matches
+each identified peptide (`by_file/<run>/psms.tsv`: `calc_mass`→mono m/z, `rt`,
+`charge`) against that file's `distributions/<stem>.distributions.sqlite` with the
+MS-Data-tab tolerances (10 ppm / 0.02 Th floor, RT band ±0.8, exact charge, best =
+closest m/z then RT apex) and reads the **charge-distribution AUC** = `SUM(features.area)`
+over the whole analyte. A protein's quantity is the AUC of its single most abundant
+unique peptide; a motif's is the SUM over the proteins it groups. Outputs:
+`quant/{peptide_auc,protein_quant}.tsv` (consumed by `quant_model`) and
+`motif-sets/{motifs,motif_quant}.tsv` (consumed by `motif_quant_model`).
 
 ## Isotope math provenance
 

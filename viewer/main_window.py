@@ -20,6 +20,7 @@ try:
     from .ms_viewer_tab import MSViewerTab
     from .proteins_tab import ProteinsTab
     from .quant_tab import QuantTab
+    from .motif_tab import MotifTab
     from .distributions_db import DistributionsDB
     from .experimental import ExperimentalSetup
 except ImportError:
@@ -28,6 +29,7 @@ except ImportError:
     from ms_viewer_tab import MSViewerTab
     from proteins_tab import ProteinsTab
     from quant_tab import QuantTab
+    from motif_tab import MotifTab
     from distributions_db import DistributionsDB
     from experimental import ExperimentalSetup
 
@@ -136,6 +138,8 @@ class MainWindow(QMainWindow):
             self.proteins_tab.apply_theme(theme)
         if getattr(self, "quant_tab", None) is not None:
             self.quant_tab.apply_theme(theme)
+        if getattr(self, "motif_tab", None) is not None:
+            self.motif_tab.apply_theme(theme)
         self.theme_action.setText("Switch to &light mode" if theme == "dark" else "Switch to &dark mode")
 
     # ---- opening folders -------------------------------------------------
@@ -224,10 +228,9 @@ class MainWindow(QMainWindow):
         self.quant_tab = QuantTab(self.session, self.experimental, theme=self.theme)
         self.quant_tab.on_theme_toggle = self.toggle_theme
         tabs.addTab(self.quant_tab, "Quantitative Comparisons")
-        tabs.addTab(self._placeholder("Motif quantification",
-                    "Time series + DE at the motif level; proteins grouped by shared skeleton "
-                    "motif, with include/exclude refinement saved back to a motif-sets folder. "
-                    "— staged, see ARCHITECTURE.md"), "Motifs")
+        self.motif_tab = MotifTab(self.session, self.experimental, theme=self.theme)
+        self.motif_tab.on_theme_toggle = self.toggle_theme
+        tabs.addTab(self.motif_tab, "Motifs")
         if 0 <= prev_index < tabs.count():
             tabs.setCurrentIndex(prev_index)
         self.setCentralWidget(tabs)
